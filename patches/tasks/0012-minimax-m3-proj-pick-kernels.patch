@@ -1,0 +1,1402 @@
+From 729bcfcf629d9a9410903f0dbbb52f9895578692 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:14:36 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: fp16 index projection and per-rank pick
+ kernels (T8c)
+
+Adds minimax_m3_proj.cu: tf_mm3_proj_bf16/f32 (fp16 index_q_proj and index_k_proj times
+the normed hidden state, fp32 fma sums in a fixed lane/chain/xor-tree order that does not
+depend on the row count, one rounding to fp16 or bf16 as a launch parameter) and
+tf_mm3_pick (per-rank (logit, id) over the vocabulary slice: larger logit, ties to the
+lowest id, NaN last). Wires index_proj, local_pick and pick_gather into Device.emit,
+registers the image, records and float64-reference contract entries, host twins with
+planted mutants, step test-minimax-proj and tf-cuda-test mm3-proj-contract. tp.betterPick
+now ranks NaN last. Ran on GB10 (spark2): mm3-proj-contract, 4 kernels pass gates 1-4.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/interface-decisions.md                   |  14 +-
+ zig/build/cuda_kernels.zig                    |   1 +
+ zig/build/cuda_row_contracts.zig              |   2 +-
+ zig/build/minimax_family.zig                  |   1 +
+ zig/build/minimax_proj_host.zig               |  23 ++
+ zig/kernels/cuda/minimax_m3_proj.cu           | 150 ++++++++
+ .../core/contract/minimax_m3_proj_records.zig |  14 +
+ zig/src/core/contract/registry.zig            |   2 +-
+ zig/src/cuda/kernels.zig                      |   1 +
+ zig/src/cuda/minimax_m3_proj.zig              | 127 +++++++
+ zig/src/cuda/root.zig                         |   2 +
+ zig/src/families/minimax_m3/forward_exec.zig  |  21 +-
+ zig/src/families/minimax_m3/tp.zig            |  17 +
+ zig/tests/cuda/contract_minimax_proj.zig      | 323 ++++++++++++++++++
+ zig/tests/cuda/contract_tests.zig             |  12 +-
+ zig/tests/cuda/main.zig                       |   2 +
+ zig/tests/minimax_proj_tests.zig              | 283 +++++++++++++++
+ zig/tests/minimax_proj_twin.zig               | 126 +++++++
+ 18 files changed, 1108 insertions(+), 13 deletions(-)
+ create mode 100644 zig/build/minimax_proj_host.zig
+ create mode 100644 zig/kernels/cuda/minimax_m3_proj.cu
+ create mode 100644 zig/src/core/contract/minimax_m3_proj_records.zig
+ create mode 100644 zig/src/cuda/minimax_m3_proj.zig
+ create mode 100644 zig/tests/cuda/contract_minimax_proj.zig
+ create mode 100644 zig/tests/minimax_proj_tests.zig
+ create mode 100644 zig/tests/minimax_proj_twin.zig
+
+diff --git a/docs/interface-decisions.md b/docs/interface-decisions.md
+index 8ae1e42..2263cbe 100644
+--- a/docs/interface-decisions.md
++++ b/docs/interface-decisions.md
+@@ -66,13 +66,13 @@ and call the EXL3 linear and grouped-expert wrappers (vcruz305's EXL3 module #42
+ `iface.zig` is unchanged. The forward (`forward.zig`, `forward_plan.zig`, `forward_exec.zig`) and the prompt driver
+ (`prefill.zig`) are written against it. What T8a needs from other tasks, and what it chose where the plan says UNVERIFIED:
+ 
+-- Missing kernel, fp16 index projection. `index_q_proj` (fp16 [256, 6144] a rank) and `index_k_proj` (fp16 [128, 6144],
+-  replicated) have no GEMV in the tree (`dense_rows.cu` takes bf16 weights; `tf_mm3_rows` only norms and rotates the
+-  result). The planner emits `index_proj {layer, rows}` (reads `a`, writes `iq_raw`, `ik_raw`, fp16, `index_fp16` flag on)
+-  and `Device.emit` returns `error.NoIndexProjKernel` until a kernel exists. A forward cannot run without it.
+-- Missing kernel, per-rank (logit, id) pick. `Head.mode = .picks` plans `local_pick` and `pick_gather`; the device returns
+-  `error.NoPickKernel`. The padded logits gather (`.gather`, `tp.LogitsGather` layout `[rank][row][slot]`) is complete, so
+-  the engine (T8b) draws from `Forward.address(out)` with `Sampler.draw` over `shard.Share.vocab` spans, or merges picks.
++- Index projection and pick kernels (T8c, `minimax_m3_proj.cu`, `cuda/minimax_m3_proj.zig`). `index_proj` runs
++  `Proj.project`: fp16 `index_q_proj` [256, 6144] and `index_k_proj` [128, 6144] times the bf16 `a`, fp32 fma sums in the
++  router's fixed order (independent of rows), one rounding to fp16 (`opts.flags.index_fp16`) or bf16, into `iq_raw`, `ik_raw`.
++  `local_pick` runs `Proj.pick` over `hlog` (own_vocab of slot logits, ids from vocab_lo) into `pairs` ([row] logit bits,
++  id); `pick_gather` all-gathers them into `pairs_all` ([rank][row]). Order: larger logit, ties to the lower id, NaN last
++  (`tp.betterPick` now ranks NaN last too). The padded logits gather (`.gather`, `tp.LogitsGather` layout `[rank][row][slot]`)
++  is the other head mode; the engine (T8b) draws from `Forward.address(out)` with `Sampler.draw`, or merges picks.
+ - For T8b (engine, follower, backend): the engine owns the `Pages` (pool base, `rk.Mirror`, `rk.Cache`), the `Modules`,
+   the `Buffers` and the `Link` (group, NCCL library and communicator); `Forward.run(Call)` queues one step on the stream
+   and returns the head's layout. A follower runs the same `Call` on its rank: both ranks plan the identical op sequence
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 86e89aa..2ed0dc0 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -110,6 +110,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "minimax_m3_select", .flags = glue }, // ours: forced-block top-16 with the tie and forcing rules as launch parameters
+     .{ .name = "minimax_m3_attn", .flags = glue }, // ours: selected-block GQA attention over paged K/V, 16 q heads a K/V stream
+     .{ .name = "minimax_m3_rows", .flags = glue }, // ours: MiniMax-M3.1-Flash per-head norm, partial RoPE, paged K/V/IK writes and the fp32 router GEMV
++    .{ .name = "minimax_m3_proj", .flags = glue }, // ours: MiniMax-M3.1-Flash fp16-weight index projections and the per-rank greedy (logit, id) pick
+     .{ .name = "drama3_staged_gemv", .flags = glue },
+     .{ .name = "drama3", .flags = &.{"-O3"} },
+     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+diff --git a/zig/build/cuda_row_contracts.zig b/zig/build/cuda_row_contracts.zig
+index f3b37bc..d1adf41 100644
+--- a/zig/build/cuda_row_contracts.zig
++++ b/zig/build/cuda_row_contracts.zig
+@@ -2,7 +2,7 @@
+ const std = @import("std");
+ 
+ pub fn host(b: *std.Build, target: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, step: *std.Build.Step) void {
+-    for ([_][]const u8{ "contract_norms_tail.zig", "contract_act_round.zig", "contract_embed.zig", "contract_qk_round.zig", "contract_minimax_act.zig", "contract_minimax_rows.zig" }) |name| {
++    for ([_][]const u8{ "contract_norms_tail.zig", "contract_act_round.zig", "contract_embed.zig", "contract_qk_round.zig", "contract_minimax_act.zig", "contract_minimax_rows.zig", "contract_minimax_proj.zig" }) |name| {
+         const m = b.createModule(.{
+             .root_source_file = b.path(b.pathJoin(&.{ "zig/tests/cuda", name })),
+             .target = target,
+diff --git a/zig/build/minimax_family.zig b/zig/build/minimax_family.zig
+index 8748617..1b4d229 100644
+--- a/zig/build/minimax_family.zig
++++ b/zig/build/minimax_family.zig
+@@ -35,6 +35,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod
+     @import("minimax_ref_host.zig").rows(b, host, core, cuda, umbrella);
+     @import("minimax_host.zig").steps(b, host, api, tokenizer, template, server_add, umbrella);
+     forward(b, host, cuda, core, lanes, api, umbrella);
++    @import("minimax_proj_host.zig").step(b, host, core, cuda, umbrella);
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug)) }));
+     b.step("test-minimax-engine-host", "MiniMax-M3.1-Flash interface, weights descriptors, page state and native host half without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
+diff --git a/zig/build/minimax_proj_host.zig b/zig/build/minimax_proj_host.zig
+new file mode 100644
+index 0000000..ccc4981
+--- /dev/null
++++ b/zig/build/minimax_proj_host.zig
+@@ -0,0 +1,23 @@
++//! test-minimax-proj: MiniMax-M3.1-Flash fp16 index projection and per-rank pick on the host, no GPU.
++const std = @import("std");
++
++pub fn step(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module, cuda: *std.Build.Module, umbrella: *std.Build.Step) void {
++    const canon = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon.zig"), .target = host, .optimize = .debug });
++    const tp = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/tp.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "canon", .module = canon } },
++    });
++    const m = b.createModule(.{
++        .root_source_file = b.path("zig/tests/minimax_proj_tests.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }, .{ .name = "mm3_tp", .module = tp } },
++    });
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
++    b.step("test-minimax-proj", "MiniMax-M3.1-Flash fp16 index projection and per-rank pick: host twins, mutants and launch records without a GPU").dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++}
+diff --git a/zig/kernels/cuda/minimax_m3_proj.cu b/zig/kernels/cuda/minimax_m3_proj.cu
+new file mode 100644
+index 0000000..64744a3
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_proj.cu
+@@ -0,0 +1,150 @@
++// MiniMax-M3.1-Flash fp16-weight index projection and the per-rank greedy pick; no third-party code.
++
++// tf_mm3_proj_{bf16,f32}: out[r][e] = sum_k w[e][k] * x[r][k] for the index query (n0 outputs) and the index key (n1).
++
++// Weights are fp16 (not quantized), x is the normed hidden state, bf16 or fp32; every product is exact in fp32.
++
++// A warp owns one output and up to 4 rows. Lane l sums chunks l, l + 32, ... of 4 values in four fp32 fma chains, then
++
++// (a0 + a1) + (a2 + a3), then a fixed xor tree 16 .. 1: the order never looks at the rows, the tile or the neighbours.
++
++// The fp32 sum is rounded once to fp16 or bf16 (launch parameter). NaN and infinities propagate as float64 does.
++
++// tf_mm3_pick: a CTA per row scans the rank's vocabulary slice of the padded logits and writes (logit, id).
++
++// Order: larger logit wins, equal logits go to the lower id, a NaN loses to every number (all NaN: the lowest id).
++
++// That is a total order, so any reduction tree gives the same pair.
++#include "minimax_m3_rows.cuh"
++
++using namespace tf_mm3;
++
++namespace {
++
++constexpr int PROJ_WARPS = 4;  // outputs a block
++constexpr int PROJ_ROWS = 4;   // rows a warp
++constexpr int PROJ_CHUNK = 128; // k is a multiple: 32 lanes x 4 values a step
++constexpr int PICK_THREADS = 256;
++
++__device__ __forceinline__ float tree32(float a) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, o));
++    return a;
++}
++
++__device__ __forceinline__ float4 load_x(const bf16* p) { return widen4(__ldg(reinterpret_cast<const uint2*>(p))); }
++__device__ __forceinline__ float4 load_x(const float* p) { return __ldg(reinterpret_cast<const float4*>(p)); }
++
++template <typename X>
++__device__ __forceinline__ void proj_body(const X* __restrict__ x, long long x_ld, const unsigned short* __restrict__ w0,
++                                          int n0, unsigned short* __restrict__ o0, long long o0_ld,
++                                          const unsigned short* __restrict__ w1, int n1, unsigned short* __restrict__ o1,
++                                          long long o1_ld, int rows, int k, int out_bf16) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int e = blockIdx.x * PROJ_WARPS + warp;
++    if (e >= n0 + n1) return;
++    const bool second = e >= n0;
++    const int j = second ? e - n0 : e;
++    const unsigned short* we = (second ? w1 : w0) + (long long)j * k;
++    unsigned short* out = second ? o1 : o0;
++    const long long out_ld = second ? o1_ld : o0_ld;
++    const long long r0 = (long long)blockIdx.y * PROJ_ROWS;
++    float acc[PROJ_ROWS][4];
++#pragma unroll
++    for (int i = 0; i < PROJ_ROWS; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
++#pragma unroll 4
++    for (int c = 0; c < k / PROJ_CHUNK; ++c) {
++        const int at = 4 * (lane + 32 * c);
++        const float4 wv = widen4_half(__ldg(reinterpret_cast<const uint2*>(we + at)));
++#pragma unroll
++        for (int i = 0; i < PROJ_ROWS; ++i) {
++            if (r0 + i >= rows) continue;
++            const float4 xv = load_x(x + (r0 + i) * x_ld + at);
++            acc[i][0] = __fmaf_rn(xv.x, wv.x, acc[i][0]);
++            acc[i][1] = __fmaf_rn(xv.y, wv.y, acc[i][1]);
++            acc[i][2] = __fmaf_rn(xv.z, wv.z, acc[i][2]);
++            acc[i][3] = __fmaf_rn(xv.w, wv.w, acc[i][3]);
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < PROJ_ROWS; ++i) {
++        const float sum = tree32(__fadd_rn(__fadd_rn(acc[i][0], acc[i][1]), __fadd_rn(acc[i][2], acc[i][3])));
++        if (lane == 0 && r0 + i < rows)
++            out[(r0 + i) * out_ld + j] = out_bf16 ? __bfloat16_as_ushort(__float2bfloat16_rn(sum))
++                                                  : __half_as_ushort(__float2half_rn(sum));
++    }
++}
++
++// True when candidate (bv, bi) beats (av, ai): a total order, NaN last, ties to the lower id.
++__device__ __forceinline__ bool beats(float bv, int bi, float av, int ai) {
++    const bool an = av != av, bn = bv != bv;
++    if (an && bn) return bi < ai;
++    if (bn) return false;
++    if (an) return true;
++    return bv > av || (bv == av && bi < ai);
++}
++
++} // namespace
++
++// x [rows, k] at x_ld elements a row; w0 fp16 [n0, k] -> o0 [rows, n0] at o0_ld; w1 [n1, k] -> o1 (n1 may be 0).
++
++// k a multiple of 128; x_ld a multiple of 4; outputs fp16 bits, or bf16 bits when out_bf16 is nonzero.
++extern "C" __global__ void __launch_bounds__(PROJ_WARPS * 32) tf_mm3_proj_bf16(
++    const bf16* __restrict__ x, long long x_ld, const unsigned short* __restrict__ w0, int n0, unsigned short* __restrict__ o0,
++    long long o0_ld, const unsigned short* __restrict__ w1, int n1, unsigned short* __restrict__ o1, long long o1_ld, int rows,
++    int k, int out_bf16) {
++    proj_body<bf16>(x, x_ld, w0, n0, o0, o0_ld, w1, n1, o1, o1_ld, rows, k, out_bf16);
++}
++
++// The same with an fp32 input: a bf16 hidden cast to fp32 gives the same bits as the bf16 form.
++extern "C" __global__ void __launch_bounds__(PROJ_WARPS * 32) tf_mm3_proj_f32(
++    const float* __restrict__ x, long long x_ld, const unsigned short* __restrict__ w0, int n0, unsigned short* __restrict__ o0,
++    long long o0_ld, const unsigned short* __restrict__ w1, int n1, unsigned short* __restrict__ o1, long long o1_ld, int rows,
++    int k, int out_bf16) {
++    proj_body<float>(x, x_ld, w0, n0, o0, o0_ld, w1, n1, o1, o1_ld, rows, k, out_bf16);
++}
++
++// logits fp32 [rows][ld] (the first n of a row are the rank's slice, the rest is padding); out [rows][2] words:
++
++// the winning logit's bits, then id0 + its index.
++extern "C" __global__ void __launch_bounds__(PICK_THREADS) tf_mm3_pick(const float* __restrict__ logits, long long ld,
++                                                                       int n, int id0, unsigned* __restrict__ out) {
++    __shared__ float sv[PICK_THREADS / 32];
++    __shared__ int si[PICK_THREADS / 32];
++    const float* row = logits + (long long)blockIdx.x * ld;
++    float bv = __int_as_float(0x7fc00000); // NaN: loses to everything
++    int bi = 0x7fffffff;
++    for (int i = threadIdx.x; i < n; i += PICK_THREADS) {
++        const float v = __ldg(row + i);
++        if (beats(v, i, bv, bi)) {
++            bv = v;
++            bi = i;
++        }
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (beats(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    if ((threadIdx.x & 31) == 0) {
++        sv[threadIdx.x >> 5] = bv;
++        si[threadIdx.x >> 5] = bi;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float v = sv[0];
++        int i = si[0];
++        for (int w = 1; w < PICK_THREADS / 32; ++w) {
++            if (beats(sv[w], si[w], v, i)) {
++                v = sv[w];
++                i = si[w];
++            }
++        }
++        out[2 * blockIdx.x] = __float_as_uint(v);
++        out[2 * blockIdx.x + 1] = (unsigned)(id0 + i);
++    }
++}
+diff --git a/zig/src/core/contract/minimax_m3_proj_records.zig b/zig/src/core/contract/minimax_m3_proj_records.zig
+new file mode 100644
+index 0000000..c063d02
+--- /dev/null
++++ b/zig/src/core/contract/minimax_m3_proj_records.zig
+@@ -0,0 +1,14 @@
++//! MiniMax-M3.1-Flash index projection and pick launch records: nvcc 13.0.88 cuobjdump, sm_80, 86, 89, 120, 121.
++const L = @import("limits.zig");
++
++fn u(regs: u32, static: u32, bound: u32) L.Usage {
++    return .{ .regs = regs, .static = static, .bound = bound };
++}
++
++pub fn records(comptime Record: type) [3]Record {
++    return .{
++        .{ .launch = .{ .name = "minimax_m3_proj tf_mm3_proj_bf16", .symbol = "tf_mm3_proj_bf16", .image = "minimax_m3_proj", .threads = 128 }, .usage = .{ u(50, 0, 128), u(48, 0, 128), u(48, 0, 128), u(56, 0, 128), u(56, 0, 128) } },
++        .{ .launch = .{ .name = "minimax_m3_proj tf_mm3_proj_f32", .symbol = "tf_mm3_proj_f32", .image = "minimax_m3_proj", .threads = 128 }, .usage = .{ u(56, 0, 128), u(56, 0, 128), u(56, 0, 128), u(58, 0, 128), u(58, 0, 128) } },
++        .{ .launch = .{ .name = "minimax_m3_proj tf_mm3_pick", .symbol = "tf_mm3_pick", .image = "minimax_m3_proj", .threads = 256 }, .usage = .{ u(22, 64, 256), u(24, 64, 256), u(24, 64, 256), u(22, 64, 256), u(22, 64, 256) } },
++    };
++}
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 6adc669..b56ebf8 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -192,7 +192,7 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "experts3_prefill down", .symbol = "_ZN19tf_experts3_prefill14prefill_kernelILi1ELi3ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3_prefill", .threads = 256, .dynamic = 47104, .opt_in = true }, .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_widen", .symbol = "tf_experts3_widen", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_planes", .symbol = "tf_experts3_planes", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 } } },
+-} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("registry_minimax.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("minimax_m3_records.zig").records(CudaRecord) ++ @import("minimax_m3_rows_records.zig").records(CudaRecord);
++} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("registry_minimax.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("minimax_m3_records.zig").records(CudaRecord) ++ @import("minimax_m3_rows_records.zig").records(CudaRecord) ++ @import("minimax_m3_proj_records.zig").records(CudaRecord);
+ 
+ /// The nvcc release `cuda`'s usage records come from: the compiler that builds the release fatbins.
+ pub const cuda_release: limits.Nvcc = .{ .major = 13, .minor = 0 };
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index b73ad1f..13e5f68 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -58,6 +58,7 @@ pub const minimax_m3_index: []const u8 = if (available) &Blob("fatbin_minimax_m3
+ pub const minimax_m3_select: []const u8 = if (available) &Blob("fatbin_minimax_m3_select").bytes else &.{};
+ pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_attn").bytes else &.{};
+ pub const minimax_m3_rows: []const u8 = if (available) &Blob("fatbin_minimax_m3_rows").bytes else &.{};
++pub const minimax_m3_proj: []const u8 = if (available) &Blob("fatbin_minimax_m3_proj").bytes else &.{};
+ pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
+ pub const minimax_m3_act: []const u8 = if (available) &Blob("fatbin_minimax_m3_act").bytes else &.{};
+ pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
+diff --git a/zig/src/cuda/minimax_m3_proj.zig b/zig/src/cuda/minimax_m3_proj.zig
+new file mode 100644
+index 0000000..70676d7
+--- /dev/null
++++ b/zig/src/cuda/minimax_m3_proj.zig
+@@ -0,0 +1,127 @@
++//! MiniMax-M3.1-Flash fp16-weight index projection and per-rank greedy pick (minimax_m3_proj.cu).
++const std = @import("std");
++const kernels = @import("kernels.zig");
++const module = @import("module.zig");
++const launch_ = @import("launch.zig");
++const stream_ = @import("stream.zig");
++
++const Driver = @import("driver.zig").Driver;
++const Module = module.Module;
++const Function = module.Function;
++const Stream = stream_.Stream;
++
++pub const warps = 4; // outputs a block
++pub const row_group = 4; // rows a warp
++pub const chunk = 128; // the reduction length is a multiple: 32 lanes of 4 values
++pub const threads = warps * 32;
++pub const pick_threads = 256;
++pub const max_grid_y = 65535;
++
++/// The dtype of the projection's outputs: fp16 (`index_fp16`, the planner's `iq_raw`/`ik_raw`) or bf16.
++pub const OutType = enum(i32) { f16 = 0, bf16 = 1 };
++
++pub const Launch = struct { grid: [3]u32, block: u32 };
++pub const Error = error{ Empty, TooManyRows, BadStride, Align };
++
++/// One block per 4 outputs (of both matrices), one grid row per 4 rows.
++pub fn projLaunch(rows: usize, outputs: usize) Error!Launch {
++    if (rows == 0 or outputs == 0) return error.Empty;
++    const gy = (rows + row_group - 1) / row_group;
++    if (gy > max_grid_y) return error.TooManyRows;
++    return .{ .grid = .{ @intCast((outputs + warps - 1) / warps), @intCast(gy), 1 }, .block = threads };
++}
++
++pub fn checkProj(k: usize, x_ld: usize) Error!void {
++    if (k == 0 or k % chunk != 0 or x_ld < k or x_ld % 4 != 0) return error.BadStride;
++}
++
++/// One CTA a row; the padded row (`ld` logits) holds the rank's `n` first.
++pub fn pickLaunch(rows: usize, n: usize, ld: usize) Error!Launch {
++    if (rows == 0 or n == 0) return error.Empty;
++    if (rows > std.math.maxInt(i32)) return error.TooManyRows;
++    if (ld < n) return error.BadStride;
++    return .{ .grid = .{ @intCast(rows), 1, 1 }, .block = pick_threads };
++}
++
++/// One matrix of the projection: fp16 weights [n, k] and the [rows, n] output at `out_ld` elements a row.
++pub const Part = struct { w: u64 = 0, n: u32 = 0, out: u64 = 0, out_ld: usize = 0 };
++
++pub const Proj = struct {
++    mod: Module,
++    bf16_fn: Function,
++    f32_fn: Function,
++    pick_fn: Function,
++
++    pub fn load(d: *const Driver) !Proj {
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var m = try Module.load(d, kernels.minimax_m3_proj);
++        errdefer m.unload();
++        return .{
++            .mod = m,
++            .bf16_fn = try m.function("tf_mm3_proj_bf16"),
++            .f32_fn = try m.function("tf_mm3_proj_f32"),
++            .pick_fn = try m.function("tf_mm3_pick"),
++        };
++    }
++
++    pub fn unload(g: *Proj) void {
++        g.mod.unload();
++    }
++
++    fn cfg(l: Launch) launch_.Config {
++        return .{ .grid = .{ .x = l.grid[0], .y = l.grid[1], .z = l.grid[2] }, .block = .{ .x = l.block } };
++    }
++
++    /// out_i [rows, n_i] = x [rows, k] times fp16 w_i [n_i, k] for the index query `a` and key `b` (b.n may be 0).
++    pub fn project(g: *const Proj, st: Stream, x: u64, x_ld: usize, x_f32: bool, k: u32, a: Part, b: Part, rows: usize, ot: OutType) !void {
++        const launch = try projLaunch(rows, @as(usize, a.n) + b.n);
++        try checkProj(k, x_ld);
++        for ([_]Part{ a, b }) |p| {
++            if (p.n == 0) continue;
++            if (p.w == 0 or p.out == 0 or p.out_ld < p.n or p.w % 8 != 0 or p.out % 2 != 0) return error.BadStride;
++        }
++        if (x % (if (x_f32) @as(u64, 16) else 8) != 0) return error.Align;
++        var args: launch_.Args = .{};
++        args.add(x);
++        args.add(@as(i64, @intCast(x_ld)));
++        for ([_]Part{ a, b }) |p| {
++            args.add(p.w);
++            args.add(@as(i32, @intCast(p.n)));
++            args.add(p.out);
++            args.add(@as(i64, @intCast(p.out_ld)));
++        }
++        args.add(@as(i32, @intCast(rows)));
++        args.add(@as(i32, @intCast(k)));
++        args.add(@backingInt(ot));
++        try launch_.launch(if (x_f32) g.f32_fn else g.bf16_fn, cfg(launch), st, &args);
++    }
++
++    /// pairs [rows] = (logit bits, id0 + index) of each padded row's best of `n`; ties to the lower id, NaN last.
++    pub fn pick(g: *const Proj, st: Stream, logits: u64, ld: usize, n: u32, id0: u32, rows: usize, pairs: u64) !void {
++        const launch = try pickLaunch(rows, n, ld);
++        if (logits == 0 or pairs == 0 or logits % 4 != 0 or pairs % 4 != 0 or @as(u64, id0) + n > std.math.maxInt(i32)) return error.BadStride;
++        var args: launch_.Args = .{};
++        args.add(logits);
++        args.add(@as(i64, @intCast(ld)));
++        args.add(@as(i32, @intCast(n)));
++        args.add(@as(i32, @intCast(id0)));
++        args.add(pairs);
++        try launch_.launch(g.pick_fn, cfg(launch), st, &args);
++    }
++};
++
++test "launch geometry: 4 outputs a block, 4 rows a grid row, one CTA a pick row" {
++    const l = try projLaunch(5, 384);
++    try std.testing.expectEqual([3]u32{ 96, 2, 1 }, l.grid);
++    try std.testing.expectEqual(@as(u32, 128), l.block);
++    try std.testing.expectError(error.Empty, projLaunch(0, 384));
++    try std.testing.expectError(error.Empty, projLaunch(1, 0));
++    try std.testing.expectError(error.TooManyRows, projLaunch(4 * max_grid_y + 1, 128));
++    try checkProj(6144, 6144);
++    try std.testing.expectError(error.BadStride, checkProj(6000, 6000));
++    try std.testing.expectError(error.BadStride, checkProj(6144, 6142));
++    const p = try pickLaunch(7, 100_000, 100_096);
++    try std.testing.expectEqual([3]u32{ 7, 1, 1 }, p.grid);
++    try std.testing.expectError(error.BadStride, pickLaunch(1, 10, 9));
++    try std.testing.expectError(error.Empty, pickLaunch(1, 0, 9));
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index 0e99408..63f679d 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -61,6 +61,7 @@ pub const window_attention = @import("window_attention.zig");
+ pub const moe_glue = @import("moe_glue.zig");
+ pub const minimax_m3_sparse = @import("minimax_m3_sparse.zig");
+ pub const minimax_m3_rows = @import("minimax_m3_rows.zig");
++pub const minimax_m3_proj = @import("minimax_m3_proj.zig");
+ pub const dense_rows = @import("dense_rows.zig");
+ pub const exl3 = @import("exl3.zig");
+ pub const exl3_experts = @import("exl3_experts.zig");
+@@ -120,6 +121,7 @@ test {
+     _ = @import("moe_glue.zig");
+     _ = @import("minimax_m3_sparse.zig");
+     _ = @import("minimax_m3_rows.zig");
++    _ = @import("minimax_m3_proj.zig");
+     _ = @import("dense_rows.zig");
+ }
+ 
+diff --git a/zig/src/families/minimax_m3/forward_exec.zig b/zig/src/families/minimax_m3/forward_exec.zig
+index 33e8411..9bc0011 100644
+--- a/zig/src/families/minimax_m3/forward_exec.zig
++++ b/zig/src/families/minimax_m3/forward_exec.zig
+@@ -11,7 +11,7 @@ const Op = plan.Op;
+ const Buf = plan.Buf;
+ const Ref = plan.Ref;
+ 
+-pub const Error = error{ NoIndexProjKernel, NoPickKernel, NoLink, BadOp };
++pub const Error = error{ NoLink, BadOp };
+ 
+ /// Every kernel module a step launches from.
+ pub const Modules = struct {
+@@ -21,6 +21,7 @@ pub const Modules = struct {
+     embed: cuda.embed_rows.EmbedRows,
+     act: cuda.minimax_m3_act.MiniMaxAct,
+     rows: rk.Rows,
++    proj: cuda.minimax_m3_proj.Proj,
+     sparse: sparse.Sparse,
+     scatter: cuda.rank_scatter.RankScatter,
+ 
+@@ -38,6 +39,8 @@ pub const Modules = struct {
+         errdefer m.act.unload();
+         m.rows = try rk.Rows.load(d);
+         errdefer m.rows.unload();
++        m.proj = try cuda.minimax_m3_proj.Proj.load(d);
++        errdefer m.proj.unload();
+         m.sparse = try sparse.Sparse.load(d);
+         errdefer m.sparse.unload();
+         m.scatter = try cuda.rank_scatter.RankScatter.load(d);
+@@ -47,6 +50,7 @@ pub const Modules = struct {
+     pub fn deinit(m: *Modules) void {
+         m.scatter.unload();
+         m.sparse.unload();
++        m.proj.unload();
+         m.rows.unload();
+         m.act.unload();
+         m.embed.unload();
+@@ -212,7 +216,13 @@ pub const Device = struct {
+                     try m.dense.prompt(s, w, dv.at(o.x), .bf16, o.rows, dv.at(o.y), ydt);
+                 } else try m.dense.decode(s, w, dv.at(o.x), .bf16, o.rows, dv.at(o.y), ydt);
+             },
+-            .index_proj => return error.NoIndexProjKernel,
++            .index_proj => |o| {
++                const ly = dv.layer(o.layer);
++                const ot: cuda.minimax_m3_proj.OutType = if (dv.opts.flags.index_fp16) .f16 else .bf16;
++                const q: cuda.minimax_m3_proj.Part = .{ .w = ly.index_q_proj, .n = dv.g.iq_w, .out = dv.b.ptr(.iq_raw), .out_ld = dv.g.iq_w };
++                const k: cuda.minimax_m3_proj.Part = .{ .w = ly.index_k_proj, .n = dv.g.ik_w, .out = dv.b.ptr(.ik_raw), .out_ld = dv.g.ik_w };
++                try m.proj.project(s, dv.b.ptr(.a), hidden, false, hidden, q, k, o.rows, ot);
++            },
+             .qk_rope => |o| try dv.qkRope(o.layer, o.rows),
+             .score => |o| {
+                 const scale: f32 = @floatCast(std.math.pow(f64, 128, -0.5));
+@@ -252,7 +262,12 @@ pub const Device = struct {
+                 const bytes = @as(usize, o.rows) * dv.g.slot * 4;
+                 try link.group.allGather(s, dv.b.ptr(.hlog), dv.b.ptr(.hgather), bytes);
+             },
+-            .local_pick, .pick_gather => return error.NoPickKernel,
++            .local_pick => |o| try m.proj.pick(s, dv.b.ptr(.hlog), dv.g.slot, dv.g.own_vocab, dv.g.vocab_lo, o.rows, dv.b.ptr(.pairs)),
++            .pick_gather => |o| {
++                // [rank][row] pairs of (logit bits, id), the layout of the logits gather with a slot of one pair
++                const link = dv.link orelse return error.NoLink;
++                try link.group.allGather(s, dv.b.ptr(.pairs), dv.b.ptr(.pairs_all), @as(usize, o.rows) * 8);
++            },
+         }
+     }
+ 
+diff --git a/zig/src/families/minimax_m3/tp.zig b/zig/src/families/minimax_m3/tp.zig
+index bb881f1..8bea885 100644
+--- a/zig/src/families/minimax_m3/tp.zig
++++ b/zig/src/families/minimax_m3/tp.zig
+@@ -107,7 +107,13 @@ pub const LogitsGather = struct {
+ /// larger logit, the lower token id on a tie, so it equals argmax over the whole vocabulary taken lowest-id-first.
+ pub const Pick = struct { logit: f32, id: u32 };
+ 
++/// A NaN logit ranks last (all NaN: the lower id), as tf_mm3_pick does, so a NaN rank never hides a finite one.
+ pub fn betterPick(a: Pick, b: Pick) Pick {
++    const an = std.math.isNan(a.logit);
++    const bn = std.math.isNan(b.logit);
++    if (an and bn) return if (b.id < a.id) b else a;
++    if (bn) return a;
++    if (an) return b;
+     if (b.logit > a.logit or (b.logit == a.logit and b.id < a.id)) return b;
+     return a;
+ }
+@@ -357,6 +363,17 @@ test "per-rank argmax merged lowest id first equals argmax over the whole vocabu
+     }
+ }
+ 
++test "picks: a NaN logit ranks last whatever the rank order, all-NaN goes to the lower id" {
++    const nan = std.math.nan(f32);
++    const fin: Pick = .{ .logit = -3, .id = 900 };
++    const bad: Pick = .{ .logit = nan, .id = 5 };
++    try std.testing.expectEqual(fin, mergePicks(&.{ bad, fin }));
++    try std.testing.expectEqual(fin, mergePicks(&.{ fin, bad }));
++    const bad2: Pick = .{ .logit = nan, .id = 400 };
++    try std.testing.expectEqual(@as(u32, 5), mergePicks(&.{ bad2, bad }).id);
++    try std.testing.expectEqual(@as(u32, 5), mergePicks(&.{ bad, bad2 }).id);
++}
++
+ fn bits(x: f32) u32 {
+     return @bitCast(x);
+ }
+diff --git a/zig/tests/cuda/contract_minimax_proj.zig b/zig/tests/cuda/contract_minimax_proj.zig
+new file mode 100644
+index 0000000..07b2a15
+--- /dev/null
++++ b/zig/tests/cuda/contract_minimax_proj.zig
+@@ -0,0 +1,323 @@
++//! MiniMax-M3.1-Flash fp16 index projection and pick under the contract on CUDA, float64 references.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const Dense = contract.dense.Dense;
++const px = cuda.minimax_m3_proj;
++
++const hidden = 6144;
++const iq_w = 256; // a rank's two index heads
++const ik_w = 128;
++
++fn chain(s: c.Shape) usize {
++    return s.k / 128 + 3 + 5;
++}
++
++/// bf16 or fp32 input to an fp16 or bf16 output; the fp32 form must equal the bf16 form's bits.
++pub const Form = enum { bf16_f16, f32_f16, bf16_bf16 };
++
++pub fn projSpec(f: Form) c.Spec {
++    return .{
++        .name = switch (f) {
++            .bf16_f16 => "cuda minimax_m3_proj tf_mm3_proj_bf16 (fp16 out)",
++            .f32_f16 => "cuda minimax_m3_proj tf_mm3_proj_f32 (fp16 out)",
++            .bf16_bf16 => "cuda minimax_m3_proj tf_mm3_proj_bf16 (bf16 out)",
++        },
++        .accum = .f32,
++        .depth = chain,
++        .out = if (f == .bf16_bf16) .bf16 else .f16,
++        .replaces = if (f == .f32_f16) "tf_mm3_proj_bf16" else null,
++        // 4 rows a warp, 4 outputs a block, 128 values a step of the reduction
++        .tiles = .{ .{ .size = px.row_group }, .{ .size = px.warps, .step = 1, .min = 1 }, .{ .size = px.chunk, .step = px.chunk, .min = px.chunk } },
++        .served = &.{
++            .{ .rows = 1, .n = iq_w + ik_w, .k = hidden },
++            .{ .rows = 5, .n = iq_w + ik_w, .k = hidden },
++            .{ .rows = 17, .n = iq_w + ik_w, .k = hidden },
++            .{ .rows = 64, .n = iq_w + ik_w, .k = hidden },
++            .{ .rows = 1, .n = iq_w, .k = hidden },
++        },
++    };
++}
++
++fn half(h: u16) f32 {
++    const v: f16 = @bitCast(h);
++    return v;
++}
++
++fn fp16(v: f32) u16 {
++    const h: f16 = @floatCast(v);
++    return @bitCast(h);
++}
++
++/// n outputs: the first (n + 1) / 2 are the query matrix, the rest the key matrix (n = 1: the key part is empty).
++pub const Proj = struct {
++    rig: rig_.Rig,
++    form: Form,
++    k: *const px.Proj,
++    d: ?Dense = null,
++    x: u64 = 0,
++    w: u64 = 0,
++    base: u64 = 0,
++    out: u64 = 0,
++
++    pub fn deinit(self: *Proj) void {
++        if (self.d) |d| d.deinit();
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Proj) g.Kernel {
++        return .{ .spec = projSpec(self.form), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Proj);
++
++    pub fn prepare(self: *Proj, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (self.d) |d| d.deinit();
++        self.d = null;
++        self.rig.reset();
++        if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.k % px.chunk != 0) return false;
++        const a = self.rig.gpu.gpa;
++        const d = try Dense.init(a, shape, 1);
++        self.d = d;
++        d.fillX(fill, seed, 1);
++        const w = try a.alloc(u16, shape.n * shape.k);
++        defer a.free(w);
++        var prng = std.Random.DefaultPrng.init(seed ^ 0x6d6d3370);
++        const rng = prng.random();
++        const k = shape.k;
++        for (0..shape.n) |j| for (0..k) |i| {
++            // gate 4: integers mirrored into the second half, so fp32 sums are exact in any order
++            const v: f32 = if (fill != .stress) (rng.float(f32) - 0.5) * 0.1 else if (i < k / 2) @floatFromInt(1 + rng.uintLessThan(u32, 7)) else -half(w[j * k + i - k / 2]);
++            w[j * k + i] = fp16(v);
++            d.w[j * k + i] = half(w[j * k + i]);
++        };
++        if (self.form == .f32_f16) {
++            const xf = try a.alloc(f32, d.x.len);
++            defer a.free(xf);
++            for (xf, d.x) |*o, h| o.* = c.fromBf16(h);
++            self.x = try self.rig.input(std.mem.sliceAsBytes(xf));
++        } else self.x = try self.rig.input(std.mem.sliceAsBytes(d.x));
++        self.w = try self.rig.input(std.mem.sliceAsBytes(w));
++        self.out = try self.rig.output(shape.rows * shape.n * 2);
++        if (self.form == .f32_f16) self.base = try self.rig.scratch(shape.rows * shape.n * 2);
++        return true;
++    }
++
++    fn launch(self: *Proj, x_f32: bool, x: u64, out: u64) !void {
++        const sh = self.d.?.shape;
++        const n0 = (sh.n + 1) / 2;
++        const n1 = sh.n - n0;
++        const a: px.Part = .{ .w = self.w, .n = @intCast(n0), .out = out, .out_ld = sh.n };
++        const b: px.Part = .{ .w = self.w + n0 * sh.k * 2, .n = @intCast(n1), .out = out + n0 * 2, .out_ld = sh.n };
++        try self.k.project(self.rig.s, x, sh.k, x_f32, @intCast(sh.k), a, b, sh.rows, if (self.form == .bf16_bf16) .bf16 else .f16);
++    }
++
++    pub fn run(self: *Proj) !void {
++        try self.launch(self.form == .f32_f16, self.x, self.out);
++        try self.rig.s.synchronize();
++    }
++
++    /// The bf16-input form on the same values.
++    pub fn replaced(self: *Proj) ![]const u8 {
++        const d = self.d.?;
++        const xb = std.mem.sliceAsBytes(d.x);
++        const dev = try self.rig.scratch(xb.len);
++        const b: cuda.DeviceBuffer = .{ .d = self.rig.gpu.d, .ptr = dev, .len = xb.len };
++        try b.upload(0, xb);
++        try self.launch(false, dev, self.base);
++        return self.rig.bytes(self.base, self.count() * 2);
++    }
++
++    pub fn count(self: *Proj) usize {
++        return self.d.?.outputs();
++    }
++
++    pub fn reference(self: *Proj, want: []f64, mag: []f64) !void {
++        return self.d.?.reference(want, mag);
++    }
++
++    pub fn simulate(self: *Proj, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return self.d.?.simulate(acc, order, out);
++    }
++};
++
++pub const pick_spec: c.Spec = .{
++    .name = "cuda minimax_m3_proj tf_mm3_pick",
++    .accum = .none,
++    .depth = pickDepth,
++    .out = .f32,
++    .nan = .{ .stated = "a NaN logit ranks last; all NaN picks the lowest id; larger logit wins, ties go to the lowest id" },
++    // a row a CTA; 256 threads stride the slice, so the edges are the thread count and its neighbours
++    .tiles = .{ .{}, .{}, .{ .size = px.pick_threads, .step = 1, .min = 1 } },
++    .served = &.{
++        .{ .rows = 1, .n = 1, .k = pick_slot },
++        .{ .rows = 5, .n = 1, .k = pick_slot },
++        .{ .rows = 128, .n = 1, .k = pick_slot },
++        .{ .rows = 1, .n = 1, .k = pick_slot - 128 },
++    },
++    .sums = .{ .f16 = 0, .bf16 = 0, .why = "a pick compares and sums nothing" },
++};
++
++fn pickDepth(_: c.Shape) usize {
++    return 1;
++}
++
++const pick_slot = 782 * 128; // the largest rank slice of the 200,064-token vocabulary
++const pick_pad = 64; // decoy logits after the slice in every row
++const pick_id0: u32 = 782 * 128; // rank 1's first id
++
++pub const Pick = struct {
++    rig: rig_.Rig,
++    k: *const px.Proj,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    logits: []f32 = &.{},
++    input: u64 = 0,
++    output: u64 = 0,
++    probe: u64 = 0,
++
++    pub fn deinit(self: *Pick) void {
++        self.rig.gpu.gpa.free(self.logits);
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Pick) g.Kernel {
++        return .{ .spec = pick_spec, .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Pick);
++
++    fn ld(self: *const Pick) usize {
++        return self.shape.k + pick_pad;
++    }
++
++    /// Row patterns by r % 8 (random, ties, NaNs, infinities, the maximum last); the padding is +inf, a decoy.
++    pub fn prepare(self: *Pick, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.rows > 128 or shape.n != 1 or shape.k == 0 or shape.k > pick_slot) return false;
++        self.rig.reset();
++        const a = self.rig.gpu.gpa;
++        a.free(self.logits);
++        self.logits = &.{};
++        self.shape = shape;
++        self.logits = try a.alloc(f32, shape.rows * self.ld());
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const k = shape.k;
++        const nan = std.math.nan(f32);
++        for (0..shape.rows) |r| {
++            const row = self.logits[r * self.ld() ..][0..self.ld()];
++            @memset(row[k..], std.math.inf(f32));
++            for (row[0..k], 0..) |*v, i| v.* = switch (r % 8) {
++                0 => rng.floatNorm(f32) * 3,
++                1 => @floatFromInt(rng.intRangeAtMost(i32, -3, 3)),
++                2 => 1.5,
++                3 => if (i % 5 == 0) nan else rng.floatNorm(f32),
++                4 => nan,
++                5 => if (i == k / 3 or i == k - 1) std.math.inf(f32) else -std.math.inf(f32),
++                6 => -std.math.inf(f32),
++                else => if (i + 1 == k) 100 else rng.floatNorm(f32),
++            };
++            if (fill == .stress) @memset(row[0..k], 0); // ties everywhere: id 0
++        }
++        self.input = try self.rig.input(std.mem.sliceAsBytes(self.logits));
++        self.output = try self.rig.output(self.count() * 4);
++        self.probe = try self.rig.scratch(8);
++        return true;
++    }
++
++    fn launch(self: *Pick, logits: u64, out: u64, rows: usize) !void {
++        try self.k.pick(self.rig.s, logits, self.ld(), @intCast(self.shape.k), pick_id0, rows, out);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn run(self: *Pick) !void {
++        try self.launch(self.input, self.output, self.shape.rows);
++    }
++
++    pub fn count(self: *Pick) usize {
++        return self.shape.rows * 2;
++    }
++
++    const Best = struct { logit: f32, id: u32 };
++
++    /// The oracle: a linear scan with the stated order.
++    fn expected(row: []const f32) Best {
++        var best: Best = .{ .logit = row[0], .id = 0 };
++        for (row[1..], 1..) |v, i| {
++            const better = if (std.math.isNan(v)) false else if (std.math.isNan(best.logit)) true else v > best.logit;
++            if (better) best = .{ .logit = v, .id = @intCast(i) };
++        }
++        return .{ .logit = best.logit, .id = pick_id0 + best.id };
++    }
++
++    pub fn reference(self: *Pick, want: []f64, mag: []f64) !void {
++        for (0..self.shape.rows) |r| {
++            const e = expected(self.logits[r * self.ld() ..][0..self.shape.k]);
++            want[2 * r] = e.logit;
++            want[2 * r + 1] = @as(f32, @bitCast(e.id));
++            mag[2 * r] = 0;
++            mag[2 * r + 1] = 0;
++        }
++    }
++
++    /// Bits, not tolerances: the winning logit's bits (any NaN for an all-NaN row), its id, the guards, the inputs.
++    pub fn check(self: *Pick, at: g.Gate) !?[]const u8 {
++        const a = self.rig.gpu.gpa;
++        const actual = try a.dupe(u8, try self.rig.outputBytes());
++        defer a.free(actual);
++        for (0..self.shape.rows) |r| {
++            const e = expected(self.logits[r * self.ld() ..][0..self.shape.k]);
++            const got_bits = std.mem.readInt(u32, actual[8 * r ..][0..4], .little);
++            const got_id = std.mem.readInt(u32, actual[8 * r + 4 ..][0..4], .little);
++            const got: f32 = @bitCast(got_bits);
++            if (std.math.isNan(e.logit)) {
++                if (!std.math.isNan(got)) return "an all-NaN row did not return NaN";
++            } else if (got_bits != @as(u32, @bitCast(e.logit))) return "the winning logit's bits differ from the scan's";
++            if (got_id != e.id) return "the winning id differs from the lowest-id scan";
++            if (at == .shapes) {
++                try self.launch(self.input + r * self.ld() * 4, self.probe, 1);
++                if (!std.mem.eql(u8, actual[8 * r ..][0..8], try self.rig.bytes(self.probe, 8))) return "a batched row differs from the same row picked alone";
++            }
++        }
++        if (!try self.rig.intact()) return "the pick changed a buffer guard";
++        if (!std.mem.eql(u8, std.mem.sliceAsBytes(self.logits), try self.rig.inputBytes())) return "the pick changed the logits";
++        return null;
++    }
++};
++
++/// tf-cuda-test mm3-proj-contract: these kernels alone through gates 1 to 4.
++pub fn run(gpu: @import("check.zig").Gpu) !void {
++    const check = @import("check.zig");
++    const a = gpu.gpa;
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var k = try px.Proj.load(gpu.d);
++    defer k.unload();
++    var projs: [3]Proj = undefined;
++    for (std.enums.values(Form), &projs) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .k = &k };
++    defer for (&projs) |*x| x.deinit();
++    var pick: Pick = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &k };
++    defer pick.deinit();
++    var kernels: std.ArrayList(g.Kernel) = .empty;
++    defer kernels.deinit(a);
++    for (&projs) |*x| try kernels.append(a, x.kernel());
++    try kernels.append(a, pick.kernel());
++    var t: g.Tally = .{};
++    try g.runAll(a, kernels.items, 0x6d33, &t);
++    std.debug.print("SUMMARY mm3-proj-contract {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings\n", .{ t.kernels, t.passed, t.failed, t.known });
++    try check.expect(t.failed == 0, "mm3-proj-contract: {d} gate failures", .{t.failed});
++}
++
++test "the served shapes fit the launches, and the pick's slice is rank 0's largest share" {
++    for (projSpec(.bf16_f16).served) |s| {
++        _ = try px.projLaunch(s.rows, s.n);
++        try px.checkProj(s.k, s.k);
++    }
++    for (pick_spec.served) |s| _ = try px.pickLaunch(s.rows, s.k, s.k + pick_pad);
++    try std.testing.expectEqual(@as(usize, 100_096), pick_slot);
++    try std.testing.expectEqual(@as(?[]const u8, "tf_mm3_proj_bf16"), projSpec(.f32_f16).replaces);
++}
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index eb3ba08..2060454 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -42,6 +42,7 @@ const window_k = @import("contract_window.zig");
+ const moe_k = @import("contract_moe.zig");
+ const mm3_k = @import("contract_minimax_sparse.zig");
+ const mm3_rows_k = @import("contract_minimax_rows.zig");
++const mm3_proj_k = @import("contract_minimax_proj.zig");
+ const qkr_k = @import("contract_qk_round.zig");
+ const fact_k = @import("contract_flashnext_fact.zig");
+ const route_k = @import("contract_route_rows.zig");
+@@ -66,7 +67,7 @@ const h3_image = struct {
+ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
+     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
+-    inline for (.{ "tree_round", "act_rows", "minimax_m3_act", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "minimax_m3_index", "minimax_m3_select", "minimax_m3_attn", "minimax_m3_rows", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
++    inline for (.{ "tree_round", "act_rows", "minimax_m3_act", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "minimax_m3_index", "minimax_m3_select", "minimax_m3_attn", "minimax_m3_rows", "minimax_m3_proj", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
+     std.debug.print("FAIL kernel-contract: unknown image name: {s}\n", .{name});
+     return error.UnknownContractImage;
+@@ -348,6 +349,15 @@ pub fn run(gpu: check.Gpu) !void {
+     for (mm3_rows_k.cfgs, &mm3_writers) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .k = &mm3_rows, .arena = .init(a) };
+     defer for (&mm3_writers) |*x| x.deinit();
+     for (&mm3_writers) |*x| try kernels.append(a, x.kernel());
++    var mm3_proj = try cuda.minimax_m3_proj.Proj.load(gpu.d);
++    defer mm3_proj.unload();
++    var mm3_projs: [3]mm3_proj_k.Proj = undefined;
++    for (std.enums.values(mm3_proj_k.Form), &mm3_projs) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .k = &mm3_proj };
++    defer for (&mm3_projs) |*x| x.deinit();
++    for (&mm3_projs) |*x| try kernels.append(a, x.kernel());
++    var mm3_pick: mm3_proj_k.Pick = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &mm3_proj };
++    defer mm3_pick.deinit();
++    try kernels.append(a, mm3_pick.kernel());
+     var moe_fns = try cuda.moe_glue.MoeGlue.load(gpu.d);
+     defer moe_fns.unload();
+     var topks: [moe_k.routes.len]moe_k.TopK = undefined;
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index d7dd86f..505ee05 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -197,6 +197,7 @@ const usage =
+     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
+     \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
+     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
++    \\  mm3-proj-contract         MiniMax-M3.1-Flash index projection and pick kernels alone through gates 1-4 (no controls, no limits)
+     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
+     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
+     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
+@@ -376,6 +377,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "gdn-back-27b")) return gdn_back_tests.runShape(gpu, 5120, 64);
+     if (std.mem.eql(u8, cmd, "kernel-contract")) return contract_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
++    if (std.mem.eql(u8, cmd, "mm3-proj-contract")) return @import("contract_minimax_proj.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
+diff --git a/zig/tests/minimax_proj_tests.zig b/zig/tests/minimax_proj_tests.zig
+new file mode 100644
+index 0000000..2bdf766
+--- /dev/null
++++ b/zig/tests/minimax_proj_tests.zig
+@@ -0,0 +1,283 @@
++//! MiniMax-M3.1-Flash fp16 index projection and per-rank pick, host only: twins, mutants, merge rule, records.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++const tp = @import("mm3_tp");
++const twin = @import("minimax_proj_twin.zig");
++
++const c = core.contract.spec;
++const px = cuda.minimax_m3_proj;
++const testing = std.testing;
++const registry = core.contract.registry;
++
++const hidden = 6144;
++const iq_w = 256; // this rank's two index heads
++const ik_w = 128;
++
++test {
++    _ = px;
++}
++
++fn bf16v(rng: std.Random, n: usize, sd: f32) ![]f32 {
++    const v = try testing.allocator.alloc(f32, n);
++    for (v) |*x| x.* = c.fromBf16(c.toBf16(rng.floatNorm(f32) * sd));
++    return v;
++}
++
++fn fp16v(rng: std.Random, n: usize, sd: f32) ![]f32 {
++    const v = try testing.allocator.alloc(f32, n);
++    for (v) |*x| {
++        const h: f16 = @floatCast(rng.floatNorm(f32) * sd);
++        x.* = h;
++    }
++    return v;
++}
++
++fn fromBits(ot: twin.OutType, b: u16) f64 {
++    return switch (ot) {
++        .f16 => @as(f16, @bitCast(b)),
++        .bf16 => c.fromBf16(b),
++    };
++}
++
++/// The projection of `rows` rows through `n` outputs, as the kernel's call computes it.
++fn call(x: []const f32, w: []const f32, rows: usize, n: usize, ot: twin.OutType, m: twin.Mutant, out: []u16) void {
++    for (0..rows) |r| for (0..n) |e| {
++        out[r * n + e] = twin.proj(x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden], hidden, rows, ot, m);
++    };
++}
++
++fn dot(x: []const f32, w: []const f32) struct { sum: f64, mag: f64 } {
++    var s: f64 = 0;
++    var a: f64 = 0;
++    for (x, w) |p, q| {
++        s += @as(f64, p) * q;
++        a += @abs(@as(f64, p) * q);
++    }
++    return .{ .sum = s, .mag = a };
++}
++
++test "products of bf16 and fp16 values are exact in fp32, so the fma only rounds the sums" {
++    var prng = std.Random.DefaultPrng.init(41);
++    const rng = prng.random();
++    for (0..20000) |_| {
++        const a = c.fromBf16(c.toBf16(rng.floatNorm(f32) * 3));
++        const hw: f16 = @floatCast(rng.floatNorm(f32) * 0.2);
++        const b: f32 = hw;
++        try testing.expectEqual(@as(f64, a) * b, @as(f64, a * b));
++    }
++}
++
++test "fp32 sums track the float64 dot within the chain bound, rows 1 to 17, fp16 and bf16 outputs, both matrices" {
++    var prng = std.Random.DefaultPrng.init(42);
++    const rng = prng.random();
++    const x = try bf16v(rng, 17 * hidden, 1.5);
++    defer testing.allocator.free(x);
++    const w = try fp16v(rng, iq_w * hidden, 0.03);
++    defer testing.allocator.free(w);
++    const out = try testing.allocator.alloc(u16, 17 * iq_w);
++    defer testing.allocator.free(out);
++    inline for (.{ twin.OutType.f16, twin.OutType.bf16 }) |ot| {
++        call(x, w, 17, iq_w, ot, .none, out);
++        const unit: f64 = if (ot == .f16) 0x1p-11 else 0x1p-8;
++        for (0..17) |r| for (0..iq_w) |e| {
++            const d = dot(x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden]);
++            // 48 fma steps a lane chain, the 4-chain sum, the 5-level tree, then the one rounding to the output
++            const work = c.gamma(48 + 3 + 5, 0x1p-24) * d.mag;
++            const got = fromBits(ot, out[r * iq_w + e]);
++            try testing.expect(@abs(got - d.sum) <= work + unit * (@abs(d.sum) + work) + (if (ot == .f16) 0x1p-24 else 0x1p-133));
++        };
++    }
++}
++
++test "a row's fp32 sum is the same in a call of 1, 3, 4, 5 or 17 rows and at any row index; the planted faults are caught" {
++    var prng = std.Random.DefaultPrng.init(43);
++    const rng = prng.random();
++    const x = try bf16v(rng, 17 * hidden, 2);
++    defer testing.allocator.free(x);
++    const w = try fp16v(rng, ik_w * hidden, 0.05);
++    defer testing.allocator.free(w);
++    // the sums, before the output's rounding hides their last 13 bits
++    var full: [17 * ik_w]f32 = undefined;
++    var part: [17 * ik_w]f32 = undefined;
++    sums(x, w, 17, .none, &full);
++    for ([_]usize{ 1, 3, 4, 5 }) |n| {
++        sums(x[0 .. n * hidden], w, n, .none, part[0 .. n * ik_w]);
++        try testing.expectEqualSlices(f32, full[0 .. n * ik_w], part[0 .. n * ik_w]);
++    }
++    sums(x[16 * hidden ..], w, 1, .none, part[0..ik_w]);
++    try testing.expectEqualSlices(f32, full[16 * ik_w ..][0..ik_w], part[0..ik_w]);
++    // a depth that follows the row count: row 0 of 17 differs from row 0 alone
++    var one: [ik_w]f32 = undefined;
++    sums(x, w, 17, .split_by_rows, &part);
++    sums(x[0..hidden], w, 1, .split_by_rows, &one);
++    try testing.expect(!std.mem.eql(f32, part[0..ik_w], &one));
++    // the other faults change the sums of a call that the real order leaves alone
++    for ([_]twin.Mutant{ .reorder_chains, .drops_tail, .half_accum }) |bad| {
++        sums(x, w, 17, bad, &part);
++        try testing.expect(!std.mem.eql(f32, &full, &part));
++    }
++    // rounding to the wrong type changes the output bits
++    var bits: [17 * ik_w]u16 = undefined;
++    var wrong: [17 * ik_w]u16 = undefined;
++    call(x, w, 17, ik_w, .f16, .none, &bits);
++    call(x, w, 17, ik_w, .f16, .wrong_out, &wrong);
++    try testing.expect(!std.mem.eql(u16, &bits, &wrong));
++}
++
++fn sums(x: []const f32, w: []const f32, rows: usize, m: twin.Mutant, out: []f32) void {
++    for (0..rows) |r| for (0..ik_w) |e| {
++        out[r * ik_w + e] = twin.projSum(x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden], hidden, rows, m);
++    };
++}
++
++test "integer inputs sum exactly in any order: the kernel's order equals float64, half accumulation and a dropped tail do not" {
++    var prng = std.Random.DefaultPrng.init(44);
++    const rng = prng.random();
++    const x = try testing.allocator.alloc(f32, 3 * hidden);
++    defer testing.allocator.free(x);
++    const w = try testing.allocator.alloc(f32, 8 * hidden);
++    defer testing.allocator.free(w);
++    // gate 4's shape: multiples mirrored into the second half, partial sums near 2^20, the result small
++    for (0..3) |r| for (0..hidden / 2) |i| {
++        const v: f32 = @floatFromInt(1 + rng.uintLessThan(u32, 32));
++        x[r * hidden + i] = v;
++        x[r * hidden + hidden / 2 + i] = v + if (i < 8) @as(f32, 1) else 0;
++    };
++    for (0..8) |e| for (0..hidden / 2) |i| {
++        const v: f32 = @floatFromInt(1 + rng.uintLessThan(u32, 7));
++        w[e * hidden + i] = v;
++        w[e * hidden + hidden / 2 + i] = -v;
++    };
++    var out: [3 * 8]u16 = undefined;
++    call(x, w, 3, 8, .bf16, .none, &out);
++    for (0..3) |r| for (0..8) |e| {
++        const d = dot(x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden]);
++        try testing.expectEqual(c.toBf16(@floatCast(d.sum)), out[r * 8 + e]);
++    };
++    for ([_]twin.Mutant{ .half_accum, .drops_tail }) |bad| {
++        var got: [3 * 8]u16 = undefined;
++        call(x, w, 3, 8, .bf16, bad, &got);
++        try testing.expect(!std.mem.eql(u16, &out, &got));
++    }
++}
++
++test "NaN and infinities reach the output as float64 arithmetic gives them" {
++    var prng = std.Random.DefaultPrng.init(45);
++    const rng = prng.random();
++    const x = try bf16v(rng, 4 * hidden, 1);
++    defer testing.allocator.free(x);
++    const w = try fp16v(rng, 16 * hidden, 0.05);
++    defer testing.allocator.free(w);
++    x[0 * hidden + 77] = std.math.nan(f32);
++    x[1 * hidden + 5000] = std.math.inf(f32);
++    x[2 * hidden + 6143] = -std.math.inf(f32);
++    x[2 * hidden + 3] = std.math.inf(f32);
++    var out: [4 * 16]u16 = undefined;
++    call(x, w, 4, 16, .f16, .none, &out);
++    for (0..4) |r| for (0..16) |e| {
++        const d = dot(x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden]);
++        try testing.expectEqual(c.classOf(d.sum), c.classOf(fromBits(.f16, out[r * 16 + e])));
++    };
++}
++
++test "pick: the slice's best, ties to the lowest id, the vocabulary id is id0 plus the index, padding is never read" {
++    var prng = std.Random.DefaultPrng.init(46);
++    const rng = prng.random();
++    var row: [3000]f32 = undefined;
++    for (0..200) |t| {
++        const n = 1 + rng.uintLessThan(usize, 2999);
++        for (&row) |*v| v.* = @floatFromInt(rng.intRangeAtMost(i32, -4, 4)); // many ties
++        for (row[n..]) |*v| v.* = 1000; // padding that would win
++        const id0: u32 = 782 * 128 * @as(u32, @intCast(t % 2));
++        const got = twin.pick(&row, n, id0, .none);
++        var best: usize = 0;
++        for (row[0..n], 0..) |v, i| if (v > row[best]) {
++            best = i;
++        };
++        try testing.expectEqual(row[best], got.logit);
++        try testing.expectEqual(id0 + @as(u32, @intCast(best)), got.id);
++        for ([_]twin.Mutant{ .forgets_id0, .scans_padding }) |bad| {
++            const w = twin.pick(&row, n, id0 + 1, bad);
++            try testing.expect(w.id != id0 + 1 + @as(u32, @intCast(best)) or w.logit != got.logit);
++        }
++    }
++}
++
++test "pick: two ranks' picks merge to the argmax of the whole vocabulary, as tp.mergePicks gives it" {
++    var prng = std.Random.DefaultPrng.init(47);
++    const rng = prng.random();
++    const split = [2][2]usize{ .{ 0, 384 }, .{ 384, 640 } }; // 5 units of 128 over 2 ranks: 3 and 2 (shard.Share)
++    var logits: [640]f32 = undefined;
++    for (0..300) |_| {
++        for (&logits) |*x| x.* = @floatFromInt(rng.intRangeAtMost(i32, -3, 3));
++        var picks: [2]tp.Pick = undefined;
++        for (0..2) |r| {
++            const lo = split[r][0];
++            const hi = split[r][1];
++            var row: [400]f32 = @splat(7777); // padded slot
++            @memcpy(row[0 .. hi - lo], logits[lo..hi]);
++            const p = twin.pick(&row, hi - lo, @intCast(lo), .none);
++            picks[r] = .{ .logit = p.logit, .id = p.id };
++        }
++        const merged = tp.mergePicks(&picks);
++        const mx = std.mem.max(f32, &logits);
++        try testing.expectEqual(mx, merged.logit);
++        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOfScalar(f32, &logits, mx).?)), merged.id);
++    }
++}
++
++test "pick: NaN ranks last, an all-NaN row goes to its lowest id, and the planted faults are caught" {
++    const nan = std.math.nan(f32);
++    var row: [1000]f32 = undefined;
++    for (&row, 0..) |*v, i| v.* = @floatFromInt(@as(i32, @intCast(i % 7)) - 3);
++    row[0] = nan;
++    row[5] = nan;
++    const got = twin.pick(&row, 1000, 100, .none);
++    try testing.expectEqual(@as(f32, 3), got.logit);
++    try testing.expectEqual(@as(u32, 100 + 6), got.id); // the first 3 is at index 6
++    // a NaN at the lowest index stays under the older comparison, a NaN-wins pick returns it
++    try testing.expect(std.math.isNan(twin.pick(&row, 1000, 100, .nan_wins).logit));
++    try testing.expect(std.math.isNan(twin.pick(&row, 1000, 100, .nan_first_stays).logit));
++    // the tie rule: the highest id wins under the planted fault
++    try testing.expect(twin.pick(&row, 1000, 100, .ties_to_last).id != got.id);
++    @memset(&row, nan);
++    const all = twin.pick(&row, 700, 5, .none);
++    try testing.expect(std.math.isNan(all.logit));
++    try testing.expectEqual(@as(u32, 5), all.id);
++    // fewer logits than threads: the idle threads never win
++    const small = twin.pick(&[_]f32{ -5, -2, -9 }, 3, 40, .none);
++    try testing.expectEqual(@as(f32, -2), small.logit);
++    try testing.expectEqual(@as(u32, 41), small.id);
++    // the host merge ranks NaN last too, in either order
++    const fin: tp.Pick = .{ .logit = -8, .id = 700 };
++    try testing.expectEqual(fin, tp.mergePicks(&.{ .{ .logit = nan, .id = 3 }, fin }));
++    try testing.expectEqual(fin, tp.mergePicks(&.{ fin, .{ .logit = nan, .id = 3 } }));
++}
++
++test "gate 5: the three launches are registered, match the geometry, and fit every chip" {
++    const want = [_]struct { sym: []const u8, threads: u32, static: u32 }{
++        .{ .sym = "tf_mm3_proj_bf16", .threads = px.threads, .static = 0 },
++        .{ .sym = "tf_mm3_proj_f32", .threads = px.threads, .static = 0 },
++        .{ .sym = "tf_mm3_pick", .threads = px.pick_threads, .static = 2 * (px.pick_threads / 32) * 4 },
++    };
++    var mine: [3]registry.CudaRecord = undefined;
++    for (want, &mine) |w, *m| {
++        const rec = for (registry.cuda) |r| {
++            if (std.mem.eql(u8, r.launch.symbol, w.sym)) break r;
++        } else return error.RecordMissing;
++        try testing.expectEqualStrings("minimax_m3_proj", rec.launch.image);
++        try testing.expectEqual(w.threads, rec.launch.threads);
++        try testing.expectEqual(@as(u32, 0), rec.launch.dynamic);
++        for (rec.usage) |u| {
++            try testing.expectEqual(w.static, u.static);
++            try testing.expectEqual(w.threads, u.bound);
++            try testing.expect(u.regs * w.threads <= 65536);
++        }
++        m.* = rec;
++    }
++    try testing.expectEqual(@as(usize, 0), try registry.checkCuda(testing.allocator, &mine, true));
++    var over = mine[2];
++    over.launch.threads = 512;
++    try testing.expect(try registry.checkCuda(testing.allocator, &.{over}, true) > 0);
++}
+diff --git a/zig/tests/minimax_proj_twin.zig b/zig/tests/minimax_proj_twin.zig
+new file mode 100644
+index 0000000..256a069
+--- /dev/null
++++ b/zig/tests/minimax_proj_twin.zig
+@@ -0,0 +1,126 @@
++//! Host twins of minimax_m3_proj.cu: the same fp32 operation order of the projection and the pick, with mutants.
++const std = @import("std");
++const core = @import("core");
++
++const c = core.contract.spec;
++
++pub const Mutant = enum {
++    none,
++    /// The projection's chain assignment follows the row count (a split-K whose depth depends on the call).
++    split_by_rows,
++    /// The four lane chains are summed in a different order.
++    reorder_chains,
++    /// The result is rounded to bf16 although fp16 was asked.
++    wrong_out,
++    /// The last chunk of the reduction is not read.
++    drops_tail,
++    /// The chains accumulate in fp16.
++    half_accum,
++    /// The pick: equal logits go to the higher id.
++    ties_to_last,
++    /// The pick: a NaN beats every number.
++    nan_wins,
++    /// The pick: the id is the index in the slice, not the vocabulary id.
++    forgets_id0,
++    /// The pick: the padding after the slice is scanned too.
++    scans_padding,
++    /// The pick: the first NaN a lane sees stays (the comparison tp.zig had before it ranked NaN last).
++    nan_first_stays,
++};
++
++fn tree(v: *[32]f32) f32 {
++    var o: usize = 16;
++    while (o > 0) : (o >>= 1) {
++        var next: [32]f32 = undefined;
++        for (&next, 0..) |*n, l| n.* = v[l] + v[l ^ o];
++        v.* = next;
++    }
++    return v[0];
++}
++
++pub const OutType = enum { f16, bf16 };
++
++/// One output's fp32 sum as the kernel forms it: x exact bf16 or fp32 values, w exact fp16 values.
++pub fn projSum(x: []const f32, w: []const f32, k: usize, rows_in_call: usize, m: Mutant) f32 {
++    var lane: [32]f32 = undefined;
++    const slices: usize = if (m == .split_by_rows) @max(1, @min(rows_in_call, 4)) else 1;
++    const chunks = if (m == .drops_tail) k / 128 - 1 else k / 128;
++    for (&lane, 0..) |*s, l| {
++        var acc: [4]f32 = @splat(0);
++        var j: usize = 0;
++        while (j < chunks) : (j += 1) {
++            const at = 4 * (l + 32 * j);
++            for (0..4) |i| {
++                const slot = if (slices > 1) (j % slices) % 4 else i;
++                if (m == .half_accum) {
++                    const h: f16 = @floatCast(@mulAdd(f32, x[at + i], w[at + i], acc[slot]));
++                    acc[slot] = h;
++                } else acc[slot] = @mulAdd(f32, x[at + i], w[at + i], acc[slot]);
++            }
++        }
++        s.* = if (m == .reorder_chains) (acc[0] + acc[2]) + (acc[1] + acc[3]) else (acc[0] + acc[1]) + (acc[2] + acc[3]);
++    }
++    return tree(&lane);
++}
++
++/// The bits of the sum's single rounding to fp16 or bf16 (the planted `wrong_out` rounds to the other).
++pub fn proj(x: []const f32, w: []const f32, k: usize, rows_in_call: usize, ot: OutType, m: Mutant) u16 {
++    const sum = projSum(x, w, k, rows_in_call, m);
++    const to_bf = (ot == .bf16) != (m == .wrong_out);
++    if (to_bf) return c.toBf16(sum);
++    const h: f16 = @floatCast(sum);
++    return @bitCast(h);
++}
++
++pub const Pick = struct { logit: f32, id: u32 };
++
++/// The kernel's order: true when (bv, bi) beats (av, ai).
++fn beats(bv: f32, bi: u32, av: f32, ai: u32, m: Mutant) bool {
++    const an = std.math.isNan(av);
++    const bn = std.math.isNan(bv);
++    if (m == .nan_wins) {
++        if (bn) return !an or bi < ai;
++        if (an) return false;
++    } else if (m == .nan_first_stays) {
++        if (an or bn) return false;
++    } else {
++        if (an and bn) return bi < ai;
++        if (bn) return false;
++        if (an) return true;
++    }
++    if (m == .ties_to_last) return bv > av or (bv == av and bi > ai);
++    return bv > av or (bv == av and bi < ai);
++}
++
++/// tf_mm3_pick on one padded row: 256 threads stride the slice, a warp's lanes meet in an xor tree, then the warps.
++pub fn pick(row: []const f32, n: usize, id0: u32, m: Mutant) Pick {
++    const nan = std.math.nan(f32);
++    const scan = if (m == .scans_padding) row.len else n;
++    var t: [256]Pick = undefined;
++    for (&t, 0..) |*p, th| {
++        p.* = .{ .logit = nan, .id = std.math.maxInt(i32) };
++        var i = th;
++        while (i < scan) : (i += 256) {
++            if (beats(row[i], @intCast(i), p.logit, p.id, m)) p.* = .{ .logit = row[i], .id = @intCast(i) };
++        }
++    }
++    var warp: [8]Pick = undefined;
++    for (&warp, 0..) |*w, wi| {
++        var lanes: [32]Pick = t[wi * 32 ..][0..32].*;
++        var o: usize = 16;
++        while (o > 0) : (o >>= 1) {
++            var next = lanes;
++            for (&next, 0..) |*p, l| {
++                const other = lanes[l ^ o];
++                if (beats(other.logit, other.id, p.logit, p.id, m)) p.* = other;
++            }
++            lanes = next;
++        }
++        w.* = lanes[0];
++    }
++    var best = warp[0];
++    for (warp[1..]) |p| if (beats(p.logit, p.id, best.logit, best.id, m)) {
++        best = p;
++    };
++    return .{ .logit = best.logit, .id = if (m == .forgets_id0) best.id else id0 + best.id };
++}
+-- 
+2.43.0
+

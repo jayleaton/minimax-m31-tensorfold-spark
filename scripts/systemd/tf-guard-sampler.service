@@ -1,0 +1,14 @@
+# Two-node memory / thermal-zone telemetry for the guard (scripts/guard/sampler.py): rank 0 locally, rank 1 over ssh.
+# Ported from the DeepSeek-V4.1 recipe (PR #48). Install as a user unit (docs/OPERATIONS.md); WorkingDirectory is
+# this checkout.
+[Unit]
+Description=TensorFold guard telemetry sampler
+
+[Service]
+WorkingDirectory=%h/minimax-m31-tensorfold-spark
+ExecStart=/usr/bin/env python3 scripts/guard/sampler.py --config %h/.config/tf-guard/guard.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

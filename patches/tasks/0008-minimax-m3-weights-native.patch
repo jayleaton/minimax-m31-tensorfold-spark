@@ -1,0 +1,2325 @@
+From dfc95048fd450c92847f319ef904fde8bb478488 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <mia.ailab1@gmail.com>
+Date: Thu, 22 Oct 2026 12:09:36 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: interface, weights and native
+ registration (T9, host half)
+
+Adds the minimax_m3 engine contract (iface.zig: Part/Resume/Marks/Cancel/Seg, the follower
+header, window widths, the conformsEngine/conformsNative checks) and resolves the 13
+GLM-reuse mismatches M1-M13 (docs/interface-decisions.md); per-rank weight descriptors from
+load.Plan and the experts' pointer/width tables (weights.zig), a device loader with direct
+I/O, a page-cache drop after each shard and a header-only checkpoint digest
+(weights_device.zig); the host half of the page state (pages.zig); native.zig for model_type
+minimax_m3_vl (format exl3) registered in the CUDA registry, whose open() checks the ranks,
+settings, plan and budget and then stops with error.EngineNotBuilt (no forward pass yet).
+
+Host patches: kv_pool.Layout.all_paged and Plan.paged (every stream pages), a
+backend-owned radix prompt cache (owns_prompt_cache, cache_limit, Info.prompt_cache), the
+MiniMax think markers chosen by tokenizer and the prompt's tail, thinking_mode written as
+enabled/disabled for MiniMax's template, a MiniMax tool-grammar style that refuses required
+tool_choice, TF_ROCE/TF_ROCE_MAX_KB in the rank fingerprint, and one host memory budget
+(Options.grant, budget.hosted). Every other family's behaviour is unchanged.
+
+No GPU was available: host tests and compile checks only.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/interface-decisions.md                   |  60 +++++
+ zig/build/cuda.zig                            |  13 +-
+ zig/build/minimax_family.zig                  |  39 +++
+ zig/src/core/direct_io.zig                    |   5 +
+ zig/src/core/kv_pool.zig                      |  20 +-
+ zig/src/core/kv_pool_test.zig                 |  22 ++
+ zig/src/families/minimax_m3/budget.zig        |   5 +
+ zig/src/families/minimax_m3/cuda.zig          |  19 ++
+ zig/src/families/minimax_m3/iface.zig         | 226 ++++++++++++++++
+ zig/src/families/minimax_m3/load.zig          |  68 +----
+ .../families/minimax_m3/load_synth_test.zig   |  26 +-
+ zig/src/families/minimax_m3/native.zig        | 200 ++++++++++++++
+ zig/src/families/minimax_m3/pages.zig         |  72 +++++
+ zig/src/families/minimax_m3/pool.zig          |   4 +-
+ zig/src/families/minimax_m3/ranks.zig         |  35 ++-
+ zig/src/families/minimax_m3/stream.zig        |  84 ++++++
+ zig/src/families/minimax_m3/weights.zig       | 254 ++++++++++++++++++
+ .../families/minimax_m3/weights_device.zig    | 137 ++++++++++
+ zig/src/families/minimax_m3/weights_test.zig  | 214 +++++++++++++++
+ zig/src/native/cuda.zig                       |  18 +-
+ zig/src/native/cuda_kv_pool.zig               |  83 +++++-
+ zig/src/server/chat.zig                       |   7 +-
+ zig/src/server/hf_text.zig                    |  15 +-
+ zig/src/server/server.zig                     |  27 +-
+ zig/src/server/tool_grammar.zig               |  13 +-
+ 25 files changed, 1549 insertions(+), 117 deletions(-)
+ create mode 100644 docs/interface-decisions.md
+ create mode 100644 zig/build/minimax_family.zig
+ create mode 100644 zig/src/families/minimax_m3/cuda.zig
+ create mode 100644 zig/src/families/minimax_m3/iface.zig
+ create mode 100644 zig/src/families/minimax_m3/native.zig
+ create mode 100644 zig/src/families/minimax_m3/pages.zig
+ create mode 100644 zig/src/families/minimax_m3/stream.zig
+ create mode 100644 zig/src/families/minimax_m3/weights.zig
+ create mode 100644 zig/src/families/minimax_m3/weights_device.zig
+ create mode 100644 zig/src/families/minimax_m3/weights_test.zig
+
+diff --git a/docs/interface-decisions.md b/docs/interface-decisions.md
+new file mode 100644
+index 0000000..076c66d
+--- /dev/null
++++ b/docs/interface-decisions.md
+@@ -0,0 +1,60 @@
++# MiniMax-M3.1-Flash: interface decisions (M1 to M13)
++
++`zig/src/families/minimax_m3/iface.zig` fixes the signatures the engine, forward, prefill, backend, follower, weights and
++kernels build against. The 13 mismatches the GLM-reuse study found are resolved here; each decision is also a constant,
++a type or a test in the code, so a change to one fails a test instead of drifting. Nothing below ran on a GPU: this tree
++was built and tested on a machine without one.
++
++| # | Mismatch | Decision | Where it lives |
++| --- | --- | --- | --- |
++| M1 | Lane 0 sat outside the pool; `kv_pool.plan` counted only `lanes - 1` streams against it | Every stream pages, the engine's own too. `kv_pool.Layout.all_paged` makes `plan` and `holds` count all `lanes` streams, each with its table row and a page; `Plan.paged` is the number that take pages (`lanes - 1` for every other family, `lanes` here); `Loaded.free_streams` is 0 and `stream_bytes` 0; `attach(ctx, paged, pages)` receives all of them | `core/kv_pool.zig`, `native/cuda_kv_pool.zig`, `pool.Dims.layout`, `iface.decisions` |
++| M2 | Only families with `snap_save` got `Info.prompt_cache` and a `pc.Store`; MiniMax's cache is a radix store over pool pages | A family may declare `owns_prompt_cache`. The host then builds no `pc.Store`, plans no copied bytes (the cached pages are pool pages), reports `Info.prompt_cache = true` when the plan leaves the cache room, and tells the family its limit through `cache_limit(ctx, pages, snaps)`: half the pool at most, bounded by `--prompt-cache-gib` (0 turns it off), snapshot records by `--keep` or 64. The startup line says "a prompt cache of up to N GiB of the pool's pages and M snapshot records" | `native/cuda_kv_pool.zig` (`owns`, `cachePages`, `kept`, `text`), `native/cuda.zig`, `native.cache_limit` |
++| M3 | Nothing made the device copy of `Tables`; `Paged.row_tab` wants entry offsets | The engine owns one int32 device table of `slots x max_pages` entries and installs `pool.Tables.upload` to push rows on its stream (`Tables.write` rolls a failed push back). A row of a window reads at `slot * max_pages` (`iface.tableOffset`, `iface.rowTabs` fills the per-row array of a shared batch from its `Seg`s); a one-stream prompt chunk passes `row_tab = 0` with `tables` at that slot's row | `iface.zig` |
++| M4 | Is the layout's page the kernels' page, and is `fixed_bytes` charged right | Yes, and tested: `Dims.layout(max_pages).pageBytes() == Dims.pageBytes()` (76,800 bytes a token at two ranks); `fixed_bytes` is one table row, charged once per stream, and the table is allocated for exactly the planned streams, so no lowering is needed | `iface` test M4 |
++| M5 | Router bias, the missing fp32 GEMV, runtime `Switches` | The T0 `Switches` are frozen at their compile-time defaults (`decisions.switches_runtime = false`); none may become environment-selectable without entering `ranks.Fingerprint`. `routePlan` keeps refusing `router_weights_use_bias`. The fp32 router GEMV is kernel work (branch mm3-t8k), not an interface; its buffers are the `[rows, 128]` fp32 logits the T4 route kernel already reads | `iface.decisions`, `ffn.zig` |
++| M6 | `exl3_experts.Layer` additions and the mixed layer 17 | `weights.uniformK2` is nonzero only when all three projections of a layer are one width for every expert; layer 17 (w1/w3 4-bit, w2 3-bit) therefore gets 0 and the kernel reads the per-expert widths. The GPU gate that layer 17 runs through `x3gm` stays open | `weights.zig` (tested on the mini pack's mixed layers) |
++| M7 | `shared_input` needs a data comparison T2's plan does not do | Left false (correct, slower). A device-side comparison of the experts' gate and up `suh` can set it later; nothing depends on it | `weights.moeLayer`, `iface.decisions.shared_input` |
++| M8 | Think markers were test-only | `Server.init` switches `markers` to `mm_think_markers` and records the two token ids when the tokenizer has `<mm:think>` and `</mm:think>`; the forced think close uses `</mm:think>`. Each reply is split by `Server.markersFor(prompt)`: a prompt ending in the opener (enabled mode) leaves only the close (`mm_think_prompt_markers`); adaptive and disabled prompts keep the full pair. The template's `thinking_mode` is now written as `enabled` / `disabled` for a template that has an `adaptive` branch (it was `thinking` / `chat`, which MiniMax's template read as adaptive) | `server/server.zig`, `server/chat.zig`, `server/hf_text.zig` |
++| M9 | `tool_grammar.style` knew four markups; MiniMax fell back to the JSON envelope | `Style.minimax` is detected from the probe turn (`]<]minimax[>[<invoke name="tfprobe_fn">`). xgrammar cannot be shown to express it: each parameter is a tag named after the parameter (`NS<city>Paris NS</city>`), and no xgrammar source is in this tree to check a structural-tag style against. So `tool_choice` "required" or a named function is refused with `minimax_refusal`; "auto" and the streaming parser work as before | `server/tool_grammar.zig` |
++| M10 | Two budgets: `budget.zig` and the host's memory plan | One source of truth for the reserve and the limit: the host passes its room before the load as `Options.grant` (net of `TENSORFOLD_MEMORY_RESERVE_GIB` and `TENSORFOLD_CUDA_MEMORY_LIMIT_GB`); `budget.hosted()` adds no reserve of its own, only the runtime and workspace terms the host cannot see. `open` runs `budget.check` with the plan's exact `slotBytes` and refuses with its words; the host's `kv_pool.plan` still decides the pages and has the last word, and `open` logs the budget's pool for comparison | `native.admission`, `budget.hosted`, `native/cuda.zig` |
++| M11 | `TF_ROCE` and `TF_ROCE_MAX_KB` were in no fingerprint | Both are in `ranks.Settings` (`roce_kb`, 0 when `TF_ROCE=0`) and in the fingerprint (`roce`, the old pad word), with a refusal text. The byte-gather closure for `ranks.agree` wraps `glm/cuda_ranks.zig`'s `gather` in the engine (T8) | `ranks.zig` |
++| M12 | Window widths | `prefill_rows` 2048, `window_rows` 16, `shared_rows` 64, `max_shared` 16, nested by comptime checks. UNVERIFIED on a GPU: widths 1, 2, 3, 16, 17, 64 and 128 must give the bits of one-token steps | `iface.zig` |
++| M13 | Vocabulary spans | The head is cut in 128-row units (`shard.unit`); logits cross ranks in `tp.LogitsGather` slots padded to the largest share and greedy picks in `tp.mergePicks`. A sampler over MiniMax's spans takes `Share.vocab` per rank, not GLM's 64-unit `cuda_shard` | `iface.decisions.head_unit`, `tp.zig` |
++
++## What the host does for a family like this
++
++`native/cuda.zig` reads, from the family namespace: `model_type`, `formats`, `default_context`, `max_segments`,
++`prompt_rows`, `window_rows`, `Options` (with `context`, `drafts`, `segments`, `slide`, `lanes`, `lanes_fixed`, `room`,
++`grant`), `open`, `explain` with `explains_open`, `weightShare`, `attach`, `fits`, `cache_limit` and `owns_prompt_cache`;
++`iface.conformsNative` lists them and fails the build when one is missing.
++
++## `open` today
++
++`native.open` does the host half and then stops with `error.EngineNotBuilt`, which `explain` words: the rank place and
++`NCCL_COMM_ID` (`ranks.admit`), `Settings`, `config.json`, the shard headers and this rank's `load.Plan`, the weights
++digest from headers and sizes, and the budget. What is not written, and is marked `UNEXERCISED` in the code: NCCL and the
++engine (`weights_device.loadWeights` is written and compile-checked, never run), the forward pass, prefill, the lanes
++backend and the follower, the rank fingerprint exchange, and the `Loaded` that carries them. `tensorfold-native
++capabilities --json` lists `minimax_m3_vl` with the format `exl3`, so the recipe's family gate passes; a serve then fails at
++the open with the sentence above, on every rank.
++
++## NFS and the page cache
++
++Rank 1 reads the checkpoint over a read-only NFS mount. The streamer reads with `O_DIRECT` and no mmap; a refused direct
++read falls back to the page cache, which on a unified-memory Spark competes with the KV pool. `core/direct_io.File.dropCache`
++(`posix_fadvise(DONTNEED)` on Linux, a no-op elsewhere) is called by `weights_device` after the last run of each shard,
++through `load.Streamer.ended`. The digest (`weights_device.digest`) is a sha256 over each tensor's name, shard, dtype, shape
++and byte range, which the shard headers already gave the catalog: no data byte is read for it. The marker check of
++`Streamer.verifyMarkers` still does about 22,000 small direct reads; measure it over NFS before batching it.
++
++## Credits
++
++The contract and the host half follow TensorFold v1.1.2's own families; no code was taken from outside it. The native-server
++registry and the CUDA serving path are Jürgen Schmied's (jschmied, PR #443), pooled KV pages are jschmied's and
++cwschroeder's (#935), and the GLM family's two-rank engine, follower, idle sleep and structured output that
++`iface.zig`'s signatures and `Header`/`Kind` are taken from are Bizuayeu's (TP over hosts #804, idle sleep #1053,
++structured output #1017, tool calls #1018) with BobClawblaw (rank watch #855, #976) and BHCC2025 (the 128-unit vocabulary
++cut #593). The backend-owned radix prompt cache the decision M2 builds on is BlivionIaG's and ThinkOffApp's HIP work
++(#625, #626) with jschmied and BobClawblaw. The EXL3 operators `weights.zig` describes records for are vcruz305's EXL3
++module (#42) inside TensorFold, with justincasey and BHCC2025, and turboderp's exllamav3 format. Ash Hart (ashhart)
++and the TensorFold contributors wrote the rest of the tree this builds on.
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index a44bf78..7e81f72 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -5,7 +5,6 @@ const golden_build = @import("golden.zig");
+ const catalog = @import("cuda_kernels.zig");
+ pub const Kernel = catalog.Kernel;
+ pub const kernels = catalog.kernels;
+-
+ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+     return b.createModule(.{ .root_source_file = b.path("zig/src/core/stagger.zig"), .target = target, .optimize = optimize });
+ }
+@@ -160,7 +159,6 @@ fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+ 
+ /// The Kolibri-1 CUDA family over the runtime, the core and the lane core.
+ const kolibri1Module = @import("kolibri.zig").module;
+-
+ /// LFM2 (d1's decision model) on CUDA: config, weights, kernels and the forward that scores labels.
+ fn lfm2Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+     return b.createModule(.{ .root_source_file = b.path("zig/src/families/lfm2/lfm2.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
+@@ -190,6 +188,7 @@ fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
+ /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
+ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
++    const glm = glmCuda(b, target, optimize, cuda, core, lanes, heat);
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+@@ -204,7 +203,8 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
+             .{ .name = "core", .module = core },
+             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision) },
+-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
++            .{ .name = "glm_cuda", .module = glm },
++            .{ .name = "minimax_cuda", .module = @import("minimax_family.zig").module(b, target, optimize, cuda, core, lanes, api, glm.import_table.get("canon").?) },
+             .{ .name = "qwen35", .module = qwen35 },
+             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
+         },
+@@ -270,11 +270,6 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("inc4_host.zig").rows(b, cuda, mods.core);
+     @import("living_dense.zig").host(b, cuda, mods.qwen35, draft_ids, runtime, family, kernels.len);
+     @import("cuda_family_host.zig").steps(b, cuda, mods, step);
+-    @import("minimax_ref_host.zig").steps(b, host, mods.core, step);
+-    _ = @import("minimax_load.zig").step(b, host, mods.core);
+-    _ = @import("minimax_pool.zig").step(b, host, mods.core);
+-    _ = @import("minimax_tp.zig").step(b, host, mods.core);
+-    @import("minimax_ref_host.zig").ffn(b, host, mods.core, cuda, step);
+     const exl3_host = b.step("test-exl3-cuda-host", "EXL3 loader and CUDA host regressions without a GPU");
+     const exl3_compile = b.addObject(.{ .name = "exl3_host_compile", .root_module = b.createModule(.{
+         .root_source_file = b.path("zig/tests/exl3_compile.zig"),
+@@ -506,7 +501,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     const parse_tests = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } } });
+     _ = @import("server.zig").addTo(b, parse_tests, host, .debug);
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = parse_tests })).step);
+-    @import("minimax_host.zig").steps(b, host, native_modules.api, mods.tokenizer, template, @import("server.zig").addTo, step);
++    @import("minimax_family.zig").steps(b, host, cuda, mods.core, mods.lanes, native_modules.api, mods.tokenizer, template, @import("server.zig").addTo, step);
+     // Living Weights: the family-neutral learner, then the pocket in each family's shards over the core's shard files
+     const living_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.living }));
+     const shards = b.createModule(.{ .root_source_file = b.path("zig/src/living_shards_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "living", .module = mods.living }} });
+diff --git a/zig/build/minimax_family.zig b/zig/build/minimax_family.zig
+new file mode 100644
+index 0000000..4e7ec82
+--- /dev/null
++++ b/zig/build/minimax_family.zig
+@@ -0,0 +1,39 @@
++//! MiniMax-M3.1-Flash's CUDA family module and every one of its host-only test steps, wired from one call.
++const std = @import("std");
++
++const Mod = *std.Build.Module;
++
++/// The shares module (cluster/canon.zig); one per compilation, so a build that also holds GLM's passes GLM's here.
++pub fn canonModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Mod {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon.zig"), .target = target, .optimize = optimize });
++}
++
++/// The family over the runtime, the core, the lane core and the engine API, as native/cuda.zig registers it.
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: Mod, core: Mod, lanes: Mod, api: Mod, canon: Mod) Mod {
++    return b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/cuda.zig"),
++        .target = target,
++        .optimize = optimize,
++        .link_libc = true,
++        .imports = &.{
++            .{ .name = "cuda", .module = cuda },
++            .{ .name = "core", .module = core },
++            .{ .name = "canon", .module = canon },
++            .{ .name = "lanes", .module = lanes },
++            .{ .name = "engine_api", .module = api },
++        },
++    });
++}
++
++/// Every `test-minimax-*` step; `umbrella` (test-cuda-host) depends on each.
++pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod, lanes: Mod, api: Mod, tokenizer: Mod, template: Mod, server_add: *const fn (*std.Build, Mod, std.Build.ResolvedTarget, std.builtin.OptimizeMode) Mod, umbrella: *std.Build.Step) void {
++    @import("minimax_ref_host.zig").steps(b, host, core, umbrella);
++    _ = @import("minimax_load.zig").step(b, host, core);
++    _ = @import("minimax_pool.zig").step(b, host, core);
++    _ = @import("minimax_tp.zig").step(b, host, core);
++    @import("minimax_ref_host.zig").ffn(b, host, core, cuda, umbrella);
++    @import("minimax_host.zig").steps(b, host, api, tokenizer, template, server_add, umbrella);
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug)) }));
++    b.step("test-minimax-engine-host", "MiniMax-M3.1-Flash interface, weights descriptors, page state and native host half without a GPU").dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++}
+diff --git a/zig/src/core/direct_io.zig b/zig/src/core/direct_io.zig
+index b71b87c..0f70de2 100644
+--- a/zig/src/core/direct_io.zig
++++ b/zig/src/core/direct_io.zig
+@@ -35,6 +35,11 @@ pub const File = struct {
+         return .{ .fd = fd, .direct = false };
+     }
+ 
++    /// Drops this file's pages from the page cache (a refused direct read falls back to it); a no-op without the call.
++    pub fn dropCache(f: File) void {
++        if (builtin.os.tag == .linux) _ = std.os.linux.fadvise(f.fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
++    }
++
+     pub fn close(f: *File) void {
+         _ = platform.c.close(f.fd);
+         f.* = undefined;
+diff --git a/zig/src/core/kv_pool.zig b/zig/src/core/kv_pool.zig
+index 8e9d55c..704779f 100644
+--- a/zig/src/core/kv_pool.zig
++++ b/zig/src/core/kv_pool.zig
+@@ -12,6 +12,8 @@ pub const Layout = struct {
+     page_tokens: u32,
+     /// Bytes of one kept snapshot's slot, outside the pages.
+     snap_bytes: u64,
++    /// Every stream, the engine's own too, takes pages: none is a full-window sequence outside the pool.
++    all_paged: bool = false,
+ 
+     pub fn pageBytes(l: Layout) u64 {
+         return l.token_bytes * l.page_tokens;
+@@ -50,7 +52,14 @@ pub const Budget = struct {
+ };
+ 
+ /// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams.
+-pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize };
++pub const Plan = struct {
++    lanes: u32,
++    snaps: usize,
++    copied: u64,
++    pages: usize,
++    /// Streams that take pages: all but the engine's own, or all of them for an all-paged layout.
++    paged: u32 = 0,
++};
+ 
+ /// The prompt cache's split: slots for its snapshots, the rest for their copied KV rows (no slot: no cache).
+ pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize, copied: u64 } {
+@@ -62,15 +71,17 @@ pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize,
+ pub fn plan(l: Layout, b: Budget) error{ NoStream, TooMany }!Plan {
+     if (b.engine > b.room or b.lanes == 0) return error.NoStream;
+     var left = b.room - b.engine;
+-    const extra: u64 = b.lanes - 1;
++    const own: u32 = if (l.all_paged) 0 else 1;
++    const extra: u64 = b.lanes - own;
+     const each = l.fixed_bytes + l.pageBytes();
+     const fit = @min(extra, left / each);
+     if (fit < extra and b.fixed) return error.TooMany;
++    if (l.all_paged and fit == 0) return error.NoStream;
+     left -= fit * l.fixed_bytes;
+     const c = split(@min(b.cache, left - fit * l.pageBytes()), l.snap_bytes, b.snaps);
+     left -= c.snaps * l.snap_bytes + c.copied;
+     const most: u64 = if (b.window > 0) fit * l.pages(b.window) else std.math.maxInt(u64);
+-    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min(left / l.pageBytes(), most)) };
++    return .{ .lanes = @intCast(own + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min(left / l.pageBytes(), most)), .paged = @intCast(fit) };
+ }
+ 
+ /// Whether `b.cache` fits whole in what `plan` leaves it: the room past the engine and a fixed part and page a stream.
+@@ -78,7 +89,8 @@ pub fn holds(l: Layout, b: Budget) bool {
+     if (b.engine > b.room or b.lanes == 0) return false;
+     const left = b.room - b.engine;
+     const each = l.fixed_bytes + l.pageBytes();
+-    return left - @min(@as(u64, b.lanes - 1), left / each) * each >= b.cache;
++    const own: u32 = if (l.all_paged) 0 else 1;
++    return left - @min(@as(u64, b.lanes - own), left / each) * each >= b.cache;
+ }
+ 
+ /// A stream's reservation: pages promised but not yet taken, and the pages it holds in token order (its table).
+diff --git a/zig/src/core/kv_pool_test.zig b/zig/src/core/kv_pool_test.zig
+index 47196e1..33261a1 100644
+--- a/zig/src/core/kv_pool_test.zig
++++ b/zig/src/core/kv_pool_test.zig
+@@ -216,3 +216,25 @@ test "a promise that does not fit asks the store to reclaim first, and fails onl
+     p.finish(&b);
+     try expect(p.idle());
+ }
++
++test "an all-paged layout counts every stream against the pool: lanes are the streams that fit, none is the engine's own" {
++    const g: u64 = 1 << 30;
++    const all: kv.Layout = .{ .fixed_bytes = mib, .token_bytes = 75 << 10, .page_tokens = 128, .snap_bytes = 64, .all_paged = true };
++    const one = try kv.plan(all, .{ .room = 40 * g, .engine = 0, .lanes = 1 });
++    try expectEqual(@as(u32, 1), one.lanes);
++    try expectEqual(@as(u32, 1), one.paged);
++    const four = try kv.plan(all, .{ .room = 40 * g, .engine = 0, .lanes = 4 });
++    try expectEqual(@as(u32, 4), four.lanes);
++    try expectEqual(@as(u32, 4), four.paged);
++    try expectEqual(@as(usize, @intCast((40 * g - 4 * mib) / all.pageBytes())), four.pages);
++    const same = nemotron_like(false);
++    try expectEqual(@as(u32, 3), (try kv.plan(same, .{ .room = 40 * g, .engine = 0, .lanes = 4 })).paged);
++    try std.testing.expectError(error.TooMany, kv.plan(all, .{ .room = 3 * (mib + all.pageBytes()), .engine = 0, .lanes = 4, .fixed = true }));
++    try std.testing.expectError(error.NoStream, kv.plan(all, .{ .room = mib, .engine = 0, .lanes = 2 }));
++    try expect(kv.holds(all, .{ .room = 2 * (mib + all.pageBytes()) + g, .engine = 0, .lanes = 2, .cache = g }));
++    try expect(!kv.holds(all, .{ .room = 2 * (mib + all.pageBytes()) + g - 1, .engine = 0, .lanes = 2, .cache = g }));
++}
++
++fn nemotron_like(all: bool) kv.Layout {
++    return .{ .fixed_bytes = mib, .token_bytes = 75 << 10, .page_tokens = 128, .snap_bytes = 64, .all_paged = all };
++}
+diff --git a/zig/src/families/minimax_m3/budget.zig b/zig/src/families/minimax_m3/budget.zig
+index 76793f5..9fb1248 100644
+--- a/zig/src/families/minimax_m3/budget.zig
++++ b/zig/src/families/minimax_m3/budget.zig
+@@ -46,6 +46,11 @@ pub fn tensorfold(total: u64, reserve_text: ?[]const u8) Error!Terms {
+     return .{ .reserve = try reserveBytes(reserve_text, total), .runtime = 4 * GiB + GiB / 2, .workspace = GiB + GiB / 2 };
+ }
+ 
++/// The host's convention: its granted room is net of its reserve and limit, so only what it cannot see is priced here.
++pub fn hosted() Terms {
++    return .{ .reserve = 0, .runtime = 4 * GiB + GiB / 2, .workspace = GiB + GiB / 2 };
++}
++
+ /// The DeepSeek sibling's priced floor (families/deepseek_v41/kv/budget.zig): a hard floor of 4 GiB MemAvailable kept
+ /// after boot, runtime 1.0, workspace 4.0 (graphs 1.2, prefill 1.3, select .25, drafting .35, slack .9), session RAM
+ /// .25 and the 128 MiB staging set. The workspace is its fitted total, so no block-score chunk is added on top.
+diff --git a/zig/src/families/minimax_m3/cuda.zig b/zig/src/families/minimax_m3/cuda.zig
+new file mode 100644
+index 0000000..92a9438
+--- /dev/null
++++ b/zig/src/families/minimax_m3/cuda.zig
+@@ -0,0 +1,19 @@
++//! MiniMax-M3.1-Flash on CUDA: the root of the `minimax_cuda` module the native server registers (native/cuda.zig).
++pub const native = @import("native.zig");
++pub const iface = @import("iface.zig");
++pub const weights = @import("weights.zig");
++pub const weights_device = @import("weights_device.zig");
++pub const pages = @import("pages.zig");
++
++test {
++    _ = native;
++    _ = iface;
++    _ = weights;
++    _ = weights_device;
++    _ = pages;
++    _ = @import("load.zig");
++    _ = @import("ffn.zig");
++    _ = @import("tp.zig");
++    _ = @import("pool.zig");
++    _ = @import("ranks.zig");
++}
+diff --git a/zig/src/families/minimax_m3/iface.zig b/zig/src/families/minimax_m3/iface.zig
+new file mode 100644
+index 0000000..ac8fe9a
+--- /dev/null
++++ b/zig/src/families/minimax_m3/iface.zig
+@@ -0,0 +1,226 @@
++//! The contract the MiniMax-M3.1-Flash engine, forward, prefill, backend, follower, weights and kernels share.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const pool = @import("pool.zig");
++const ranks = @import("ranks.zig");
++const sparse = cuda.minimax_m3_sparse;
++
++pub const Sampling = lanes.Sampling;
++pub const Paged = sparse.Paged;
++pub const Rows = sparse.Rows;
++pub const Scratch = sparse.Scratch;
++
++// M12: a prompt chunk, whole pages (GLM's fw.prefill_rows).
++pub const prefill_rows: u32 = 2048;
++// Rows of one verify window; UNVERIFIED on a GPU (widths 1, 2, 3, 16, 17, 64, 128 are its gate).
++pub const window_rows: u32 = 16;
++// Rows of one forward shared by several streams' windows (GLM: 32), and the streams in it.
++pub const shared_rows: u32 = 64;
++pub const max_shared: u32 = 16;
++// Widest forward any caller makes; the router, expert and sparse scratch are sized by it.
++pub const max_rows: u32 = prefill_rows;
++
++comptime {
++    if (prefill_rows % pool.page_tokens != 0) @compileError("a prompt chunk must be whole pages: marks and resumes sit on pages");
++    if (window_rows > shared_rows or shared_rows > prefill_rows) @compileError("window <= shared <= chunk");
++    if (max_shared * window_rows < shared_rows) @compileError("a shared forward must be fillable by max_shared windows");
++}
++
++/// The 13 mismatches of the GLM-reuse study, resolved; the prose is docs/interface-decisions.md.
++pub const decisions = struct {
++    // M1: every stream, the engine's own too, is a slot of the paged pool; no full-window sequence lives outside it.
++    pub const all_paged = true;
++    pub const free_streams: u32 = 0;
++    // M2: the backend owns a radix prompt cache over the pool's pages; the host builds no `pc.Store`.
++    pub const owns_prompt_cache = true;
++    // M3: one int32 device table of slots x max_pages entries; a window's row reads at slot * max_pages.
++    pub const table_entry_bytes: usize = 4;
++    // M5: the T0 Switches stay at their compile-time defaults; none is runtime-selectable, so none is fingerprinted.
++    pub const switches_runtime = false;
++    // M7: Layer.shared_input stays false (correct, slower) until a device-side check of the gate/up scales exists.
++    pub const shared_input = false;
++    // M11: TF_ROCE and TF_ROCE_MAX_KB are in Settings and in the fingerprint (ranks.zig).
++    pub const roce_in_fingerprint = true;
++    // M13: the head is cut in 128-row units; logits cross ranks in LogitsGather slots, greedy picks in mergePicks.
++    pub const head_unit: usize = 128;
++};
++
++// One stream's window of a shared verify: its slot, its ids and its drawn tokens (GLM's Part).
++pub const Part = struct { slot: u32, ids: []const u32, out: []u32, bits: u64 = 0 };
++// Where a prompt pass resumes: `at` rows already in the stream's adopted pages (a multiple of the page); no state id.
++pub const Resume = struct { at: usize };
++// Rank 0's marks in a prompt pass: `call` may keep the prefix at a mark (a page multiple).
++pub const Marks = struct { at: []const u32, ctx: *anyopaque, call: *const fn (ctx: *anyopaque, at: u32) void };
++pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
++// One stream's rows in a shared forward: rows [row0, row0 + rows) of the batch belong to `slot`.
++pub const Seg = struct { slot: u32, row0: u32, rows: u32 };
++
++// What `Engine.init` takes besides the device and the checkpoint.
++pub const EngineOptions = struct {
++    capacity: usize, // tokens a sequence holds (context + window_rows, whole pages)
++    settings: ranks.Settings,
++    slots: u32 = 1, // streams the block table has rows for; `attach` raises it to the planned streams
++};
++
++// M3: entry offset of `slot`'s row in the device table (`Paged.row_tab` holds one per batch row).
++pub fn tableOffset(slot: u32, max_pages: usize) i32 {
++    return @intCast(@as(usize, slot) * max_pages);
++}
++
++// Fills `out[row0 .. row0 + rows]` of every segment with that segment's table offset.
++pub fn rowTabs(out: []i32, segs: []const Seg, max_pages: usize) void {
++    for (segs) |s| @memset(out[s.row0..][0..s.rows], tableOffset(s.slot, max_pages));
++}
++
++// Pages a rank's table row holds: whole pages of the capacity.
++pub fn maxPages(capacity: usize) usize {
++    return (capacity + pool.page_tokens - 1) / pool.page_tokens;
++}
++
++// Bytes of the whole device table for `slots` streams (the layout's fixed part is one row of it, per stream).
++pub fn tableBytes(slots: usize, max_pages: usize) usize {
++    return slots * max_pages * decisions.table_entry_bytes;
++}
++
++pub const Kind = enum(u32) { begin = 1, prefill, chunk, verify, shared, keep, release, end, idle };
++
++// One step as it crosses: 64 bytes, then `n` u32 ids.
++pub const Header = extern struct {
++    kind: u32,
++    n: u32 = 0, // ids that follow
++    depth: u32 = 0, // chunk: where it starts; shared: its parts
++    flags: u32 = 0, // begin: sampled; verify, shared: whole rows
++    a: u64 = 0, // keep: rows; prefill, chunk: the rows resumed from the adopted pages
++    seed: u64 = 0, // begin: the sampling seed
++    temperature: f64 = 0,
++    top_p: f64 = 0,
++    min_p: f64 = 0,
++    top_k: u32 = 0, // begin: top_k; chunk: the prompt's length
++    slot: u32 = 0, // the stream's slot the step runs on
++
++    comptime {
++        std.debug.assert(@sizeOf(Header) == 64);
++    }
++};
++
++pub fn laneFacts(window: u32, verify: u32) lanes.Model {
++    return .{ .exact_width = window, .hidden_rows = true, .batch_rows = verify, .max_streams = max_shared, .streams_exact = true, .copy_match = 5, .context_copies = true, .lone_cost_tile = 16 };
++}
++
++// One method the backend, prefill and follower call; `conformsEngine` compares each against it.
++const Method = struct { name: []const u8, args: []const type, ret: type };
++
++fn methods(comptime E: type) []const Method {
++    const gpa = std.mem.Allocator;
++    return &[_]Method{
++        .{ .name = "init", .args = &.{ gpa, std.Io, *const cuda.Driver, *const cuda.Context, []const u8, *const cuda.nccl.Library, cuda.nccl.Comm, usize, usize, EngineOptions }, .ret = *E },
++        .{ .name = "deinit", .args = &.{*E}, .ret = void },
++        .{ .name = "bind", .args = &.{ *E, u32 }, .ret = void },
++        .{ .name = "release", .args = &.{ *E, u32 }, .ret = void },
++        .{ .name = "seqBytes", .args = &.{*const E}, .ret = u64 },
++        .{ .name = "pos", .args = &.{*const E}, .ret = usize },
++        .{ .name = "begin", .args = &.{ *E, ?Sampling }, .ret = void },
++        .{ .name = "beginFollowing", .args = &.{ *E, ?Sampling }, .ret = void },
++        .{ .name = "prefill", .args = &.{ *E, []const u32, ?Resume, ?Cancel, ?Marks }, .ret = u32 },
++        .{ .name = "prefillChunk", .args = &.{ *E, []const u32, usize, usize, ?Resume, ?Cancel, ?Marks }, .ret = ?u32 },
++        .{ .name = "gate", .args = &.{ *E, ?Cancel }, .ret = void },
++        .{ .name = "verify", .args = &.{ *E, []const u32, []u32, u64 }, .ret = void },
++        .{ .name = "verifyShared", .args = &.{ *E, []const Part }, .ret = void },
++        .{ .name = "keep", .args = &.{ *E, usize }, .ret = void },
++        .{ .name = "draw", .args = &.{ *E, u64, usize, u64, u64, []u32 }, .ret = void },
++        .{ .name = "checkGathers", .args = &.{*const E}, .ret = void },
++    };
++}
++
++fn payload(comptime R: type) type {
++    return if (@typeInfo(R) == .error_union) @typeInfo(R).error_union.payload else R;
++}
++
++// Compile error naming the first method of `E` whose parameters or result differ from the contract.
++pub fn conformsEngine(comptime E: type) void {
++    inline for (comptime methods(E)) |m| {
++        if (!@hasDecl(E, m.name)) @compileError("Engine lacks " ++ m.name);
++        const info = @typeInfo(@TypeOf(@field(E, m.name))).@"fn";
++        if (info.param_types.len != m.args.len) @compileError("Engine." ++ m.name ++ " takes a different number of parameters");
++        inline for (info.param_types, m.args) |p, want| {
++            if (p.? != want) @compileError("Engine." ++ m.name ++ " has a parameter of type " ++ @typeName(p.?) ++ ", the contract has " ++ @typeName(want));
++        }
++        if (payload(info.return_type.?) != m.ret) @compileError("Engine." ++ m.name ++ " returns " ++ @typeName(payload(info.return_type.?)) ++ ", the contract has " ++ @typeName(m.ret));
++    }
++}
++
++// What `native/cuda.zig` reads from this family's namespace (the `@hasDecl` surface); a compile error names the gap.
++pub fn conformsNative(comptime F: type) void {
++    inline for (.{ "model_type", "formats", "default_context", "max_segments", "Options", "Loaded", "open", "explain", "explains_open", "weightShare", "capacity", "attach", "fits", "window_rows", "owns_prompt_cache", "cache_limit" }) |name| {
++        if (!@hasDecl(F, name)) @compileError("the family namespace lacks " ++ name);
++    }
++    if (!@hasField(F.Options, "context") or !@hasField(F.Options, "grant") or !@hasField(F.Options, "lanes")) @compileError("Options needs context, grant, lanes");
++    inline for (.{ "backend", "facts", "rows", "stream_bytes", "free_streams", "ctx", "deinit", "layout" }) |name| {
++        if (!@hasField(F.Loaded, name)) @compileError("Loaded lacks " ++ name);
++    }
++}
++
++const Fake = struct {
++    pub fn init(_: std.mem.Allocator, _: std.Io, _: *const cuda.Driver, _: *const cuda.Context, _: []const u8, _: *const cuda.nccl.Library, _: cuda.nccl.Comm, _: usize, _: usize, _: EngineOptions) !*Fake {
++        return error.Unused;
++    }
++    pub fn deinit(_: *Fake) void {}
++    pub fn bind(_: *Fake, _: u32) !void {}
++    pub fn release(_: *Fake, _: u32) void {}
++    pub fn seqBytes(_: *const Fake) u64 {
++        return 0;
++    }
++    pub fn pos(_: *const Fake) usize {
++        return 0;
++    }
++    pub fn begin(_: *Fake, _: ?Sampling) !void {}
++    pub fn beginFollowing(_: *Fake, _: ?Sampling) !void {}
++    pub fn prefill(_: *Fake, _: []const u32, _: ?Resume, _: ?Cancel, _: ?Marks) !u32 {
++        return 0;
++    }
++    pub fn prefillChunk(_: *Fake, _: []const u32, _: usize, _: usize, _: ?Resume, _: ?Cancel, _: ?Marks) !?u32 {
++        return null;
++    }
++    pub fn gate(_: *Fake, _: ?Cancel) !void {}
++    pub fn verify(_: *Fake, _: []const u32, _: []u32, _: u64) !void {}
++    pub fn verifyShared(_: *Fake, _: []const Part) !void {}
++    pub fn keep(_: *Fake, _: usize) !void {}
++    pub fn draw(_: *Fake, _: u64, _: usize, _: u64, _: u64, _: []u32) !void {}
++    pub fn checkGathers(_: *const Fake) !void {}
++};
++
++test "an engine with every method of the contract conforms (a wrong one is a compile error, see the decls above)" {
++    conformsEngine(Fake);
++}
++
++test "the follower's header is the 64 bytes GLM's is, and its kinds start at 1" {
++    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Header));
++    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(Kind.begin));
++    try std.testing.expectEqual(@as(u32, 9), @intFromEnum(Kind.idle));
++}
++
++test "M3: a shared window's rows read their own slot's table row" {
++    var out = [_]i32{ -1, -1, -1, -1, -1, -1 };
++    rowTabs(&out, &.{ .{ .slot = 2, .row0 = 0, .rows = 3 }, .{ .slot = 0, .row0 = 3, .rows = 2 } }, 512);
++    try std.testing.expectEqualSlices(i32, &.{ 1024, 1024, 1024, 0, 0, -1 }, &out);
++    try std.testing.expectEqual(@as(usize, 513), maxPages(65536 + window_rows));
++    try std.testing.expectEqual(@as(usize, 3 * 512 * 4), tableBytes(3, 512));
++}
++
++test "M4: the layout's page is the geometry's page and its fixed part is one table row, per stream" {
++    const cfg = &@import("config.zig").flash;
++    const dims = try pool.Dims.of(cfg, try @import("shard.zig").Share.of(cfg, 0, 2));
++    const l = dims.layout(512);
++    try std.testing.expectEqual(dims.pageBytes(), l.pageBytes());
++    try std.testing.expectEqual(@as(u64, tableBytes(1, 512)), l.fixed_bytes);
++    try std.testing.expectEqual(@as(u64, 76_800), dims.tokenBytes());
++}
++
++test "M12/M1: widths nest and the lane facts keep windows exact over several streams" {
++    const f = laneFacts(window_rows, shared_rows);
++    try std.testing.expectEqual(window_rows, f.exact_width);
++    try std.testing.expectEqual(shared_rows, f.batch_rows);
++    try std.testing.expect(f.hidden_rows and f.streams_exact and !f.mtp);
++    try std.testing.expect(decisions.all_paged and decisions.free_streams == 0);
++}
+diff --git a/zig/src/families/minimax_m3/load.zig b/zig/src/families/minimax_m3/load.zig
+index 9841405..794ef21 100644
+--- a/zig/src/families/minimax_m3/load.zig
++++ b/zig/src/families/minimax_m3/load.zig
+@@ -181,7 +181,7 @@ pub const Item = struct {
+     dst: u64,
+     fold: bool = false, // bf16 norm weights stored as fp32 1 + w (the destination holds 4-byte floats)
+ 
+-    fn first(i: Item) u64 {
++    pub fn first(i: Item) u64 {
+         return i.base + i.span.offset;
+     }
+ };
+@@ -511,69 +511,8 @@ pub const Sink = struct {
+     put: *const fn (ctx: *anyopaque, slot: u32, offset: u64, bytes: []const u8) anyerror!void,
+ };
+ 
+-/// Reads a plan's byte runs in file order with direct I/O through one aligned buffer.
+-pub const Streamer = struct {
+-    gpa: std.mem.Allocator,
+-    cat: *const Catalog,
+-    buf: dio.Buffer,
+-    folded: []f32,
+-
+-    pub const default_chunk = 8 << 20;
+-
+-    pub fn init(gpa: std.mem.Allocator, cat: *const Catalog, chunk: usize) !Streamer {
+-        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), chunk);
+-        errdefer gpa.free(buf);
+-        return .{ .gpa = gpa, .cat = cat, .buf = buf, .folded = try gpa.alloc(f32, dio.fits(chunk) / 2) };
+-    }
+-
+-    pub fn deinit(s: *Streamer) void {
+-        s.gpa.free(s.buf);
+-        s.gpa.free(s.folded);
+-        s.* = undefined;
+-    }
+-
+-    /// Every EXL3 marker holds the mul1 multiplier: a codebook the kernels do not decode is refused before any copy.
+-    pub fn verifyMarkers(s: *Streamer, plan: *const Plan) !void {
+-        for (plan.matrices) |m| {
+-            const got = try s.cat.files.items[m.marker_shard].read(s.buf, m.marker_at, 4);
+-            if (std.mem.readInt(u32, got[0..4], .little) != mul1_multiplier) {
+-                std.log.warn("layer {d} {t} expert {d}: codebook marker is not mul1", .{ m.layer, m.proj, m.expert });
+-                return error.BadCodebookMarker;
+-            }
+-        }
+-    }
+-
+-    pub fn run(s: *Streamer, plan: *const Plan, sink: Sink) !void {
+-        try s.verifyMarkers(plan);
+-        const room = dio.fits(s.buf.len);
+-        for (plan.items) |it| {
+-            const file = s.cat.files.items[it.shard];
+-            const limit = plan.slots[it.slot].bytes;
+-            if (it.fold) {
+-                // a norm weight: one read, bf16 to fp32 1 + w
+-                if (it.span.len > room or it.span.count != 1 or it.dst != 0) return error.BadPlan;
+-                const got = try file.read(s.buf, it.first(), @intCast(it.span.len));
+-                const out = foldGemma(s.folded, got);
+-                try sink.put(sink.ctx, it.slot, 0, std.mem.sliceAsBytes(out));
+-                continue;
+-            }
+-            var run_i: u64 = 0;
+-            while (run_i < it.span.count) : (run_i += 1) {
+-                var at = it.base + it.span.at(run_i);
+-                var dst = it.dst + run_i * it.span.len;
+-                var left: u64 = it.span.len;
+-                while (left > 0) {
+-                    const n: usize = @intCast(@min(left, room));
+-                    if (dst + n > limit) return error.BadPlan;
+-                    try sink.put(sink.ctx, it.slot, dst, try file.read(s.buf, at, n));
+-                    at += n;
+-                    dst += n;
+-                    left -= n;
+-                }
+-            }
+-        }
+-    }
+-};
++pub const ShardEnd = @import("stream.zig").ShardEnd;
++pub const Streamer = @import("stream.zig").Streamer;
+ 
+ /// bf16 norm weights as fp32 `1 + w` (Gemma RMSNorm), summed once in fp32; the caller's `out` holds the result.
+ pub fn foldGemma(out: []f32, bf16: []const u8) []f32 {
+@@ -586,6 +525,7 @@ pub fn foldGemma(out: []f32, bf16: []const u8) []f32 {
+ }
+ 
+ test {
++    _ = @import("stream.zig");
+     _ = @import("config.zig");
+     _ = names;
+     _ = shard;
+diff --git a/zig/src/families/minimax_m3/load_synth_test.zig b/zig/src/families/minimax_m3/load_synth_test.zig
+index 5319378..48448fc 100644
+--- a/zig/src/families/minimax_m3/load_synth_test.zig
++++ b/zig/src/families/minimax_m3/load_synth_test.zig
+@@ -9,7 +9,7 @@ const gpa = std.testing.allocator;
+ const Config = config.Config;
+ 
+ /// A two-expert-pair model the kernels' widths allow: 4 layers (one dense), 4 experts, every width a multiple of 256.
+-fn mini() Config {
++pub fn mini() Config {
+     var c = config.flash;
+     c.hidden = 256;
+     c.layers = 4;
+@@ -45,20 +45,20 @@ fn dtypeSize(dtype: []const u8) usize {
+     return if (std.mem.eql(u8, dtype, "I8") or std.mem.eql(u8, dtype, "U8")) 1 else 2;
+ }
+ 
+-const Pack = struct {
++pub const Pack = struct {
+     arena: std.heap.ArenaAllocator,
+     ts: std.ArrayList(T) = .empty,
+ 
+-    fn init() Pack {
++    pub fn init() Pack {
+         return .{ .arena = .init(gpa) };
+     }
+ 
+-    fn deinit(p: *Pack) void {
++    pub fn deinit(p: *Pack) void {
+         p.arena.deinit();
+     }
+ 
+     /// A tensor of `dtype` and `shape` whose bytes are a function of its name (bf16 holds small exact values).
+-    fn add(p: *Pack, name: []const u8, dtype: []const u8, shape: []const usize) !void {
++    pub fn add(p: *Pack, name: []const u8, dtype: []const u8, shape: []const usize) !void {
+         const a = p.arena.allocator();
+         var n: usize = dtypeSize(dtype);
+         for (shape) |d| n *= d;
+@@ -75,7 +75,7 @@ const Pack = struct {
+         try p.ts.append(a, .{ .name = try a.dupe(u8, name), .dtype = dtype, .shape = try a.dupe(usize, shape), .data = data });
+     }
+ 
+-    fn find(p: *Pack, name: []const u8) *T {
++    pub fn find(p: *Pack, name: []const u8) *T {
+         for (p.ts.items) |*t| if (std.mem.eql(u8, t.name, name)) return t;
+         unreachable;
+     }
+@@ -88,7 +88,7 @@ const Pack = struct {
+         unreachable;
+     }
+ 
+-    fn reshape(p: *Pack, name: []const u8, dtype: []const u8, shape: []const usize) !void {
++    pub fn reshape(p: *Pack, name: []const u8, dtype: []const u8, shape: []const usize) !void {
+         p.drop(name);
+         try p.add(name, dtype, shape);
+     }
+@@ -109,7 +109,7 @@ const Pack = struct {
+         try p.add(names.plain(&b, role, layer), dtype, shape);
+     }
+ 
+-    fn all(p: *Pack, c: *const Config) !void {
++    pub fn all(p: *Pack, c: *const Config) !void {
+         const q = c.heads * c.head_dim;
+         const kv = c.kv_heads * c.head_dim;
+         try p.plain(.embed, 0, "BF16", &.{ c.vocab, c.hidden });
+@@ -149,14 +149,14 @@ const Pack = struct {
+     }
+ };
+ 
+-const Write = struct { shards: usize = 2, index: bool = true, cut_last: usize = 0 };
++pub const Write = struct { shards: usize = 2, index: bool = true, cut_last: usize = 0 };
+ 
+ fn shardFile(buf: *[48]u8, i: usize, of: usize) []const u8 {
+     return std.fmt.bufPrint(buf, "model-{d:0>5}-of-{d:0>5}.safetensors", .{ i + 1, of }) catch unreachable;
+ }
+ 
+ /// Tensors alternate over the shards (a group's parts are in both) with their headers and an index.json.
+-fn write(io: std.Io, dir: std.Io.Dir, p: *const Pack, w: Write) !void {
++pub fn write(io: std.Io, dir: std.Io.Dir, p: *const Pack, w: Write) !void {
+     var index: std.ArrayList(u8) = .empty;
+     defer index.deinit(gpa);
+     try index.appendSlice(gpa, "{\"metadata\":{},\"weight_map\":{");
+@@ -193,17 +193,17 @@ fn write(io: std.Io, dir: std.Io.Dir, p: *const Pack, w: Write) !void {
+     if (w.index) try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+ }
+ 
+-const Dir = struct {
++pub const Dir = struct {
+     tmp: std.testing.TmpDir,
+     path: [:0]u8,
+ 
+-    fn init(io: std.Io) !Dir {
++    pub fn init(io: std.Io) !Dir {
+         var tmp = std.testing.tmpDir(.{});
+         errdefer tmp.cleanup();
+         return .{ .tmp = tmp, .path = try tmp.dir.realPathFileAlloc(io, ".", gpa) };
+     }
+ 
+-    fn deinit(d: *Dir) void {
++    pub fn deinit(d: *Dir) void {
+         gpa.free(d.path);
+         d.tmp.cleanup();
+     }
+diff --git a/zig/src/families/minimax_m3/native.zig b/zig/src/families/minimax_m3/native.zig
+new file mode 100644
+index 0000000..0c495d4
+--- /dev/null
++++ b/zig/src/families/minimax_m3/native.zig
+@@ -0,0 +1,200 @@
++//! MiniMax-M3.1-Flash behind the native CUDA host (GLM's contract); `open` stops at error.EngineNotBuilt.
++const std = @import("std");
++const cuda = @import("cuda");
++const kv = @import("core").kv_pool;
++const lanes = @import("lanes");
++const iface = @import("iface.zig");
++const ranks = @import("ranks.zig");
++const budget = @import("budget.zig");
++const config = @import("config.zig");
++const load = @import("load.zig");
++const pool = @import("pool.zig");
++const shard = @import("shard.zig");
++const pages = @import("pages.zig");
++const weights_device = @import("weights_device.zig");
++
++pub const model_type = config.model_type;
++pub const formats: []const []const u8 = &.{"exl3"};
++// The plan says 65,536 to 131,072 tokens; the host's memory plan and `admission` decide what really fits.
++pub const default_context: i64 = 65536;
++pub const max_segments: u32 = 1;
++pub const prompt_rows: u32 = iface.prefill_rows;
++pub const window_rows: u32 = iface.window_rows;
++pub const explains_open = true;
++// Decision M2: the backend owns a radix prompt cache over the pool's pages, so the host builds no snapshot store.
++pub const owns_prompt_cache = iface.decisions.owns_prompt_cache;
++
++/// The server's reading of this rank's room after its load (the budget streams are admitted by); null if unreadable.
++pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
++
++pub const Options = struct {
++    context: usize,
++    drafts: bool, // read by the host; this family has no head, so it drafts by copies only
++    segments: usize = 1,
++    slide: bool = false,
++    lanes: u32 = 1,
++    lanes_fixed: bool = false,
++    room: ?Room = null,
++    grant: u64 = 0, // the host's room before the load, net of its reserve (0: unknown, budget unchecked); decision M10
++};
++
++/// The smallest room among the other ranks and whose it is.
++pub const Peer = struct { bytes: u64, rank: usize };
++
++pub const Loaded = struct {
++    backend: lanes.backend.Backend,
++    facts: lanes.Model,
++    rows: u32,
++    stream_bytes: usize = 0, // every stream is paged: its table row is the layout's fixed part
++    free_streams: u32 = iface.decisions.free_streams,
++    ctx: *anyopaque,
++    deinit: *const fn (*anyopaque) void,
++    layout: ?kv.Layout = null,
++    peer_room: ?Peer = null,
++};
++
++/// What `attach` builds on, `open` will own: the page state of one rank (T8 adds the device arena beside it).
++pub const Owned = struct {
++    gpa: std.mem.Allocator,
++    layout: kv.Layout,
++    max_pages: usize,
++    window: u64 = window_rows,
++    pages: ?*pages.Pages = null,
++};
++
++/// Slots for `context` plus a verify window, whole pages: the longest sequence a stream holds.
++pub fn capacity(context: usize) usize {
++    return std.mem.alignForward(usize, context + window_rows, pool.page_tokens);
++}
++
++/// Bytes this rank's weights take, for the host's admission: the plan's exact slot bytes, else the whole checkpoint.
++pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
++    const p = ranks.place(&ranks.environment) catch return total;
++    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return total;
++    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch return total;
++    const c = config.parse(a, text) catch return total;
++    var cat = load.Catalog.open(a, io, dir) catch return total;
++    defer cat.deinit();
++    var plan = load.Plan.build(a, &cat, &c, shard.Share.of(&c, p.rank, p.world) catch return total, .{}) catch return total;
++    defer plan.deinit();
++    return plan.slotBytes();
++}
++
++/// The pool behind the engine: `streams` paged sequences and `count` pages, made now (decision M1: all streams page).
++pub fn attach(p: *anyopaque, streams: u32, count: usize) !void {
++    const own: *Owned = @ptrCast(@alignCast(p));
++    if (own.pages) |old| old.destroy();
++    own.pages = try pages.Pages.create(own.gpa, own.layout, streams, count, own.max_pages, own.window);
++}
++
++/// The prompt cache's limits from the host's plan: pages and snapshot records (0 and 0: off).
++pub fn cache_limit(p: *anyopaque, count: usize, snaps: usize) void {
++    const own: *Owned = @ptrCast(@alignCast(p));
++    if (own.pages) |pg| pg.limit(count, snaps);
++}
++
++/// Whether a request's caches fit now (the lane host's admission, on its engine thread).
++pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
++    const own: *Owned = @ptrCast(@alignCast(p));
++    return if (own.pages) |pg| pg.fits(prompt, max_tokens) else false;
++}
++
++/// The words of the last budget refusal (single-threaded start-up), for `explain`.
++var detail_buf: [1024]u8 = undefined;
++var detail_len: usize = 0;
++
++/// What the host-side checks of `open` conclude for this rank at `context`: its place, plan and the budget's verdict.
++pub const Admission = struct { place: ranks.Place, weights: u64, verdict: ?budget.Verdict, fingerprint_weights: [32]u8 };
++
++/// Reads the shard headers, plans this rank's weights and, with the host's room named, runs the budget at `o.context`.
++pub fn admission(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const config.Config, p: ranks.Place, o: Options) !Admission {
++    var cat = try load.Catalog.open(gpa, io, dir);
++    defer cat.deinit();
++    const share = try shard.Share.of(c, p.rank, p.world);
++    var plan = try load.Plan.build(gpa, &cat, c, share, .{});
++    defer plan.deinit();
++    const dims = try pool.Dims.of(c, share);
++    var out: Admission = .{ .place = p, .weights = plan.slotBytes(), .verdict = null, .fingerprint_weights = try weights_device.digest(gpa, &cat) };
++    if (o.grant == 0) return out;
++    out.verdict = budget.check(dims, .{ .available = o.grant, .weights = out.weights, .terms = budget.hosted(), .lanes = o.lanes, .lanes_fixed = o.lanes_fixed, .window = window_rows, .max_positions = c.max_positions }, o.context);
++    return out;
++}
++
++pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
++    _ = kernels; // our own kernels: a captured set is not used
++    _ = ctx;
++    const p = try ranks.admit(&ranks.environment);
++    var problem: []const u8 = "";
++    _ = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
++        std.log.err("{s}", .{problem});
++        return err;
++    };
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
++    defer gpa.free(text);
++    const c = try config.parse(gpa, text);
++    const a = try admission(gpa, io, dir, &c, p, o);
++    if (a.verdict) |v| switch (v) {
++        .refused => |r| {
++            const words = std.fmt.bufPrint(&detail_buf, "{f}", .{r}) catch detail_buf[0..0];
++            detail_len = words.len;
++            return error.BudgetRefused;
++        },
++        .ok => |cap| std.log.info("minimax budget: {d} tokens a stream, {d} pages, {d:.2} GiB of KV room (the host's plan has the last word)", .{ cap.context, cap.pages, @as(f64, @floatFromInt(cap.pool_bytes)) / (1 << 30) }),
++    };
++    // UNEXERCISED and not written (T8): NCCL, the engine, forward, prefill, lanes backend, follower, then Loaded.
++    return error.EngineNotBuilt;
++}
++
++/// The server's words for this family's refusals.
++pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
++    inline for (@typeInfo(ranks.Error).error_set.error_names.?) |name| {
++        if (err == @field(anyerror, name)) return ranks.refusal(@field(ranks.Error, name));
++    }
++    return switch (err) {
++        error.EngineNotBuilt => "MiniMax-M3.1-Flash is registered and its checkpoint, ranks and memory budget were checked, but this build has no forward pass for it yet (the engine, prefill and lanes backend are not in this tree)",
++        error.BudgetRefused => detail_buf[0..detail_len],
++        error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
++        error.BadRank => "TF_MM3_WORLD is larger than the checkpoint can be cut for (4 kv heads, 128-unit widths)",
++        else => null,
++    };
++}
++
++comptime {
++    iface.conformsNative(@This());
++}
++
++test "capacity keeps a verify window past the context, in whole pages" {
++    try std.testing.expectEqual(@as(usize, 65664), capacity(65536));
++    try std.testing.expectEqual(@as(usize, 128), capacity(1));
++    try std.testing.expect(capacity(100000) % pool.page_tokens == 0 and capacity(100000) >= 100000 + window_rows);
++}
++
++test "attach makes the pool, fits asks it, the cache limit reaches the store, and a family without pages refuses" {
++    const gpa = std.testing.allocator;
++    const l: kv.Layout = .{ .fixed_bytes = 4096, .token_bytes = 1024, .page_tokens = pool.page_tokens, .snap_bytes = pool.snap_bytes, .all_paged = true };
++    var own: Owned = .{ .gpa = gpa, .layout = l, .max_pages = 64 };
++    try std.testing.expect(!fits(&own, 10, 10));
++    try attach(&own, 2, 100);
++    defer own.pages.?.destroy();
++    try std.testing.expect(fits(&own, 1000, 100));
++    try std.testing.expect(!fits(&own, 100 * 128, 0));
++    cache_limit(&own, 40, 8);
++    try attach(&own, 3, 50);
++    try std.testing.expectEqual(@as(usize, 50), own.pages.?.pages.total());
++}
++
++test "explain words every named refusal and leaves foreign errors to the host" {
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoRank).?, "TF_MM3_RANK") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoCommId).?, "NCCL_COMM_ID") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.EngineNotBuilt).?, "no forward pass") != null);
++    try std.testing.expect(explain(null, error.OutOfMemory) == null);
++}
++
++test "the family's declarations are the ones the host reads" {
++    try std.testing.expectEqualStrings("minimax_m3_vl", model_type);
++    try std.testing.expectEqualStrings("exl3", formats[0]);
++    try std.testing.expect(owns_prompt_cache and explains_open);
++    try std.testing.expectEqual(@as(u32, 2048), prompt_rows);
++}
+diff --git a/zig/src/families/minimax_m3/pages.zig b/zig/src/families/minimax_m3/pages.zig
+new file mode 100644
+index 0000000..663ce63
+--- /dev/null
++++ b/zig/src/families/minimax_m3/pages.zig
+@@ -0,0 +1,72 @@
++//! The host half of the engine's page state: page ids, the radix prompt cache, the block tables (device half: T8).
++const std = @import("std");
++const kv = @import("core").kv_pool;
++const pool = @import("pool.zig");
++const state = @import("state.zig");
++
++pub const Pages = struct {
++    gpa: std.mem.Allocator,
++    pages: kv.Pool,
++    cache: state.Cache,
++    tables: pool.Tables,
++    layout: kv.Layout,
++    max_pages: usize,
++    window: u64,
++
++    /// `streams` slots of at most `max_pages` pages over a pool of `count` pages; `window` rows past a reply.
++    pub fn create(gpa: std.mem.Allocator, layout: kv.Layout, streams: u32, count: usize, max_pages: usize, window: u64) !*Pages {
++        const p = try gpa.create(Pages);
++        errdefer gpa.destroy(p);
++        p.gpa = gpa;
++        p.layout = layout;
++        p.max_pages = max_pages;
++        p.window = window;
++        p.pages = try kv.Pool.init(gpa, count, layout.pageBytes());
++        errdefer p.pages.deinit();
++        p.tables = try pool.Tables.init(gpa, streams, max_pages);
++        errdefer p.tables.deinit();
++        try p.cache.init(gpa, &p.pages, layout, state.rules);
++        return p;
++    }
++
++    pub fn destroy(p: *Pages) void {
++        const gpa = p.gpa;
++        p.cache.deinit();
++        p.tables.deinit();
++        p.pages.deinit();
++        gpa.destroy(p);
++    }
++
++    /// Whether a request's prompt, reply and last window can be promised now (the store's idle pages counted).
++    pub fn fits(p: *Pages, prompt: u32, max_tokens: u32) bool {
++        const need = p.cache.need(prompt, max_tokens, p.window);
++        return need <= p.max_pages and need <= p.pages.total() and p.pages.fits(need);
++    }
++
++    /// The prompt cache may hold `count` pages (half the pool at most) and `snaps` records; 0 and 0 switches it off.
++    pub fn limit(p: *Pages, count: usize, snaps: usize) void {
++        p.cache.limit(@min(count, p.pages.total() / 2), snaps);
++    }
++};
++
++test "pages: the cache is limited to half the pool, a request that cannot fit is refused, and teardown is clean" {
++    const gpa = std.testing.allocator;
++    const l: kv.Layout = .{ .fixed_bytes = 4096, .token_bytes = 1024, .page_tokens = pool.page_tokens, .snap_bytes = pool.snap_bytes, .all_paged = true };
++    const p = try Pages.create(gpa, l, 2, 64, 32, 16);
++    defer p.destroy();
++    try std.testing.expect(p.fits(1000, 100)); // 9 pages
++    try std.testing.expect(!p.fits(4000, 200)); // 33 pages: past the table row
++    try std.testing.expect(!p.fits(70 * 128, 0)); // past the pool
++    p.limit(1000, 8);
++    try std.testing.expect(p.pages.idle());
++    var s: state.Stream = .{ .slot = 1 };
++    var sink = p.tables.sink(1);
++    const prompt: [3000]u32 = @splat(7);
++    const marks = try p.cache.admit(gpa, &s, &prompt, 0, 100, p.window, sink.table(), p.max_pages);
++    defer gpa.free(marks);
++    try std.testing.expectEqual(@as(usize, 25), s.lease.ids.items.len);
++    try std.testing.expectEqual(@as(?u32, s.lease.ids.items[3]), p.tables.page(1, 3));
++    p.cache.end(&s, &p.tables);
++    try std.testing.expect(p.pages.idle());
++    try std.testing.expectEqual(@as(?u32, null), p.tables.page(1, 3));
++}
+diff --git a/zig/src/families/minimax_m3/pool.zig b/zig/src/families/minimax_m3/pool.zig
+index 6f84825..2aa00bb 100644
+--- a/zig/src/families/minimax_m3/pool.zig
++++ b/zig/src/families/minimax_m3/pool.zig
+@@ -46,9 +46,9 @@ pub const Dims = struct {
+         return max_pages * @sizeOf(i32);
+     }
+ 
+-    /// The pool's layout for streams of at most `max_pages` pages: the table row is their fixed part.
++    /// The layout for streams of at most `max_pages` pages: the table row is their fixed part, every stream pages.
+     pub fn layout(d: Dims, max_pages: u64) kv.Layout {
+-        return .{ .fixed_bytes = tableBytes(max_pages), .token_bytes = d.tokenBytes(), .page_tokens = page_tokens, .snap_bytes = snap_bytes };
++        return .{ .fixed_bytes = tableBytes(max_pages), .token_bytes = d.tokenBytes(), .page_tokens = page_tokens, .snap_bytes = snap_bytes, .all_paged = true };
+     }
+ 
+     /// Where things sit inside one page, per layer: `K[kvh][128 tok][head_dim]`, `V[kvh][128][head_dim]`, `IK[128][index_dim]`.
+diff --git a/zig/src/families/minimax_m3/ranks.zig b/zig/src/families/minimax_m3/ranks.zig
+index 829fe24..f4b9d3d 100644
+--- a/zig/src/families/minimax_m3/ranks.zig
++++ b/zig/src/families/minimax_m3/ranks.zig
+@@ -8,6 +8,8 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
+ pub const rank_var = "TF_MM3_RANK";
+ pub const world_var = "TF_MM3_WORLD";
+ pub const layers_var = "TF_MM3_LAYERS";
++pub const roce_var = "TF_ROCE";
++pub const roce_cap_var = "TF_ROCE_MAX_KB";
+ /// NCCL's own rendezvous variable: rank 0's IPv4 address and port, the same text on every rank.
+ pub const comm_id_var = "NCCL_COMM_ID";
+ 
+@@ -81,6 +83,7 @@ pub fn refusal(err: Error) []const u8 {
+ /// arithmetic must be here and in the fingerprint so both ranks are made to agree.
+ pub const Settings = struct {
+     layers: u32 = 0, // TF_MM3_LAYERS: the first this many layers only, for one-GPU checks (0: all)
++    roce_kb: u32 = 4096, // TF_ROCE_MAX_KB, the small-gather RoCE path's cap in KiB; 0 when TF_ROCE=0 keeps every gather on NCCL
+ 
+     pub fn read(get: Get, problem: *[]const u8) Error!Settings {
+         var s: Settings = .{};
+@@ -91,6 +94,16 @@ pub const Settings = struct {
+                 return error.BadSetting;
+             }
+         }
++        if (get(roce_cap_var)) |v| {
++            s.roce_kb = std.fmt.parseInt(u32, v, 10) catch 0;
++            if (s.roce_kb == 0 or s.roce_kb > std.math.maxInt(u32) / 1024) {
++                problem.* = "TF_ROCE_MAX_KB: an integer from 1 through 4194303 KiB, or unset for 4096 KiB";
++                return error.BadSetting;
++            }
++        }
++        if (get(roce_var)) |v| if (std.mem.eql(u8, v, "0")) {
++            s.roce_kb = 0;
++        };
+         return s;
+     }
+ };
+@@ -102,20 +115,21 @@ pub const Fingerprint = extern struct {
+     rank: u32,
+     layers: u32, // TF_MM3_LAYERS (0: all)
+     reduce: u32 = 1, // tp.zig's reduction_version: the fp32 rank-order sum
+-    pad: u32 = 0,
++    roce: u32, // Settings.roce_kb: the ranks open the RoCE small-gather path together or not at all
+     capacity: u64, // tokens a sequence holds
+     config: [32]u8, // sha256 of config.json
+     quant: [32]u8, // sha256 of quantization_config.json: codebook, version, every matrix's bits
+     program: [32]u8, // sha256 of this executable
+     weights: [32]u8, // digest of the checkpoint's metadata and shard bytes (the engine's checkpoint digest)
+ 
+-    pub const Field = enum { layout, rank, world, layers, reduce, capacity, config, quant, program, weights };
++    pub const Field = enum { layout, rank, world, layers, reduce, roce, capacity, config, quant, program, weights };
+ 
+     pub fn of(p: Place, s: Settings, capacity: usize, config: [32]u8, quant: [32]u8, program: [32]u8, weights: [32]u8) Fingerprint {
+         return .{
+             .world = @intCast(p.world),
+             .rank = @intCast(p.rank),
+             .layers = s.layers,
++            .roce = s.roce_kb,
+             .capacity = capacity,
+             .config = config,
+             .quant = quant,
+@@ -133,7 +147,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
+         if (f.rank != r) return .{ .field = .rank, .rank = r };
+         if (f.world != all.len) return .{ .field = .world, .rank = r };
+-        inline for (.{ "world", "layers", "reduce", "capacity", "config", "quant", "program", "weights" }) |name| {
++        inline for (.{ "world", "layers", "reduce", "roce", "capacity", "config", "quant", "program", "weights" }) |name| {
+             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
+                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
+         }
+@@ -148,6 +162,7 @@ pub fn explain(f: Fingerprint.Field) []const u8 {
+         .world => "the ranks were started with different world sizes",
+         .layers => "TF_MM3_LAYERS",
+         .reduce => "a different reduction order",
++        .roce => "TF_ROCE or TF_ROCE_MAX_KB",
+         .capacity => "the sequence capacity (the context)",
+         .config => "config.json",
+         .quant => "quantization_config.json (codebook, version or bit widths)",
+@@ -227,6 +242,20 @@ fn fp(rank: usize) Fingerprint {
+     return Fingerprint.of(.{ .rank = rank, .world = 2 }, .{}, 131072, hashBytes("config"), hashBytes("quant"), h, hashBytes("weights"));
+ }
+ 
++test "settings: TF_ROCE=0 turns the RoCE path off and TF_ROCE_MAX_KB must be a usable cap, both agreed by the ranks" {
++    var problem: []const u8 = "";
++    Fake.pairs = &.{};
++    try std.testing.expectEqual(@as(u32, 4096), (try Settings.read(&Fake.get, &problem)).roce_kb);
++    Fake.pairs = &.{.{ roce_cap_var, "1024" }};
++    try std.testing.expectEqual(@as(u32, 1024), (try Settings.read(&Fake.get, &problem)).roce_kb);
++    Fake.pairs = &.{ .{ roce_var, "0" }, .{ roce_cap_var, "1024" } };
++    try std.testing.expectEqual(@as(u32, 0), (try Settings.read(&Fake.get, &problem)).roce_kb);
++    Fake.pairs = &.{.{ roce_cap_var, "0" }};
++    try std.testing.expectError(error.BadSetting, Settings.read(&Fake.get, &problem));
++    var all = [_]Fingerprint{ fp(0), Fingerprint.of(.{ .rank = 1, .world = 2 }, .{ .roce_kb = 0 }, 131072, hashBytes("config"), hashBytes("quant"), @splat(1), hashBytes("weights")) };
++    try std.testing.expectEqual(Mismatch{ .field = .roce, .rank = 1 }, mismatch(&all).?);
++}
++
+ test "fingerprints: agreeing ranks pass; config, quantization, weights and the rest name the first difference" {
+     var all = [_]Fingerprint{ fp(0), fp(1) };
+     try std.testing.expect(mismatch(&all) == null);
+diff --git a/zig/src/families/minimax_m3/stream.zig b/zig/src/families/minimax_m3/stream.zig
+new file mode 100644
+index 0000000..be59e0e
+--- /dev/null
++++ b/zig/src/families/minimax_m3/stream.zig
+@@ -0,0 +1,84 @@
++//! The checkpoint streamer: a plan's byte runs read in file order with direct I/O through one aligned buffer.
++const std = @import("std");
++const core = @import("core");
++const dio = core.direct_io;
++const load = @import("load.zig");
++const Catalog = load.Catalog;
++const Plan = load.Plan;
++const Sink = load.Sink;
++
++/// Told when the last run of a shard has been read: its pages can leave the page cache.
++pub const ShardEnd = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, shard: u16) void };
++
++/// Reads a plan's byte runs in file order with direct I/O through one aligned buffer.
++pub const Streamer = struct {
++    gpa: std.mem.Allocator,
++    cat: *const Catalog,
++    buf: dio.Buffer,
++    folded: []f32,
++    ended: ?ShardEnd = null,
++
++    pub const default_chunk = 8 << 20;
++
++    pub fn init(gpa: std.mem.Allocator, cat: *const Catalog, chunk: usize) !Streamer {
++        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), chunk);
++        errdefer gpa.free(buf);
++        return .{ .gpa = gpa, .cat = cat, .buf = buf, .folded = try gpa.alloc(f32, dio.fits(chunk) / 2) };
++    }
++
++    pub fn deinit(s: *Streamer) void {
++        s.gpa.free(s.buf);
++        s.gpa.free(s.folded);
++        s.* = undefined;
++    }
++
++    /// Every EXL3 marker holds the mul1 multiplier: a codebook the kernels do not decode is refused before any copy.
++    pub fn verifyMarkers(s: *Streamer, plan: *const Plan) !void {
++        for (plan.matrices) |m| {
++            const got = try s.cat.files.items[m.marker_shard].read(s.buf, m.marker_at, 4);
++            if (std.mem.readInt(u32, got[0..4], .little) != load.mul1_multiplier) {
++                std.log.warn("layer {d} {t} expert {d}: codebook marker is not mul1", .{ m.layer, m.proj, m.expert });
++                return error.BadCodebookMarker;
++            }
++        }
++    }
++
++    pub fn run(s: *Streamer, plan: *const Plan, sink: Sink) !void {
++        try s.verifyMarkers(plan);
++        const room = dio.fits(s.buf.len);
++        var shard_open: ?u16 = null;
++        for (plan.items) |it| {
++            if (shard_open) |o| if (o != it.shard) s.shardEnded(o);
++            shard_open = it.shard;
++            const file = s.cat.files.items[it.shard];
++            const limit = plan.slots[it.slot].bytes;
++            if (it.fold) {
++                // a norm weight: one read, bf16 to fp32 1 + w
++                if (it.span.len > room or it.span.count != 1 or it.dst != 0) return error.BadPlan;
++                const got = try file.read(s.buf, it.first(), @intCast(it.span.len));
++                const out = load.foldGemma(s.folded, got);
++                try sink.put(sink.ctx, it.slot, 0, std.mem.sliceAsBytes(out));
++                continue;
++            }
++            var run_i: u64 = 0;
++            while (run_i < it.span.count) : (run_i += 1) {
++                var at = it.base + it.span.at(run_i);
++                var dst = it.dst + run_i * it.span.len;
++                var left: u64 = it.span.len;
++                while (left > 0) {
++                    const n: usize = @intCast(@min(left, room));
++                    if (dst + n > limit) return error.BadPlan;
++                    try sink.put(sink.ctx, it.slot, dst, try file.read(s.buf, at, n));
++                    at += n;
++                    dst += n;
++                    left -= n;
++                }
++            }
++        }
++        if (shard_open) |o| s.shardEnded(o);
++    }
++
++    fn shardEnded(s: *Streamer, shard: u16) void {
++        if (s.ended) |e| e.call(e.ctx, shard);
++    }
++};
+diff --git a/zig/src/families/minimax_m3/weights.zig b/zig/src/families/minimax_m3/weights.zig
+new file mode 100644
+index 0000000..84cbfe4
+--- /dev/null
++++ b/zig/src/families/minimax_m3/weights.zig
+@@ -0,0 +1,254 @@
++//! A rank's weights as the kernels take them, described from load.Plan and each slot's device base; host only.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const load = @import("load.zig");
++const names = @import("names.zig");
++const ffn = @import("ffn.zig");
++const Config = @import("config.zig").Config;
++const exl3 = cuda.exl3;
++const st = core.safetensors;
++
++pub const Error = error{ MissingTensor, BadDtype, BadShape, BadLayer, OutOfMemory };
++
++pub const Dense = struct { gate: exl3.Weight, up: exl3.Weight, down: exl3.Weight };
++
++pub const Moe = struct {
++    router: u64, // fp32 [experts, hidden], as stored
++    bias: u64, // fp32 [experts], e_score_correction_bias
++    experts: cuda.exl3_experts.Layer,
++    shared: Dense,
++};
++
++pub const Ffn = union(enum) { dense: Dense, moe: Moe };
++
++/// One layer. Norm weights are fp32 `1 + w` (the Gemma fold ran in the streamer); index projections are fp16.
++pub const Layer = struct {
++    input_ln: u64 = 0,
++    post_ln: u64 = 0,
++    q_norm: u64 = 0,
++    k_norm: u64 = 0,
++    index_q_norm: u64 = 0,
++    index_k_norm: u64 = 0,
++    index_q_proj: u64 = 0, // fp16 [this rank's index heads * index dim, hidden]
++    index_k_proj: u64 = 0, // fp16 [index dim, hidden], replicated
++    q: exl3.Weight,
++    k: exl3.Weight,
++    v: exl3.Weight,
++    o: exl3.Weight,
++    ffn: Ffn,
++};
++
++pub const Weights = struct {
++    embed: u64 = 0, // bf16 [vocab, hidden], replicated
++    final_norm: u64 = 0,
++    head: exl3.Weight,
++    layers: []Layer,
++};
++
++/// One routed layer's per-expert tables as the experts kernel reads them, before they are on the device.
++pub const Tables = struct {
++    layer: u16,
++    gate: []u64, // w1: trellis pointer of each expert
++    up: []u64, // w3
++    down: []u64, // w2
++    gate_k2: []const i32, // 2 * bits of each expert's trellis
++    up_k2: []const i32,
++    down_k2: []const i32,
++};
++
++/// The device pointers of the six tables once uploaded, in `Tables` order.
++pub const TablePtrs = struct { gate: u64, up: u64, down: u64, gate_k2: u64, up_k2: u64, down_k2: u64 };
++
++pub const Described = struct { weights: Weights, tables: []Tables };
++
++/// The kernel's record of one dense matrix: slot base plus the matrix' byte offsets, strides for its rank-local shape.
++pub fn weight(m: load.Matrix, bases: []const u64) exl3.Weight {
++    const s = exl3.strides(m.k, m.n, m.halves, false);
++    return .{
++        .trellis = bases[m.trellis] + m.trellis_off,
++        .suh = bases[m.suh] + m.suh_off,
++        .svh = bases[m.svh] + m.svh_off,
++        .k = m.k,
++        .n = m.n,
++        .halves = m.halves,
++        .codebook = .mul1,
++        .stride_k = s.k,
++        .stride_nb = s.nb,
++    };
++}
++
++fn matrix(plan: *const load.Plan, bases: []const u64, proj: names.Proj, layer: u32) Error!exl3.Weight {
++    const m = plan.matrix(proj, layer, 0) orelse return error.MissingTensor;
++    return weight(m.*, bases);
++}
++
++/// The half-bit width every expert of all three projections shares, else 0 (layer 17's 4-bit w1/w3 with a 3-bit w2).
++pub fn uniformK2(m: *const load.MoeLayer) u32 {
++    var width: ?u32 = null;
++    for ([_]*const load.MoeProj{ &m.w1, &m.w3, &m.w2 }) |p| {
++        var seen: ?u32 = null;
++        for (p.histogram, 0..) |count, k2| {
++            if (count == 0) continue;
++            if (seen != null) return 0;
++            seen = @intCast(k2);
++        }
++        const only = seen orelse return 0;
++        if (width != null and width.? != only) return 0;
++        width = only;
++    }
++    return width orelse 0;
++}
++
++fn tables(a: std.mem.Allocator, m: *const load.MoeLayer, bases: []const u64) Error!Tables {
++    const n = m.w1.halves.len;
++    var out: Tables = .{ .layer = m.layer, .gate = undefined, .up = undefined, .down = undefined, .gate_k2 = m.w1.halves, .up_k2 = m.w3.halves, .down_k2 = m.w2.halves };
++    if (m.w3.halves.len != n or m.w2.halves.len != n) return error.BadShape;
++    inline for (.{ .{ "gate", &m.w1 }, .{ "up", &m.w3 }, .{ "down", &m.w2 } }) |pair| {
++        const p: *const load.MoeProj = pair[1];
++        const ptrs = try a.alloc(u64, n);
++        for (ptrs, p.trellis_off) |*d, off| d.* = bases[p.trellis_slot] + off;
++        @field(out, pair[0]) = ptrs;
++    }
++    return out;
++}
++
++fn moeLayer(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, bases: []const u64, l: u32, pending: *std.ArrayList(Tables)) Error!Moe {
++    const m = plan.moeLayer(l) orelse return error.MissingTensor;
++    if (m.w1.k != m.w3.k or m.w1.n != m.w3.n or m.w2.k != m.w1.n or m.w2.n != m.w1.k) return error.BadShape;
++    try pending.append(a, try tables(a, m, bases));
++    return .{
++        .router = 0,
++        .bias = 0,
++        .shared = .{
++            .gate = try matrix(plan, bases, .shared_gate, l),
++            .up = try matrix(plan, bases, .shared_up, l),
++            .down = try matrix(plan, bases, .shared_down, l),
++        },
++        .experts = .{
++            .gate = 0,
++            .up = 0,
++            .down = 0,
++            .gate_k2 = 0,
++            .up_k2 = 0,
++            .down_k2 = 0,
++            .suh_g = bases[m.w1.suh_slot],
++            .suh_u = bases[m.w3.suh_slot],
++            .svh_g = bases[m.w1.svh_slot],
++            .svh_u = bases[m.w3.svh_slot],
++            .suh_d = bases[m.w2.suh_slot],
++            .svh_d = bases[m.w2.svh_slot],
++            .experts = c.experts,
++            .dims = m.w1.k,
++            .width = m.w1.n,
++            .codebook = .mul1,
++            .uniform_k2 = uniformK2(m),
++            .shared_input = false, // decision M7: no check of the gate/up scales yet
++        },
++    };
++}
++
++/// `bases[slot]` is slot's device address. `layers` is how many layers the plan holds (a thin model: the first ones).
++pub fn describe(a: std.mem.Allocator, plan: *const load.Plan, c: *const Config, bases: []const u64, layers: usize) Error!Described {
++    if (bases.len != plan.slots.len or layers > c.layers) return error.BadLayer;
++    const out = try a.alloc(Layer, layers);
++    var pending: std.ArrayList(Tables) = .empty;
++    for (out, 0..) |*o, i| {
++        const l: u32 = @intCast(i);
++        o.* = .{
++            .q = try matrix(plan, bases, .q, l),
++            .k = try matrix(plan, bases, .k, l),
++            .v = try matrix(plan, bases, .v, l),
++            .o = try matrix(plan, bases, .o, l),
++            .ffn = if (c.isMoe(l)) .{ .moe = try moeLayer(a, plan, c, bases, l, &pending) } else .{ .dense = .{
++                .gate = try matrix(plan, bases, .dense_gate, l),
++                .up = try matrix(plan, bases, .dense_up, l),
++                .down = try matrix(plan, bases, .dense_down, l),
++            } },
++        };
++    }
++    var w: Weights = .{ .head = try matrix(plan, bases, .head, 0), .layers = out };
++    var seen_embed = false;
++    for (plan.plain) |p| {
++        const at = bases[p.slot];
++        try checkPlain(p);
++        switch (p.role) {
++            .embed => {
++                w.embed = at;
++                seen_embed = true;
++            },
++            .final_norm => w.final_norm = at,
++            else => {
++                if (p.layer >= layers) continue;
++                const o = &out[p.layer];
++                switch (p.role) {
++                    .input_ln => o.input_ln = at,
++                    .post_ln => o.post_ln = at,
++                    .q_norm => o.q_norm = at,
++                    .k_norm => o.k_norm = at,
++                    .index_q_norm => o.index_q_norm = at,
++                    .index_k_norm => o.index_k_norm = at,
++                    .index_q_proj => o.index_q_proj = at,
++                    .index_k_proj => o.index_k_proj = at,
++                    .router => if (o.ffn == .moe) {
++                        o.ffn.moe.router = at;
++                    } else return error.BadLayer,
++                    .router_bias => if (o.ffn == .moe) {
++                        o.ffn.moe.bias = at;
++                    } else return error.BadLayer,
++                    .embed, .final_norm => unreachable,
++                }
++            },
++        }
++    }
++    if (!seen_embed) return error.MissingTensor;
++    return .{ .weights = w, .tables = try pending.toOwnedSlice(a) };
++}
++
++/// The dtype each plain role must hold on the device: norms folded to fp32, index projections fp16, router fp32.
++pub fn checkPlain(p: load.PlainTensor) Error!void {
++    const want: st.DType = switch (p.role) {
++        .embed => .bf16,
++        .index_q_proj, .index_k_proj => .f16,
++        .router, .router_bias => .f32,
++        else => .f32,
++    };
++    if (p.dtype != want) return error.BadDtype;
++}
++
++/// Sets layer `t.layer`'s table pointers and applies decision M5's switches (which may swap gate and up).
++pub fn attachTables(w: *Weights, t: Tables, ptrs: TablePtrs, sw: ffn.Switches) void {
++    const e = &w.layers[t.layer].ffn.moe.experts;
++    e.gate = ptrs.gate;
++    e.up = ptrs.up;
++    e.down = ptrs.down;
++    e.gate_k2 = ptrs.gate_k2;
++    e.up_k2 = ptrs.up_k2;
++    e.down_k2 = ptrs.down_k2;
++    ffn.configureLayer(e, sw);
++}
++
++/// One buffer per routed layer holds its six tables: three int64 pointer tables, then three int32 width tables.
++pub fn packTables(a: std.mem.Allocator, t: Tables) Error![]u8 {
++    const n = t.gate.len;
++    const out = try a.alloc(u8, n * (3 * 8 + 3 * 4));
++    var at: usize = 0;
++    for ([_][]const u64{ t.gate, t.up, t.down }) |p| for (p) |v| {
++        std.mem.writeInt(u64, out[at..][0..8], v, .little);
++        at += 8;
++    };
++    for ([_][]const i32{ t.gate_k2, t.up_k2, t.down_k2 }) |p| for (p) |v| {
++        std.mem.writeInt(i32, out[at..][0..4], v, .little);
++        at += 4;
++    };
++    return out;
++}
++
++/// Where the six tables of `packTables` sit when the buffer starts at device address `base`, for `n` experts.
++pub fn tablePtrs(base: u64, n: usize) TablePtrs {
++    return .{ .gate = base, .up = base + 8 * n, .down = base + 16 * n, .gate_k2 = base + 24 * n, .up_k2 = base + 28 * n, .down_k2 = base + 32 * n };
++}
++
++test {
++    _ = @import("weights_test.zig");
++}
+diff --git a/zig/src/families/minimax_m3/weights_device.zig b/zig/src/families/minimax_m3/weights_device.zig
+new file mode 100644
+index 0000000..38d5db1
+--- /dev/null
++++ b/zig/src/families/minimax_m3/weights_device.zig
+@@ -0,0 +1,137 @@
++//! A rank's weights on the device: a buffer per slot, direct I/O, page cache dropped per shard, a header digest.
++const std = @import("std");
++const cuda = @import("cuda");
++const load = @import("load.zig");
++const shard_ = @import("shard.zig");
++const weights = @import("weights.zig");
++const ffn = @import("ffn.zig");
++const Config = @import("config.zig").Config;
++const Sha256 = std.crypto.hash.sha2.Sha256;
++
++/// Bytes put between stream synchronizations: bounds the pinned staging the async copies hold.
++pub const sync_every: u64 = 256 << 20;
++
++/// sha256 over each tensor's name, shard, dtype, shape and byte range in name order; no data byte is read (NFS-safe).
++pub fn digest(gpa: std.mem.Allocator, cat: *const load.Catalog) ![32]u8 {
++    const keys = try gpa.alloc([]const u8, cat.map.count());
++    defer gpa.free(keys);
++    var it = cat.map.keyIterator();
++    for (keys) |*k| k.* = it.next().?.*;
++    std.mem.sort([]const u8, keys, {}, struct {
++        fn less(_: void, a: []const u8, b: []const u8) bool {
++            return std.mem.lessThan(u8, a, b);
++        }
++    }.less);
++    var h = Sha256.init(.{});
++    for (keys) |k| {
++        const r = cat.map.get(k).?;
++        h.update(k);
++        h.update(&.{0});
++        const fields = [_]u64{ r.shard, @intFromEnum(r.dtype), r.rank, r.begin, r.len };
++        for (fields) |f| h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, f)));
++        for (r.shape[0..r.rank]) |d| h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, d)));
++    }
++    return h.finalResult();
++}
++
++/// Streams `plan` through `sink`, calling `ended` after each shard's last run.
++pub fn feed(gpa: std.mem.Allocator, cat: *const load.Catalog, plan: *const load.Plan, sink: load.Sink, ended: ?load.ShardEnd) !void {
++    var s = try load.Streamer.init(gpa, cat, load.Streamer.default_chunk);
++    defer s.deinit();
++    s.ended = ended;
++    try s.run(plan, sink);
++}
++
++/// The shard-end hook that empties the page cache of the shard's file.
++pub const CacheDrop = struct {
++    cat: *const load.Catalog,
++
++    pub fn hook(d: *CacheDrop) load.ShardEnd {
++        return .{ .ctx = d, .call = call };
++    }
++
++    fn call(ctx: *anyopaque, shard: u16) void {
++        const d: *CacheDrop = @ptrCast(@alignCast(ctx));
++        d.cat.files.items[shard].dropCache();
++    }
++};
++
++/// The sink onto per-slot device buffers: async copies on `stream`, synchronized every `sync_every` bytes.
++const Upload = struct {
++    bufs: []const cuda.DeviceBuffer,
++    stream: cuda.Stream,
++    since: u64 = 0,
++
++    fn put(ctx: *anyopaque, slot: u32, offset: u64, bytes: []const u8) anyerror!void {
++        const u: *Upload = @ptrCast(@alignCast(ctx));
++        try u.bufs[slot].uploadAsync(@intCast(offset), bytes, u.stream.handle);
++        u.since += bytes.len;
++        if (u.since >= sync_every) {
++            try u.stream.synchronize();
++            u.since = 0;
++        }
++    }
++};
++
++pub const Loaded = struct {
++    arena: std.heap.ArenaAllocator,
++    bufs: []cuda.DeviceBuffer,
++    tables: []cuda.DeviceBuffer,
++    weights: weights.Weights,
++    digest: [32]u8,
++    bytes: u64, // device bytes of the slots
++
++    pub fn deinit(l: *Loaded) void {
++        for (l.bufs) |*b| b.free();
++        for (l.tables) |*b| b.free();
++        l.arena.deinit();
++        l.* = undefined;
++    }
++};
++
++/// Plans rank `share` (the first `layers` layers; 0: all), fills the slots, uploads the expert tables. UNEXERCISED.
++pub fn loadWeights(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, dir: []const u8, c: *const Config, share: shard_.Share, layers: usize) !Loaded {
++    var cat = try load.Catalog.open(gpa, io, dir);
++    defer cat.deinit();
++    const sum = try digest(gpa, &cat);
++    var first: [64]u16 = undefined;
++    const subset: []const u16 = if (layers == 0 or layers >= c.layers) &.{} else blk: {
++        for (first[0..layers], 0..) |*f, i| f.* = @intCast(i);
++        break :blk first[0..layers];
++    };
++    var plan = try load.Plan.build(gpa, &cat, c, share, .{ .layers = subset });
++    defer plan.deinit();
++    var out: Loaded = .{ .arena = .init(gpa), .bufs = &.{}, .tables = &.{}, .weights = undefined, .digest = sum, .bytes = plan.slotBytes() };
++    errdefer out.arena.deinit();
++    const a = out.arena.allocator();
++    var made: std.ArrayList(cuda.DeviceBuffer) = .empty;
++    errdefer made.deinit(gpa);
++    errdefer for (made.items) |*b| b.free();
++    const bases = try a.alloc(u64, plan.slots.len);
++    for (plan.slots, bases) |s, *base| {
++        const b = try cuda.DeviceBuffer.alloc(d, @intCast(s.bytes));
++        try made.append(gpa, b);
++        base.* = b.ptr;
++    }
++    var up: Upload = .{ .bufs = made.items, .stream = stream };
++    var drop: CacheDrop = .{ .cat = &cat };
++    try feed(gpa, &cat, &plan, .{ .ctx = &up, .put = Upload.put }, drop.hook());
++    try stream.synchronize();
++    var described = try weights.describe(a, &plan, c, bases, if (layers == 0) c.layers else layers);
++    var tab: std.ArrayList(cuda.DeviceBuffer) = .empty;
++    errdefer tab.deinit(gpa);
++    errdefer for (tab.items) |*b| b.free();
++    for (described.tables) |t| {
++        const packed_ = try weights.packTables(gpa, t);
++        defer gpa.free(packed_);
++        const b = try cuda.DeviceBuffer.fromHost(d, packed_);
++        try tab.append(gpa, b);
++        weights.attachTables(&described.weights, t, weights.tablePtrs(b.ptr, t.gate.len), ffn.Switches{});
++    }
++    out.bufs = try a.dupe(cuda.DeviceBuffer, made.items);
++    out.tables = try a.dupe(cuda.DeviceBuffer, tab.items);
++    made.deinit(gpa);
++    tab.deinit(gpa);
++    out.weights = described.weights;
++    return out;
++}
+diff --git a/zig/src/families/minimax_m3/weights_test.zig b/zig/src/families/minimax_m3/weights_test.zig
+new file mode 100644
+index 0000000..1ebf856
+--- /dev/null
++++ b/zig/src/families/minimax_m3/weights_test.zig
+@@ -0,0 +1,214 @@
++//! weights.zig and weights_device.zig on the synthetic mini checkpoint, with fake slot bases and sinks; no GPU.
++const std = @import("std");
++const load = @import("load.zig");
++const weights = @import("weights.zig");
++const device = @import("weights_device.zig");
++const shard = @import("shard.zig");
++const ffn = @import("ffn.zig");
++const synth = @import("load_synth_test.zig");
++const native = @import("native.zig");
++const budget = @import("budget.zig");
++
++const gpa = std.testing.allocator;
++const base0: u64 = 0x7000_0000_0000;
++
++fn fakeBases(plan: *const load.Plan, out: []u64) void {
++    for (plan.slots, out, 0..) |s, *b, i| b.* = base0 + i * 0x1_0000_0000 + (s.bytes & 0);
++}
++
++const Fixture = struct {
++    dir: synth.Dir,
++    cat: load.Catalog,
++    pack: synth.Pack,
++
++    fn init(io: std.Io, c: *const @import("config.zig").Config, mutate: bool) !Fixture {
++        var pack = synth.Pack.init();
++        errdefer pack.deinit();
++        try pack.all(c);
++        if (mutate) pack.ts.items[0].data[0] ^= 0xff;
++        var dir = try synth.Dir.init(io);
++        errdefer dir.deinit();
++        try synth.write(io, dir.tmp.dir, &pack, .{});
++        return .{ .dir = dir, .cat = try load.Catalog.open(gpa, io, dir.path), .pack = pack };
++    }
++
++    fn deinit(f: *Fixture) void {
++        f.cat.deinit();
++        f.dir.deinit();
++        f.pack.deinit();
++    }
++};
++
++test "describe: every record points at its slot base plus its offset, and the experts' widths decide uniform_k2" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var f = try Fixture.init(io, &c, false);
++    defer f.deinit();
++    var plan = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 1, 2), .{});
++    defer plan.deinit();
++    var bases: [4096]u64 = undefined;
++    fakeBases(&plan, bases[0..plan.slots.len]);
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const d = try weights.describe(arena.allocator(), &plan, &c, bases[0..plan.slots.len], c.layers);
++    const w = d.weights;
++    try std.testing.expectEqual(@as(usize, 4), w.layers.len);
++    const q = plan.matrix(.q, 2, 0).?;
++    try std.testing.expectEqual(bases[q.trellis] + q.trellis_off, w.layers[2].q.trellis);
++    try std.testing.expectEqual(@as(u32, 12), w.layers[2].q.halves);
++    try std.testing.expectEqual(q.n, w.layers[2].q.n);
++    try std.testing.expect(w.layers[0].ffn == .dense and w.layers[1].ffn == .moe);
++    try std.testing.expect(w.embed != 0 and w.final_norm != 0 and w.head.n == plan.matrix(.head, 0, 0).?.n);
++    try std.testing.expect(w.layers[0].input_ln != 0 and w.layers[0].index_q_proj != 0 and w.layers[0].index_k_norm != 0);
++    try std.testing.expect(w.layers[1].ffn.moe.router != 0 and w.layers[1].ffn.moe.bias != 0);
++    // layer 1: w1, w3 and w2 are all 4-bit; layer 2 mixes 4/4/3; layer 3 has one 4-bit expert among 3-bit
++    try std.testing.expectEqual(@as(u32, 8), w.layers[1].ffn.moe.experts.uniform_k2);
++    try std.testing.expectEqual(@as(u32, 0), w.layers[2].ffn.moe.experts.uniform_k2);
++    try std.testing.expectEqual(@as(u32, 0), w.layers[3].ffn.moe.experts.uniform_k2);
++    try std.testing.expect(!w.layers[1].ffn.moe.experts.shared_input);
++    try std.testing.expectEqual(@as(usize, 3), d.tables.len);
++    const m1 = plan.moeLayer(1).?;
++    try std.testing.expectEqual(@as(usize, c.experts), d.tables[0].gate.len);
++    for (d.tables[0].gate, m1.w1.trellis_off) |p, off| try std.testing.expectEqual(bases[m1.w1.trellis_slot] + off, p);
++    try std.testing.expectEqual(bases[m1.w2.svh_slot], w.layers[1].ffn.moe.experts.svh_d);
++    try std.testing.expectEqual(@as(usize, m1.w1.k), w.layers[1].ffn.moe.experts.dims);
++}
++
++test "a thin model describes its first layers only, and a wrong plain dtype or missing tensor is refused" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var f = try Fixture.init(io, &c, false);
++    defer f.deinit();
++    var plan = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 0, 2), .{ .layers = &.{ 0, 1 } });
++    defer plan.deinit();
++    var bases: [4096]u64 = undefined;
++    fakeBases(&plan, bases[0..plan.slots.len]);
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const d = try weights.describe(arena.allocator(), &plan, &c, bases[0..plan.slots.len], 2);
++    try std.testing.expectEqual(@as(usize, 2), d.weights.layers.len);
++    try std.testing.expectEqual(@as(usize, 1), d.tables.len);
++    try std.testing.expectError(error.MissingTensor, weights.describe(arena.allocator(), &plan, &c, bases[0..plan.slots.len], 3));
++    var odd = plan.plain[0];
++    odd.role = .index_q_proj;
++    odd.dtype = .bf16;
++    try std.testing.expectError(error.BadDtype, weights.checkPlain(odd));
++    odd.role = .router;
++    odd.dtype = .f32;
++    try weights.checkPlain(odd);
++}
++
++test "the tables pack to the layout the pointers say, and a gate/up swap exchanges both pairs" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var f = try Fixture.init(io, &c, false);
++    defer f.deinit();
++    var plan = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 0, 1), .{});
++    defer plan.deinit();
++    var bases: [4096]u64 = undefined;
++    fakeBases(&plan, bases[0..plan.slots.len]);
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var d = try weights.describe(arena.allocator(), &plan, &c, bases[0..plan.slots.len], c.layers);
++    const t = d.tables[1]; // layer 2
++    const bytes = try weights.packTables(gpa, t);
++    defer gpa.free(bytes);
++    const n = t.gate.len;
++    try std.testing.expectEqual(n * 36, bytes.len);
++    const at = weights.tablePtrs(1000, n);
++    try std.testing.expectEqual(@as(u64, 1000 + 24 * n), at.gate_k2);
++    try std.testing.expectEqual(t.up[2], std.mem.readInt(u64, bytes[at.up - 1000 ..][16..24], .little));
++    try std.testing.expectEqual(t.down_k2[3], std.mem.readInt(i32, bytes[at.down_k2 - 1000 ..][12..16], .little));
++    weights.attachTables(&d.weights, t, at, .{ .w1_is_gate = false });
++    const e = d.weights.layers[2].ffn.moe.experts;
++    try std.testing.expectEqual(at.up, e.gate);
++    try std.testing.expectEqual(at.gate, e.up);
++    try std.testing.expectEqual(at.up_k2, e.gate_k2);
++    try std.testing.expectEqual(at.down, e.down);
++    try std.testing.expect(e.act_mode >= 2);
++}
++
++test "the digest reads headers and sizes: data bytes do not move it, a changed header does" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var a = try Fixture.init(io, &c, false);
++    defer a.deinit();
++    var b = try Fixture.init(io, &c, true);
++    defer b.deinit();
++    const da = try device.digest(gpa, &a.cat);
++    try std.testing.expectEqualSlices(u8, &da, &(try device.digest(gpa, &b.cat)));
++    var other = try Fixture.init(io, &c, false);
++    defer other.deinit();
++    try other.pack.reshape("language_model.model.layers.0.input_layernorm.weight", "BF16", &.{c.hidden * 2});
++    var dir2 = try synth.Dir.init(io);
++    defer dir2.deinit();
++    try synth.write(io, dir2.tmp.dir, &other.pack, .{});
++    var cat2 = try load.Catalog.open(gpa, io, dir2.path);
++    defer cat2.deinit();
++    try std.testing.expect(!std.mem.eql(u8, &da, &(try device.digest(gpa, &cat2))));
++}
++
++const Count = struct {
++    bytes: u64 = 0,
++    ended: std.ArrayList(u16) = .empty,
++    fn put(ctx: *anyopaque, _: u32, _: u64, bytes: []const u8) anyerror!void {
++        const s: *Count = @ptrCast(@alignCast(ctx));
++        s.bytes += bytes.len;
++    }
++    fn done(ctx: *anyopaque, shard_no: u16) void {
++        const s: *Count = @ptrCast(@alignCast(ctx));
++        s.ended.append(gpa, shard_no) catch unreachable;
++    }
++};
++
++test "feed tells the hook once per shard, in shard order, after that shard's last run" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var f = try Fixture.init(io, &c, false);
++    defer f.deinit();
++    var plan = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 0, 1), .{});
++    defer plan.deinit();
++    var count: Count = .{};
++    defer count.ended.deinit(gpa);
++    try device.feed(gpa, &f.cat, &plan, .{ .ctx = &count, .put = Count.put }, .{ .ctx = &count, .call = Count.done });
++    try std.testing.expectEqualSlices(u16, &.{ 0, 1 }, count.ended.items);
++    try std.testing.expect(count.bytes > 0);
++    var again: Count = .{};
++    defer again.ended.deinit(gpa);
++    try device.feed(gpa, &f.cat, &plan, .{ .ctx = &again, .put = Count.put }, null);
++    try std.testing.expectEqual(count.bytes, again.bytes);
++    try std.testing.expectEqual(@as(usize, 0), again.ended.items.len);
++    var drop: device.CacheDrop = .{ .cat = &f.cat };
++    drop.hook().call(drop.hook().ctx, 0); // advice on an open file: must not fail or change what is read
++    try device.feed(gpa, &f.cat, &plan, .{ .ctx = &again, .put = Count.put }, drop.hook());
++    try std.testing.expectEqual(2 * count.bytes, again.bytes);
++}
++
++test "the device loader compiles: its signature is the one native.zig calls" {
++    _ = &device.loadWeights;
++    _ = ffn.Switches;
++}
++
++test "admission: the plan's exact bytes and the digest come from the headers, and the host's room decides the verdict" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var f = try Fixture.init(io, &c, false);
++    defer f.deinit();
++    const place: @import("ranks.zig").Place = .{ .rank = 1, .world = 2 };
++    const o: native.Options = .{ .context = 65536, .drafts = false, .grant = 20 << 30 };
++    const a = try native.admission(gpa, io, f.dir.path, &c, place, o);
++    var plan = try load.Plan.build(gpa, &f.cat, &c, try shard.Share.of(&c, 1, 2), .{});
++    defer plan.deinit();
++    try std.testing.expectEqual(plan.slotBytes(), a.weights);
++    try std.testing.expectEqualSlices(u8, &(try device.digest(gpa, &f.cat)), &a.fingerprint_weights);
++    try std.testing.expect(a.verdict.? == .ok);
++    try std.testing.expect(a.verdict.?.ok.context == 65536);
++    const tight = try native.admission(gpa, io, f.dir.path, &c, place, .{ .context = 65536, .drafts = false, .grant = 5 << 30 });
++    try std.testing.expect(tight.verdict.? == .refused);
++    const words = try budget.refusalText(gpa, tight.verdict.?.refused);
++    defer gpa.free(words);
++    try std.testing.expect(std.mem.indexOf(u8, words, "CONTEXT=65536") != null or std.mem.indexOf(u8, words, "no KV room") != null);
++    const unknown = try native.admission(gpa, io, f.dir.path, &c, place, .{ .context = 65536, .drafts = false });
++    try std.testing.expect(unknown.verdict == null); // no host room named: nothing to check
++    try std.testing.expectEqual(@as(u64, 0), budget.hosted().reserve);
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 52aff43..1e73362 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -15,6 +15,7 @@ const lfm2 = @import("lfm2.zig");
+ const glm = @import("glm_cuda");
+ const qwen35 = @import("qwen35");
+ const kolibri1 = @import("kolibri1");
++const minimax = @import("minimax_cuda");
+ const Allocator = std.mem.Allocator;
+ const budget = @import("cuda_memory.zig");
+ const lane_backend = @import("cuda_bound.zig");
+@@ -25,7 +26,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
+ const drafted = @import("cuda_drafted.zig");
+ const kv_pages = @import("cuda_kv_pool.zig");
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native };
++const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, minimax.native };
+ /// --record opens here (engines.zig refuses it for a backend without this).
+ pub const records = true;
+ pub const backends: []const []const u8 = &.{"cuda"};
+@@ -289,6 +290,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
+     if (!family_options.set(F, o, &opts, problem)) return null;
+     if (@hasField(F.Options, "room")) opts.room = .{ .ctx = &probe, .read = Probe.read };
++    if (@hasField(F.Options, "grant")) opts.grant = before.room(held0); // the host's room before the load, one budget
+     if (weights > before.room(held0)) {
+         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
+         return null;
+@@ -372,7 +374,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         };
+         return null;
+     };
+-    if (!try kv_pages.attach(F, a, loaded.ctx, paged, problem)) return null;
++    if (!try kv_pages.attach(F, a, loaded.ctx, layout, paged, o, problem)) return null;
+     served.reserve(streams) catch |e| {
+         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot reserve {d} streams' caches at a {d}-token window ({s}): serve fewer with --parallel, or lower --context", .{ streams, window, @errorName(e) });
+         return null;
+@@ -447,7 +449,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .context_window = @intCast(window),
+         .startup = h.startup,
+         .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
+-        .prompt_cache = h.store != null,
++        .prompt_cache = h.store != null or (kv_pages.owns(F) and cache > 0),
+         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
+         .logprobs = served.backend.vtable.first_row != null,
+         .prompt_logprobs = served.backend.vtable.prompt_rows,
+@@ -465,14 +467,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+ }
+ const toGib = family_memory.toGib;
+ test {
+-    _ = windows;
+     _ = @import("cuda_startup_test.zig");
+     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
+     _ = refusals;
+     _ = lane_backend;
+     _ = snaps;
+     _ = cuda_device; // the device and variable tests
+-    _ = windows;
++    _ = @import("cuda_vision_offer.zig");
++    _ = kv_pages;
++    _ = drafted;
+ }
+ 
+ test "CUDA host preserves prefill_step and first-before-draft capability" {
+@@ -580,11 +583,6 @@ test "Flash Next refuses tensor-rank draft caching before files or CUDA" {
+ test "Flash Next takes --vision at family admission" {
+     try @import("cuda_flashnext_refusal_test.zig").vision();
+ }
+-test {
+-    _ = @import("cuda_vision_offer.zig");
+-    _ = kv_pages;
+-    _ = drafted;
+-}
+ test "Learner ownership: actual native close drains Nemotron before any source, trainer or parent free" {
+     try @import("nemotron_trainer_test.zig").run(Host, Host.serve, Host.close, false);
+ }
+diff --git a/zig/src/native/cuda_kv_pool.zig b/zig/src/native/cuda_kv_pool.zig
+index 754602d..970a3ef 100644
+--- a/zig/src/native/cuda_kv_pool.zig
++++ b/zig/src/native/cuda_kv_pool.zig
+@@ -7,6 +7,11 @@ const Allocator = std.mem.Allocator;
+ 
+ pub const Plan = kv_pool.Plan;
+ 
++/// A family whose backend owns a radix prompt cache over the pool's pages (no snapshot copies, no `pc.Store`).
++pub fn owns(comptime F: type) bool {
++    return @hasDecl(F, "owns_prompt_cache") and F.owns_prompt_cache;
++}
++
+ /// A family whose other streams take pages (Nemotron's) names their layout; any other allocates a window each (null).
+ pub fn layout(loaded: anytype) ?kv_pool.Layout {
+     return if (comptime @hasField(@TypeOf(loaded), "layout")) loaded.layout else null;
+@@ -45,7 +50,7 @@ fn fits(comptime F: type, loaded: anytype, o: api.Open, room: u64, window: u64,
+ /// The pool beside the engine's own full-window sequence, which `model` counts once; null: `problem` says why not.
+ pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool) !?Plan {
+     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
+-    const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
++    const want = if (host_mode or comptime owns(F)) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
+     return kv_pool.plan(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows }) catch |e| {
+         problem.* = switch (e) {
+             error.NoStream => "the CUDA memory budget fits no stream beside the model",
+@@ -56,20 +61,39 @@ pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api
+ }
+ 
+ /// The planned streams' sequences and pages made now; false: `problem` says why they could not be.
+-pub fn attach(comptime F: type, a: Allocator, ctx: *anyopaque, paged: ?Plan, problem: *[]const u8) !bool {
++pub fn attach(comptime F: type, a: Allocator, ctx: *anyopaque, l: ?kv_pool.Layout, paged: ?Plan, o: api.Open, problem: *[]const u8) !bool {
+     if (comptime !@hasDecl(F, "attach")) return true;
+     const p = paged orelse return true;
+-    F.attach(ctx, p.lanes - 1, p.pages) catch |e| {
+-        problem.* = try std.fmt.allocPrint(a, "the CUDA engine could not make its {d} streams' pages ({s})", .{ p.lanes - 1, @errorName(e) });
++    const layout_ = l orelse return true;
++    F.attach(ctx, p.paged, p.pages) catch |e| {
++        problem.* = try std.fmt.allocPrint(a, "the CUDA engine could not make its {d} streams' pages ({s})", .{ p.paged, @errorName(e) });
+         return false;
+     };
++    if (comptime @hasDecl(F, "cache_limit")) F.cache_limit(ctx, cachePages(F, layout_, p, o), cacheSnaps(o));
+     return true;
+ }
+ 
++/// Snapshot records a backend-owned cache keeps: --keep, else the pool's default.
++fn cacheSnaps(o: api.Open) usize {
++    return named(o) orelse kv_pool.most_snaps;
++}
++
++/// Pages a backend-owned radix cache may hold: half the pool at most, within --prompt-cache-gib (0: none; default 16).
++pub fn cachePages(comptime F: type, l: kv_pool.Layout, p: Plan, o: api.Open) usize {
++    if (comptime !owns(F)) return 0;
++    if (cacheSnaps(o) == 0) return 0; // --keep 0: no prompt states, so no pages held for them
++    const asked = budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
++    return @intCast(@min(p.pages / 2, asked / l.pageBytes()));
++}
++
+ /// The cache's snapshot slots and copied rows' bytes (`snaps` 0: a family without slots keeps its cache whole).
+ pub const Kept = struct { snaps: usize, copied: u64, snap_bytes: u64, host: bool = false, most: usize = std.math.maxInt(usize) };
+ 
+ pub fn kept(comptime F: type, loaded: anytype, paged: ?Plan, o: api.Open, room: u64, held: u64, host_budget: u64, host_mode: bool) Kept {
++    if (comptime owns(F)) if (paged) |p| if (layout(loaded)) |l| {
++        const pages = cachePages(F, l, p, o);
++        return .{ .snaps = if (pages > 0) cacheSnaps(o) else 0, .copied = pages * l.pageBytes(), .snap_bytes = l.snap_bytes };
++    };
+     if (host_mode) return .{ .snaps = 0, .copied = hostBudget(o, host_budget), .snap_bytes = stagingBytes(F, loaded, hostBudget(o, host_budget)), .host = true, .most = named(o) orelse std.math.maxInt(usize) };
+     if (comptime !@hasDecl(F, "snap_slots")) return .{ .snaps = 0, .copied = if (@hasDecl(F, "snap_save")) budget.cacheBytes(o.prompt_cache_gib, room, held) else 0, .snap_bytes = 0 };
+     const b: u64 = loaded.snap_bytes;
+@@ -87,9 +111,9 @@ pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: K
+ 
+ /// The startup line's streams and cache.
+ pub fn text(comptime F: type, a: Allocator, stream_bytes: u64, l: ?kv_pool.Layout, paged: ?Plan, window: u64, k: Kept, kv8: bool) ![2][]const u8 {
+-    const shape = if (paged) |p| try std.fmt.allocPrint(a, "the engine's own at a {d}-token window ({d:.2} GiB, in the model's), {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ window, toGib(stream_bytes), p.lanes - 1, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else try std.fmt.allocPrint(a, "{d:.2} GiB each at a {d}-token window{s}", .{ toGib(stream_bytes), window, if (kv8) " (fp8 caches)" else "" });
++    const shape = if (l != null and l.?.all_paged) try std.fmt.allocPrint(a, "{d} taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ paged.?.paged, paged.?.pages, l.?.page_tokens, toGib(paged.?.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else if (paged) |p| try std.fmt.allocPrint(a, "the engine's own at a {d}-token window ({d:.2} GiB, in the model's), {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ window, toGib(stream_bytes), p.paged, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else try std.fmt.allocPrint(a, "{d:.2} GiB each at a {d}-token window{s}", .{ toGib(stream_bytes), window, if (kv8) " (fp8 caches)" else "" });
+     const placed = comptime @hasDecl(F, "snap_place"); // the startup line says where its prompt states went, and why
+-    const cache = if (k.copied == 0) ", no prompt cache" else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
++    const cache = if (k.copied == 0) ", no prompt cache" else if (comptime owns(F)) try std.fmt.allocPrint(a, ", a prompt cache of up to {d:.1} GiB of the pool's pages and {d} snapshot records", .{ toGib(k.copied), k.snaps }) else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
+     return .{ shape, cache };
+ }
+ 
+@@ -176,3 +200,50 @@ test "kv safety: keep zero reserves and allocates no staging through native plan
+ fn hostBudget(o: api.Open, bytes: u64) u64 {
+     return if (named(o) == 0) 0 else bytes;
+ }
++
++const Radix = struct {
++    pub const owns_prompt_cache = true;
++    pub const window_rows = 16;
++    var attached: [2]usize = .{ 0, 0 };
++    var limited: [2]usize = .{ 0, 0 };
++    pub fn attach(_: *anyopaque, streams: u32, pages: usize) !void {
++        attached = .{ streams, pages };
++    }
++    pub fn cache_limit(_: *anyopaque, pages: usize, snaps: usize) void {
++        limited = .{ pages, snaps };
++    }
++};
++
++test "a backend-owned radix cache: every stream pages, the cache takes pool pages not copied bytes, and attach hears the limits" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var problem: []const u8 = "";
++    var ctx: u8 = 0;
++    const l: kv_pool.Layout = .{ .fixed_bytes = 1 << 20, .token_bytes = 75 << 10, .page_tokens = 128, .snap_bytes = 64, .all_paged = true };
++    const loaded = .{ .ctx = @as(*anyopaque, &ctx), .layout = @as(?kv_pool.Layout, l) };
++    const o: api.Open = .{ .dir = "", .model_type = "m", .lanes = 4 };
++    const p = (try plan(Radix, a, l, 40 << 30, o, 65536, &problem, false)).?;
++    try std.testing.expectEqual(@as(u32, 4), p.lanes);
++    try std.testing.expectEqual(@as(u32, 4), p.paged);
++    try std.testing.expectEqual(@as(u64, 0), p.copied); // the cache is pool pages
++    try std.testing.expect(owns(Radix) and !owns(Fixture));
++    const k = kept(Radix, loaded, p, o, 40 << 30, 0, 0, false);
++    try std.testing.expectEqual(@as(usize, kv_pool.most_snaps), k.snaps);
++    try std.testing.expectEqual(@as(u64, p.pages / 2 * l.pageBytes()), k.copied);
++    try std.testing.expect(try attach(Radix, a, &ctx, l, p, o, &problem));
++    try std.testing.expectEqual([2]usize{ 4, p.pages }, Radix.attached);
++    try std.testing.expectEqual([2]usize{ p.pages / 2, kv_pool.most_snaps }, Radix.limited);
++    const shown = (try text(Radix, a, 0, l, p, 65536, k, false));
++    try std.testing.expect(std.mem.startsWith(u8, shown[0], "4 taking "));
++    try std.testing.expect(std.mem.indexOf(u8, shown[1], "of the pool's pages") != null);
++    const none: api.Open = .{ .dir = "", .model_type = "m", .lanes = 4, .keep = 0 };
++    try std.testing.expectEqual(@as(u64, 0), kept(Radix, loaded, p, none, 40 << 30, 0, 0, false).copied);
++    const off: api.Open = .{ .dir = "", .model_type = "m", .lanes = 4, .prompt_cache_gib = 0 };
++    try std.testing.expectEqual(@as(u64, 0), kept(Radix, loaded, p, off, 40 << 30, 0, 0, false).copied);
++    try std.testing.expectEqualStrings(", no prompt cache", (try text(Radix, a, 0, l, p, 65536, kept(Radix, loaded, p, off, 40 << 30, 0, 0, false), false))[1]);
++    try std.testing.expectEqual([2]usize{ 0, kv_pool.most_snaps }, blk: {
++        _ = try attach(Radix, a, &ctx, l, p, off, &problem);
++        break :blk Radix.limited;
++    });
++}
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 4cd079b..dce265e 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -233,7 +233,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     release(srv, preparing); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .markers = srv.markersFor(request.prompt), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .lp = if (request.logprobs != null) .{} else null };
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+@@ -278,6 +278,7 @@ const Generation = struct {
+     seed: ?u64 = null,
+     sink: ?Sink,
+     thinking: bool,
++    markers: reply_text.Markers = reply_text.think_markers, // this reply's think markers (MiniMax's depend on the prompt's tail)
+     stops: reply_text.Stops,
+     ignore_eos: bool,
+     max_tokens: u32,
+@@ -352,7 +353,7 @@ const Generation = struct {
+         if (g.visible.pending()) return; // a character still split across tokens
+         var answer = text;
+         if (g.thinking) {
+-            const split = try reply_text.splitThinking(g.a, text, false, g.srv.markers);
++            const split = try reply_text.splitThinking(g.a, text, false, g.markers);
+             const piece = g.streamed_reasoning.after(split.reasoning, true);
+             if (piece.len > 0) {
+                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
+@@ -472,7 +473,7 @@ const Generation = struct {
+         var content: []const u8 = text;
+         var reasoning: ?[]const u8 = null;
+         if (g.thinking) {
+-            const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
++            const split = try reply_text.splitThinking(a, text, true, g.markers);
+             const r = reply_text.pyStrip(split.reasoning);
+             reasoning = if (r.len > 0) r else null;
+             content = split.answer;
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index 9c558ce..48adee8 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -312,7 +312,7 @@ pub const HfText = struct {
+             var it = t.specials.object.iterator();
+             while (it.next()) |e| try globals.put(a, e.key_ptr.*, e.value_ptr.*);
+         }
+-        try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
++        try globals.put(a, "thinking_mode", .{ .string = thinkingMode(t.source, options.enable_thinking) });
+         var context: std.json.ObjectMap = .empty;
+         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
+         if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+@@ -327,6 +327,19 @@ pub const HfText = struct {
+     }
+ };
+ 
++/// The template's `thinking_mode` word: "thinking" or "chat"; MiniMax-M3.1's template reads "enabled" and "disabled".
++fn thinkingMode(source: []const u8, on: bool) []const u8 {
++    if (std.mem.indexOf(u8, source, "thinking_mode == \"adaptive\"") != null) return if (on) "enabled" else "disabled";
++    return if (on) "thinking" else "chat";
++}
++
++test "thinking_mode: MiniMax's template gets its own words, every other template keeps thinking and chat" {
++    try std.testing.expectEqualStrings("enabled", thinkingMode("{% if thinking_mode == \"adaptive\" %}", true));
++    try std.testing.expectEqualStrings("disabled", thinkingMode("{% if thinking_mode == \"adaptive\" %}", false));
++    try std.testing.expectEqualStrings("thinking", thinkingMode("{% if thinking_mode == \"thinking\" %}", true));
++    try std.testing.expectEqualStrings("chat", thinkingMode("", false));
++}
++
+ test "model EOS does not hide a different tokenizer chat end" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index de238e6..3f9ab1d 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -100,6 +100,8 @@ pub const Server = struct {
+     eos: []const u32 = &.{},
+     think_close: []const u32 = &.{},
+     think_close_end: ?u32 = null,
++    /// MiniMax-M3.1's think tokens when the tokenizer has both: the reply's markers depend on the prompt's tail.
++    mm_think: ?struct { open: u32, close: u32 } = null,
+     metrics: metrics.Metrics,
+     store: responses.Store,
+     next_id: std.atomic.Value(u64) = .init(1),
+@@ -150,6 +152,10 @@ pub const Server = struct {
+         const a = srv.arena.allocator();
+         srv.eos = try a.dupe(u32, text.eosIds());
+         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
++        if (text.tokenId(reply_text.mm_think_markers.close)) |close| if (text.tokenId(reply_text.mm_think_markers.open)) |open| {
++            srv.markers = reply_text.mm_think_markers;
++            srv.mm_think = .{ .open = open, .close = close };
++        };
+         const source = text.templateSource();
+         srv.effort_levels = try fields.effortLevels(a, source);
+         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
+@@ -160,7 +166,7 @@ pub const Server = struct {
+             const template_images = templateImages(srv);
+             if (!template_images) log.line("warning: --vision: the chat template writes no image placeholder for an image part, so image requests will fail; serve with --chat-template naming a template that has an image path", .{});
+         }
+-        if (text.tokenId("</think>")) |end| {
++        if (text.tokenId(if (srv.mm_think != null) reply_text.mm_think_markers.close else "</think>")) |end| {
+             const lead = try text.encode(a, "\n", false);
+             const trail = try text.encode(a, "\n\n", false);
+             srv.think_close = try std.mem.concat(a, u32, &.{ lead, &.{end}, trail });
+@@ -174,6 +180,12 @@ pub const Server = struct {
+         return srv;
+     }
+ 
++    /// The markers a reply to `prompt` is split by (an enabled MiniMax prompt ends in the opener).
++    pub fn markersFor(srv: *const Server, prompt: []const u32) reply_text.Markers {
++        const m = srv.mm_think orelse return srv.markers;
++        return if (prompt.len > 0 and prompt[prompt.len - 1] == m.open) reply_text.mm_think_prompt_markers else srv.markers;
++    }
++
+     pub fn stopKeepalive(srv: *Server) void {
+         if (srv.keepalive) |k| k.stop();
+         srv.keepalive = null;
+@@ -432,3 +444,16 @@ fn templateImages(srv: *Server) bool {
+ fn needsUserAfterTool(source: []const u8) bool {
+     return std.mem.indexOf(u8, source, "No user query found") != null;
+ }
++
++test "MiniMax's reply markers follow the prompt's tail: enabled ends in the opener, so only the close is left" {
++    var srv: Server = undefined;
++    srv.markers = reply_text.mm_think_markers;
++    srv.mm_think = .{ .open = 7, .close = 8 };
++    try std.testing.expectEqualStrings("", srv.markersFor(&.{ 1, 2, 7 }).open);
++    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2, 8 }).open);
++    try std.testing.expectEqualStrings("<mm:think>", srv.markersFor(&.{ 1, 2 }).open);
++    try std.testing.expectEqualStrings("</mm:think>", srv.markersFor(&.{}).close);
++    srv.mm_think = null;
++    srv.markers = reply_text.think_markers;
++    try std.testing.expectEqualStrings("</think>", srv.markersFor(&.{ 7 }).close);
++}
+diff --git a/zig/src/server/tool_grammar.zig b/zig/src/server/tool_grammar.zig
+index 104a6e3..76db271 100644
+--- a/zig/src/server/tool_grammar.zig
++++ b/zig/src/server/tool_grammar.zig
+@@ -11,7 +11,7 @@ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ 
+ /// The template's call envelope, with XML parameters or JSON arguments.
+-pub const Style = enum { xml, json, gemma, glm };
++pub const Style = enum { xml, json, gemma, glm, minimax };
+ 
+ const probe = "tfprobe_fn";
+ const key = "tfprobe_k";
+@@ -24,6 +24,7 @@ const value_blanks = 32;
+ 
+ /// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
+ pub fn style(rendered: []const u8) ?Style {
++    if (std.mem.indexOf(u8, rendered, "]<]minimax[>[<invoke name=\"" ++ probe ++ "\">") != null) return .minimax;
+     if (std.mem.indexOf(u8, rendered, "<|tool_call>call:" ++ probe ++ "{") != null) return .gemma;
+     const at = std.mem.lastIndexOf(u8, rendered, "<tool_call>") orelse return null;
+     const text = rendered[at..];
+@@ -33,6 +34,9 @@ pub fn style(rendered: []const u8) ?Style {
+     return null;
+ }
+ 
++/// MiniMax tags each parameter by its own name after a namespace token; no xgrammar style is known to write that.
++pub const minimax_refusal = "tool_choice \"required\" or a named function cannot be enforced for MiniMax-M3.1's tool markup yet: use tool_choice \"auto\" and check the reply's tool_calls";
++
+ /// The grammar for a reply that must call one of `tools`: one call, or (`parallel`) one or more, then the end.
+ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
+     const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
+@@ -42,6 +46,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
+         error.Refused => "",
+     };
+     const s = style(rendered) orelse .json; // unrecognized markup uses the canonical call form the parser accepts
++    if (s == .minimax) return cx.refuse(minimax_refusal);
+     const text = try build(cx.a, s, tools, parallel);
+     const field = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
+     return srv.compiledStructure(cx, .structural_tag, text, field, thinking);
+@@ -84,6 +89,7 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
+             try whole.put(a, "required", try list(a, &.{ .{ .string = "name" }, .{ .string = "arguments" } }));
+             break :blk try list(a, &.{ try constant(a, "<tool_call>"), ws, try arguments(a, .{ .object = whole }, "json"), ws, try constant(a, "</tool_call>") });
+         },
++        .minimax => unreachable, // `structure` refuses before it builds
+         // GLM's template writes NAME<arg_key>K</arg_key><arg_value>V</arg_value>... with no blanks: xgrammar's glm_xml
+         .glm => try list(a, &.{
+             try constant(a, try std.fmt.allocPrint(a, "<tool_call>{s}", .{name})), try arguments(a, schema, "glm_xml"),
+@@ -130,6 +136,11 @@ test "the probe call's markup picks the style" {
+     try std.testing.expectEqual(Style.glm, style("</think><tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>").?);
+ }
+ 
++test "MiniMax's probe call picks its own style, which a required call refuses by name" {
++    try std.testing.expectEqual(Style.minimax, style("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tfprobe_fn\">]<]minimax[>[<tfprobe_k>v]<]minimax[>[</tfprobe_k>").?);
++    try std.testing.expect(std.mem.indexOf(u8, minimax_refusal, "tool_choice") != null);
++}
++
+ test "a required call's grammar names every offered tool and its schema; one call without parallel" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+-- 
+2.43.0
+

@@ -1,0 +1,4 @@
+[bench] tooleval own off: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0}
+[bench] tooleval toolcall off: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, 'corruption': 0, 'leak': 0, 'typing': 0}
+[bench] -> out/bench-graphs-on-20261026-015359.json
+[results] run/results.md (copy out/results-20261026-015919.md) from ['out/smoke-20261026-015319.json', 'out/bench-graphs-off-20261025-135403.json', 'out/bench-graphs-on-20261026-015359.json']

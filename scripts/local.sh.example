@@ -1,0 +1,11 @@
+# Optional: copy to scripts/local.sh (not in git) for this machine's own overrides; scripts/config.sh reads it before
+# config/prod.env, so a value here wins over the production config (and the environment wins over both). The settings
+# themselves are documented in config/prod.env.example; start there.
+# WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-copy-id user@192.0.2.2)
+# FABRIC_PEER=192.0.2.12         # the worker's CX7 address, when WORKER is reached over another network
+# HF_CACHE=/models/hf            # this Spark's Hugging Face cache, if it is not ~/.cache/huggingface (the pack is 199.9 GB)
+# The pack is PRIVATE: log in with a read token that can see it (`hf auth login`, saved at ~/.cache/huggingface/token),
+# or export HF_TOKEN for the run. Never put the token in this file or commit it.
+# CONTEXT=65536                  # a smaller window for a test (scripts/quant_budget.py --serve prices it)
+# EXTRA_ENV="TF_FOO=1"           # NAME=value words for both ranks (a family patch's switches)
+# ALLOW_UNSUPPORTED=1            # ENGINE DEVELOPMENT ONLY: go on although the build lacks the minimax_m3_vl family

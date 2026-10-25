@@ -1,0 +1,136 @@
+17:26:20 config <path> image 23a99c742de3
+17:26:21 waiting for the locks
+17:26:21 locks held on both nodes
+17:26:21 JOB 301-base-alloff toggles [TF_MM3_FAST_SAMPLE=0 TF_EXL3_EXPERT_LOADS=lanes TF_MM3_GEMV_FUSE=0 TF_MM3_GEMV_BATCH=0 TF_MM3_MANY_ROWS=0    DRAFTS=0] steps [probe decode prefill]
+17:37:31   301-base-alloff start rc=0 in 670s; loaded in 24.3s
+17:39:04   301-base-alloff probe rc=0 [probe] 301-base-alloff median tok/s {'greedy': 19.73, 'sampled': 19.18} ok=True
+17:40:00   301-base-alloff decode rc=0 per stream 19.04 per stream 19.11 
+17:41:08   301-base-alloff prefill rc=0 prefill 2048: prompt 2053 (cached 0), 666.9 tok/s server prefill 32768: prompt 32764 (cached 0), 524.1 tok/s server 
+17:41:14   301-base-alloff stopped
+17:41:14 JOB 302-allon toggles [MEM_GATE_GIB=115 DRAFTS=0] steps [smoke toolmatrix probe decode prefill needle]
+17:42:20   302-allon start rc=0 in 66s; loaded in 24.2s
+17:43:02   302-allon smoke rc=0 12 PASS 0 FAIL
+17:47:07   302-allon tool off temp=0 reps=1 rc=0 own off: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} toolcall off: rc 0, {'passed': 21, 'total': 21, 'unsupported': 0, 'corruption': 0, 'leak': 0, 'typing': 0} 
+17:52:17   302-allon tool adaptive temp=0 reps=1 rc=0 own adaptive: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} toolcall adaptive: rc 0, {'passed': 21, 'total': 21, 'unsupported': 0, 'corruption': 0, 'leak': 0, 'typing': 0} 
+18:04:06   302-allon tool off temp=-1 reps=3 rc=0 own off: rc 0, {'scores': [12, 12, 12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} toolcall off: rc 1, {'passed': 58, 'total': 63, 'unsupported': 0, 'corruption': 0, 'leak': 0, 'typing': 0} 
+18:19:03   302-allon tool adaptive temp=-1 reps=3 rc=0 own adaptive: rc 0, {'scores': [12, 12, 12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} toolcall adaptive: rc 1, {'passed': 57, 'total': 63, 'unsupported': 0, 'corruption': 0, 'leak': 1, 'typing':
+18:20:32   302-allon probe rc=0 [probe] 302-allon median tok/s {'greedy': 20.59, 'sampled': 20.55} ok=True
+18:21:28   302-allon decode rc=0 per stream 19.56 per stream 19.63 
+18:22:47   302-allon prefill rc=0 prefill 2048: prompt 2053 (cached 0), 604.2 tok/s server prefill 32768: prompt 32764 (cached 0), 444.8 tok/s server 
+18:34:33   302-allon needle rc=0 [smoke] PASS needle: needle at depth 0.4 of a ~120000-token prompt (sparse MSA past 2048) | {"passkey": "75009", "content": "75009", "prompt_tokens": 120008, "tokenize_count": 120008, "sized_by": "/to
+18:34:37   302-allon stopped
+18:34:37 JOB 303-allon-dspark toggles [MEM_GATE_GIB=115 DRAFTS=1 DRAFTER=dspark TF_MM3_DRAFT_DEPTH=3 TF_MM3_DSPARK_STATS=1] steps [smoke toolcall toolthink probe decode prefill]
+18:35:46   303-allon-dspark start rc=0 in 69s; loaded in 26.0s
+18:36:27   303-allon-dspark smoke rc=0 12 PASS 0 FAIL
+18:42:01   303-allon-dspark toolcall rc=0 [bench] tooleval own off: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} [bench] tooleval toolcall off: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, 'corruption
+18:48:14   303-allon-dspark toolthink rc=0 [bench] tooleval own adaptive: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} [bench] tooleval toolcall adaptive: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, '
+18:49:29   303-allon-dspark probe rc=0 [probe] 303-allon-dspark median tok/s {'greedy': 27.88, 'sampled': 25.74} ok=True
+18:50:36   303-allon-dspark decode rc=0 per stream 19.51 per stream 19.24 
+18:51:52   303-allon-dspark prefill rc=0 prefill 2048: prompt 2053 (cached 0), 601.8 tok/s server prefill 32768: prompt 32764 (cached 0), 464.9 tok/s server 
+18:51:57   303-allon-dspark stopped
+18:51:57 JOB 304-allon-dflash2 toggles [DRAFTS=dflash2 TF_MM3_DRAFT=dflash2 TF_MM3_DRAFT_DEPTH=5 TF_MM3_DSPARK_STATS=1] steps [smoke toolcall probe decode]
+18:53:18   304-allon-dflash2 start rc=0 in 81s; loaded in 27.6s
+18:53:59   304-allon-dflash2 smoke rc=0 12 PASS 0 FAIL
+18:59:19   304-allon-dflash2 toolcall rc=0 [bench] tooleval own off: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} [bench] tooleval toolcall off: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, 'corruption
+19:00:34   304-allon-dflash2 probe rc=0 [probe] 304-allon-dflash2 median tok/s {'greedy': 27.61, 'sampled': 26.64} ok=True
+19:01:30   304-allon-dflash2 decode rc=0 per stream 20.52 per stream 19.13 
+19:01:34   304-allon-dflash2 stopped
+19:01:34 JOB 305-roce-on toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1] steps [smoke probe decode prefill]
+19:02:48   305-roce-on start rc=0 in 74s; loaded in 24.0s
+19:03:30   305-roce-on smoke rc=0 12 PASS 0 FAIL
+19:04:56   305-roce-on probe rc=0 [probe] 305-roce-on median tok/s {'greedy': 21.17, 'sampled': 20.97} ok=True
+19:05:50   305-roce-on decode rc=0 per stream 20.41 per stream 20.39 
+19:07:04   305-roce-on prefill rc=0 prefill 2048: prompt 2053 (cached 0), 615.4 tok/s server prefill 32768: prompt 32764 (cached 0), 474.7 tok/s server 
+19:07:09   305-roce-on stopped
+19:07:09 JOB 306-roce-sum toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_ROCE_SUM=1] steps [probe decode]
+19:08:15   306-roce-sum start rc=0 in 66s; loaded in 23.4s
+19:09:42   306-roce-sum probe rc=0 [probe] 306-roce-sum median tok/s {'greedy': 21.15, 'sampled': 20.98} ok=True
+19:10:35   306-roce-sum decode rc=0 per stream 20.46 per stream 20.41 
+19:10:40   306-roce-sum stopped
+19:10:40 JOB 307-kv-exact-262k toggles [DRAFTS=0 CONTEXT=262144 KV_TIER_DIR=<path> WORKER_KV_TIER_DIR=<path> TF_MM3_KV_TIER=/kvtier TF_MM3_KV_TIER_GIB=64 MEM_GATE_GIB=113] steps [smoke probe decode]
+19:11:38   307-kv-exact-262k start rc=1 in 58s; 
+19:11:40   307-kv-exact-262k START_FAILED
+19:11:40 JOB 308-kv-approx-4x1m toggles [DRAFTS=0 CONTEXT=1048576 PARALLEL=4 KV_TIER_DIR=<path> WORKER_KV_TIER_DIR=<path> TF_MM3_KV_TIER=/kvtier TF_MM3_KV_TIER_GIB=252 TF_MM3_KV_HORIZON=32768 TF_MM3_KV_CANDIDATES=16 MEM_GATE_GIB=112] steps [smoke probe decode4]
+19:12:38   308-kv-approx-4x1m start rc=1 in 58s; 
+19:12:41   308-kv-approx-4x1m START_FAILED
+19:12:41 JOB 309-vision toggles [DRAFTS=0 VISION=1 CONTEXT=23680 MEM_GATE_GIB=110] steps [vision probe]
+19:13:50   309-vision start rc=0 in 69s; loaded in 26.0s
+19:14:40   309-vision vision rc=0 [vision] smoke: 9/9 passed 
+19:16:08   309-vision probe rc=0 [probe] 309-vision median tok/s {'greedy': 21.07, 'sampled': 20.32} ok=True
+19:16:12   309-vision stopped
+19:16:12 JOB 311-off-s11 toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_FAST_SAMPLE=0] steps [probe decode prefill]
+19:17:19   311-off-s11 start rc=0 in 67s; loaded in 24.0s
+19:18:47   311-off-s11 probe rc=0 [probe] 311-off-s11 median tok/s {'greedy': 21.0, 'sampled': 20.16} ok=True
+19:19:41   311-off-s11 decode rc=0 per stream 20.04 per stream 20.34 
+19:20:57   311-off-s11 prefill rc=0 prefill 2048: prompt 2053 (cached 0), 602.5 tok/s server prefill 32768: prompt 32764 (cached 0), 466.5 tok/s server 
+19:21:02   311-off-s11 stopped
+19:21:02 JOB 312-off-s8 toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_EXL3_EXPERT_LOADS=lanes] steps [probe decode prefill]
+19:22:10   312-off-s8 start rc=0 in 68s; loaded in 23.7s
+19:23:37   312-off-s8 probe rc=0 [probe] 312-off-s8 median tok/s {'greedy': 21.08, 'sampled': 20.23} ok=True
+19:24:41   312-off-s8 decode rc=0 per stream 19.98 per stream 20.37 
+19:25:55   312-off-s8 prefill rc=0 prefill 2048: prompt 2053 (cached 0), 602.8 tok/s server prefill 32768: prompt 32764 (cached 0), 479.3 tok/s server 
+19:26:00   312-off-s8 stopped
+19:26:00 JOB 313-off-fuse toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_GEMV_FUSE=0] steps [probe decode prefill]
+19:27:06   313-off-fuse start rc=0 in 66s; loaded in 24.0s
+19:28:37   313-off-fuse probe rc=0 [probe] 313-off-fuse median tok/s {'greedy': 20.06, 'sampled': 19.86} ok=True
+19:29:35   313-off-fuse decode rc=0 per stream 19.39 per stream 18.88 
+19:30:59   313-off-fuse prefill rc=0 prefill 2048: prompt 2053 (cached 0), 604.5 tok/s server prefill 32768: prompt 32764 (cached 0), 480.3 tok/s server 
+19:31:04   313-off-fuse stopped
+19:31:04 JOB 314-off-batch toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_GEMV_BATCH=0] steps [probe decode prefill]
+19:32:11   314-off-batch start rc=0 in 67s; loaded in 24.2s
+19:33:40   314-off-batch probe rc=0 [probe] 314-off-batch median tok/s {'greedy': 20.67, 'sampled': 20.37} ok=True
+19:34:34   314-off-batch decode rc=0 per stream 19.94 per stream 19.93 
+19:35:45   314-off-batch prefill rc=0 prefill 2048: prompt 2053 (cached 0), 678.2 tok/s server prefill 32768: prompt 32764 (cached 0), 504.2 tok/s server 
+19:35:50   314-off-batch stopped
+19:35:50 JOB 321-slots-c2 toggles [DRAFTS=0 PARALLEL=2 MAX_TOKENS=32768 MEM_GATE_GIB=117] steps [concurrent probe]
+19:36:56   321-slots-c2 start rc=0 in 66s; loaded in 24.4s
+19:36:56   321-slots-c2 concurrent rc=1 
+19:38:24   321-slots-c2 probe rc=0 [probe] 321-slots-c2 median tok/s {'greedy': 21.07, 'sampled': 20.24} ok=True
+19:38:28   321-slots-c2 stopped
+19:38:28 JOB 322-slots-c4 toggles [DRAFTS=0 PARALLEL=4 MAX_TOKENS=32768 MEM_GATE_GIB=117] steps [concurrent probe smoke]
+19:39:45   322-slots-c4 start rc=0 in 77s; loaded in 24.0s
+19:39:46   322-slots-c4 concurrent rc=1 
+19:41:13   322-slots-c4 probe rc=0 [probe] 322-slots-c4 median tok/s {'greedy': 21.08, 'sampled': 20.52} ok=True
+19:42:14   322-slots-c4 smoke rc=0 12 PASS 0 FAIL
+19:42:19   322-slots-c4 stopped
+19:42:19 JOB 323-slots-c4-53k toggles [DRAFTS=0 CONTEXT=53248 PARALLEL=4 MEM_GATE_GIB=117] steps [concurrent]
+19:43:25   323-slots-c4-53k start rc=0 in 66s; loaded in 24.0s
+19:44:26   323-slots-c4-53k concurrent rc=0 {"label": "323-slots-c4-53k", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 4, "unmeasured": 0, "aggregate_tps": 0.0, "per_stream_tps": 0.0, "ttft_s_max": null, "timing_valid": false, "end_to_end_tps": null, "makespan_s": nu
+19:44:26   323-slots-c4-53k SERVER_DOWN after concurrent
+19:44:29   323-slots-c4-53k stopped
+19:44:29 JOB 324-slots-c4-nomany toggles [DRAFTS=0 PARALLEL=4 MAX_TOKENS=32768 MEM_GATE_GIB=117 TF_MM3_MANY_ROWS=0] steps [concurrent]
+19:44:52   324-slots-c4-nomany start rc=1 in 23s; 
+19:44:52   324-slots-c4-nomany THERMAL_STOP recorded: worker: 1792957468 93 C; clearing when both nodes are cool
+19:46:33   324-slots-c4-nomany start after thermal-clear rc=0
+19:52:06   324-slots-c4-nomany concurrent rc=0 {"label": "324-slots-c4-nomany", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 59.2, "per_stream_tps": 15.2, "ttft_s_max": 1.03, "timing_valid": true, "end_to_end_tps": 58.67976044254806,
+19:52:11   324-slots-c4-nomany stopped
+19:52:11 JOB 325-off-many toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_MANY_ROWS=0] steps [probe decode prefill]
+19:53:18   325-off-many start rc=0 in 67s; loaded in 24.1s
+19:54:46   325-off-many probe rc=0 [probe] 325-off-many median tok/s {'greedy': 20.58, 'sampled': 20.31} ok=True
+19:55:40   325-off-many decode rc=0 per stream 20.29 per stream 20.35 
+19:56:55   325-off-many prefill rc=0 prefill 2048: prompt 2053 (cached 0), 603.1 tok/s server prefill 32768: prompt 32764 (cached 0), 478.3 tok/s server 
+19:57:00   325-off-many stopped
+19:57:00 JOB 331-release-dspark-roce toggles [MEM_GATE_GIB=115 DRAFTS=1 DRAFTER=dspark TF_MM3_DRAFT_DEPTH=3 TF_MM3_DSPARK_STATS=1 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1] steps [smoke toolcall probe decode prefill]
+19:58:08   331-release-dspark-roce start rc=0 in 68s; loaded in 25.8s
+19:58:48   331-release-dspark-roce smoke rc=0 12 PASS 0 FAIL
+20:04:18   331-release-dspark-roce toolcall rc=0 [bench] tooleval own off: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} [bench] tooleval toolcall off: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, 'corruption
+20:05:32   331-release-dspark-roce probe rc=0 [probe] 331-release-dspark-roce median tok/s {'greedy': 27.45, 'sampled': 26.53} ok=True
+20:06:26   331-release-dspark-roce decode rc=0 per stream 19.55 per stream 21.73 
+20:07:39   331-release-dspark-roce prefill rc=0 prefill 2048: prompt 2053 (cached 0), 612.4 tok/s server prefill 32768: prompt 32764 (cached 0), 483.8 tok/s server 
+20:07:44   331-release-dspark-roce stopped
+20:07:44 JOB 331-slots-c2-rerun toggles [DRAFTS=0 PARALLEL=2 MAX_TOKENS=32768 MEM_GATE_GIB=117] steps [concurrent]
+20:08:50   331-slots-c2-rerun start rc=0 in 66s; loaded in 24.2s
+20:14:51   331-slots-c2-rerun concurrent rc=0 {"label": "331-slots-c2-rerun", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 39.6, "per_stream_tps": 19.9, "ttft_s_max": 13.19, "timing_valid": true, "end_to_end_tps": 39.40585223205063,
+20:14:56   331-slots-c2-rerun stopped
+20:14:56 JOB 332-release-plain-roce toggles [MEM_GATE_GIB=115 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1] steps [probe decode]
+20:16:03   332-release-plain-roce start rc=0 in 67s; loaded in 23.9s
+20:17:29   332-release-plain-roce probe rc=0 [probe] 332-release-plain-roce median tok/s {'greedy': 21.19, 'sampled': 20.94} ok=True
+20:18:23   332-release-plain-roce decode rc=0 per stream 20.4 per stream 20.24 
+20:18:27   332-release-plain-roce stopped
+20:18:27 JOB 332-slots-c4-rerun toggles [DRAFTS=0 PARALLEL=4 MAX_TOKENS=32768 MEM_GATE_GIB=117] steps [concurrent]
+20:20:31   332-slots-c4-rerun start rc=0 in 124s; loaded in 24.3s
+20:25:49   332-slots-c4-rerun concurrent rc=0 {"label": "332-slots-c4-rerun", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 65.5, "per_stream_tps": 16.6, "ttft_s_max": 0.45, "timing_valid": true, "end_to_end_tps": 64.86885061229341, 
+20:25:53   332-slots-c4-rerun stopped
+20:25:53 END job
+20:25:53 WINDOW_END
+20:25:54 locks released

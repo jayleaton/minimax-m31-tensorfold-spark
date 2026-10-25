@@ -1,0 +1,126 @@
+minimax-m31-tensorfold-spark
+Copyright 2026 Jay Leaton (https://x.com/jayleaton)
+
+This project's own code, scripts, tests and documentation are licensed under the Apache License, Version 2.0 (see
+LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and the copyright line
+above, and state what you changed (Apache-2.0, section 4). The license covers this recipe only; it grants nothing for
+any model weights.
+
+This project builds on other work that keeps its own license:
+
+MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold: the base of this recipe; see the section at the end of this
+file, which reproduces its NOTICE.
+
+DeepSeek-V4.1 TensorFold recipe
+  https://github.com/jayleaton/deepseek-v41-tensorfold-spark, Copyright 2026 Jay Leaton, Apache License 2.0.
+  scripts/guard/, scripts/watch.sh, scripts/systemd/tf-*, tests/guard/ are ported from its pull request #48 (model-agnostic
+  names, the minimax_m3_vl family's settings, no operator ladder). scripts/check_secrets.py, scripts/redact.py,
+  scripts/check-secrets-allow.txt and tests/scripts/ are from its pull request #77; bench/ (tooleval, quality, structured,
+  stress, soak) and scripts/canary.py are adapted from it for MiniMax; scripts/serve.sh, the memory gate and page-cache
+  drops, scripts/pairwatch.sh (its fail-fast, done outside the engine), the floors on both ranks (pull request #79) and the
+  docs' structure follow it. scripts/check-public.sh is adapted from it and the GLM-5.3 recipe.
+
+GLM-5.3 TensorFold recipe
+  https://github.com/jayleaton/glm53-tensorfold-spark, Copyright 2026 Jay Leaton, Apache License 2.0.
+  AGENTS.md follows its bring-up guide; scripts/serve.sh's preflight, link checks, scoped sudo, xid and the config
+  conventions follow its scripts; bench/toolcall.py is adapted from its bench/toolcall_harness.py.
+
+TensorFold
+  https://github.com/ashhart/TensorFold, Copyright 2026 TensorFold contributors. Not included; zig/Dockerfile fetches and
+  builds it, and it keeps its own license.
+
+MiniMax-M3.1-Flash configuration facts (scripts/quant_budget.py, docs/)
+  Numeric facts (tensor classes, element counts, index total_size) read from MiniMaxAI/MiniMax-M3.1-Flash at revision
+  54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e. No MiniMax file is copied.
+
+MMLU (bench/data/mmlu200.jsonl)
+  200 questions of the MMLU test set (Hendrycks et al., https://github.com/hendrycks/test). MIT License,
+  Copyright (c) 2020 Dan Hendrycks: "Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in the Software without restriction,
+  including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+  conditions: The above copyright notice and this permission notice shall be included in all copies or substantial
+  portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED."
+
+Engine series (engine/patches/)
+  0001 links patches/0001-minimax-m3-family.patch (MiaAI-Lab's, below). 0002 is this project's engine work on top of it,
+  exported by scripts/export-engine.sh (engine/SOURCE-EXPORT.md); applied to TensorFold v1.1.2 at image build time. It
+  carries: tools/dflash2_reference.py, ported from z-lab/dflash (https://github.com/z-lab/dflash) dflash2 model.py, MIT
+  License, Copyright (c) z-lab; MiniMax's chat template of MiniMaxAI/MiniMax-M3.1-Flash at revision 54e4e69d as a test
+  fixture, under the MiniMax Community License (Copyright (c) 2026 MiniMax); the published config.json and tensor shapes of
+  incoai/MiniMax-M3.1-Flash-DFlash2 (Apache License 2.0). Every other test fixture in it is this project's own, including
+  a synthetic MiniMax-class DFlash2 config (dflash2_minimax_layout.json).
+
+Built into the engine image, not vendored here (each keeps its own license):
+  xgrammar (https://github.com/mlc-ai/xgrammar), Apache License 2.0, built as libtfgrammar at the engine's pinned tag;
+  libjpeg-turbo (IJG, BSD-3-Clause and zlib licenses) and libwebp (BSD-3-Clause) for image input, built from their
+  release tarballs; Zig 0.17.0 (MIT) to compile TensorFold.
+
+Fetched at run time, not included:
+  incoai/MiniMax-M3.1-Flash-DFlash2 (https://huggingface.co/incoai/MiniMax-M3.1-Flash-DFlash2), Apache License 2.0,
+  downloaded by scripts/prepare.sh for DRAFTS=dflash2; SeraphimSerapis/tool-eval-bench (MIT) and Weschera/spark-bench,
+  cloned by bench/tooleval/run.sh setup.
+
+Not included; each user obtains these under their own terms:
+
+  MiniMax-M3.1-Flash weights and the EXL3 pack made from them (under the MiniMax Community License, which the pack ships as
+  LICENSE), ExLlamaV3 (https://github.com/turboderp-org/exllamav3), and the NVIDIA base images the engine image is built
+  from.
+
+====================================================================================================
+MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold (the base of this recipe)
+  Copyright 2026 MiaAI-Lab. Apache License, Version 2.0. Imported at commit fd1d379: start.sh, stop.sh, scripts/
+  (banner.sh, check-drafted.sh, config.sh, local.sh.example, memguard.sh, nodes.sh, prepare.sh, publish-image.sh),
+  zig/Dockerfile, patches/ (unchanged), docs/ (dspark-plan, engine-port-plan, engine-reuse-glm-zig, fp8-kv,
+  loader-speed, rank-contract, speed-borrow-*, tensorfold-build-notes), CHANGELOG.md and CREDITS.md (now
+  docs/CHANGELOG.md and docs/CREDITS-MIAAI-LAB.md). Changes made
+  here are listed in docs/PORT.md and CHANGELOG.md. Its NOTICE, reproduced unchanged as Apache-2.0 section 4(d)
+  requires:
+
+  | MiniMax-M3.1-Flash EXL3 3.5 bpw on 2x DGX Spark with TensorFold
+  | Copyright 2026 MiaAI-Lab
+  |
+  | This project's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see
+  | LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and state what you
+  | changed (Apache-2.0, section 4).
+  |
+  | This project builds on third-party work that keeps its own license:
+  |
+  | TensorFold
+  |   https://github.com/ashhart/TensorFold
+  |   Copyright 2026 TensorFold contributors. Apache License, Version 2.0. TensorFold's NOTICE reads: "TensorFold /
+  |   Copyright 2026 TensorFold contributors / https://github.com/ashhart/TensorFold". zig/Dockerfile fetches and builds
+  |   TensorFold v1.1.2 (commit 4ff784410f70b95767684d337e59dfd6d94fec8b) and applies the files in patches/ to it (the MiniMax-M3.1-Flash family: patches/0001-minimax-m3-family.patch, listed patch by patch in CREDITS.md).
+  |   Any change in patches/ is this project's work, or its named author's, under Apache-2.0; the code it modifies, and quotes as
+  |   diff context, stays under its authors' licenses. The image carries TensorFold's LICENSE, NOTICE, THIRD_PARTY_NOTICES.md and
+  |   LICENSES under /opt/tensorfold/share/doc/tensorfold.
+  |
+  | MiniMax-M3.1-Flash
+  |   https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash
+  |   By MiniMax (MiniMaxAI). The license on its model card governs the weights and any derivative, including the quantized
+  |   checkpoint below. The weights are downloaded by scripts/prepare.sh, not distributed here.
+  |
+  | MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw
+  |   https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw (private)
+  |   By Mia's AI Lab (Mia-AiLab): a quantized derivative of the model above in the EXL3 format of exllamav3. Its model card says it
+  |   does not change the base model's terms. The weights are downloaded by scripts/prepare.sh, not distributed here.
+  |
+  | ExLlamaV3
+  |   https://github.com/turboderp-org/exllamav3
+  |   By turboderp (turboderp-org). MIT License. The EXL3 format and quantizer the checkpoint was made with.
+  |
+  | GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  |   https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  |   Copyright 2026 MiaAI-Lab and its contributors. Apache License, Version 2.0. scripts/config.sh, scripts/nodes.sh,
+  |   start.sh, stop.sh, scripts/banner.sh and scripts/publish-image.sh are adapted from it, including code by webzone,
+  |   Alexbob0 and john (see CREDITS.md).
+  |
+  | DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-TensorFold
+  |   https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-TensorFold
+  |   Copyright 2026 MiaAI-Lab. Apache License, Version 2.0. The native-Zig two-Spark structure of start.sh, scripts/nodes.sh,
+  |   scripts/prepare.sh and zig/Dockerfile, scripts/memguard.sh, the API key option and the serve-flags check are adapted from it.
+  |
+  | NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
+  |   The image's base, under NVIDIA's container license and its components' own licenses.
+  |
+  | Zig 0.17.0 (https://ziglang.org), MIT License: downloaded into the image build to compile TensorFold; not redistributed here.

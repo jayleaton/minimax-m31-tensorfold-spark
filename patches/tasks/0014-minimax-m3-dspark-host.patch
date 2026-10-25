@@ -1,0 +1,3086 @@
+From c3b75bbeb207dce4d2bcce93d2f09e8036c08971 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:23:37 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: dspark draft, host half (config, names,
+ rank plan, float64 reference, twins, budget, refusals)
+
+Adds the base model's dspark speculative-decoding draft as host-testable code and a design (docs/dspark-plan.md in the recipe):
+dspark_config (parse the pack's dspark/config.json, admit against the target, byte arithmetic, MoE window cost model),
+dspark_names (the 97 tensors of the header), dspark_load (per-rank plan over load.Catalog; mxfp8 codes and ue8m0 scales cut
+as the target's heads and dense MLP, no Gemma fold), dspark_ref (float64 mxfp8 decode, taps, context state, 5-layer
+sliding-window block, Markov chain, confidence, every unverified semantic a named switch), dspark_twin (K/V ring, two-rank
+block, per-rank candidate gather, each with planted mutants), budget.Terms.draft / withDraft / Refusal.draft, and native's
+takes_drafter = false with the draft-specific --drafter refusal. Step test-minimax-dspark (also under test-cuda-host).
+No kernels, no engine integration, no GPU. The semantics are UNVERIFIED: the upstream modeling code was unavailable.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/minimax_dspark.zig                  |  20 +
+ zig/build/minimax_family.zig                  |   1 +
+ zig/src/families/minimax_m3/budget.zig        |  31 +-
+ zig/src/families/minimax_m3/dspark_config.zig | 516 +++++++++++++++++
+ zig/src/families/minimax_m3/dspark_load.zig   | 259 +++++++++
+ .../families/minimax_m3/dspark_model_test.zig | 500 ++++++++++++++++
+ zig/src/families/minimax_m3/dspark_names.zig  | 193 +++++++
+ zig/src/families/minimax_m3/dspark_ref.zig    | 539 ++++++++++++++++++
+ zig/src/families/minimax_m3/dspark_test.zig   | 286 ++++++++++
+ zig/src/families/minimax_m3/dspark_twin.zig   | 252 ++++++++
+ .../minimax_m3/fixtures/dspark_config.json    | 297 ++++++++++
+ .../minimax_m3/fixtures/dspark_header.json    |   1 +
+ zig/src/families/minimax_m3/native.zig        |   4 +
+ 13 files changed, 2897 insertions(+), 2 deletions(-)
+ create mode 100644 zig/build/minimax_dspark.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_config.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_load.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_model_test.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_names.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_ref.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_test.zig
+ create mode 100644 zig/src/families/minimax_m3/dspark_twin.zig
+ create mode 100644 zig/src/families/minimax_m3/fixtures/dspark_config.json
+ create mode 100644 zig/src/families/minimax_m3/fixtures/dspark_header.json
+
+diff --git a/zig/build/minimax_dspark.zig b/zig/build/minimax_dspark.zig
+new file mode 100644
+index 0000000..3f043fd
+--- /dev/null
++++ b/zig/build/minimax_dspark.zig
+@@ -0,0 +1,20 @@
++//! test-minimax-dspark: the dspark draft's config, names, rank plan, float64 reference, twins and budget; no GPU.
++const std = @import("std");
++
++pub fn step(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module, umbrella: *std.Build.Step) *std.Build.Step {
++    const canon = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon.zig"), .target = host, .optimize = .debug });
++    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true });
++    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
++    const family = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/dspark_test.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "canon", .module = canon }, .{ .name = "engine_api", .module = api } },
++    });
++    const s = b.step("test-minimax-dspark", "MiniMax-M3.1-Flash dspark draft: config, names, plan, float64 reference, twins with mutants, budget; no GPU");
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = family }));
++    s.dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++    return s;
++}
+diff --git a/zig/build/minimax_family.zig b/zig/build/minimax_family.zig
+index 2053fef..60dde07 100644
+--- a/zig/build/minimax_family.zig
++++ b/zig/build/minimax_family.zig
+@@ -34,6 +34,7 @@ fn moduleAt(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
+ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod, lanes: Mod, api: Mod, tokenizer: Mod, template: Mod, server_add: *const fn (*std.Build, Mod, std.Build.ResolvedTarget, std.builtin.OptimizeMode) Mod, umbrella: *std.Build.Step) void {
+     @import("minimax_ref_host.zig").steps(b, host, core, umbrella);
+     _ = @import("minimax_load.zig").step(b, host, core);
++    _ = @import("minimax_dspark.zig").step(b, host, core, umbrella);
+     _ = @import("minimax_pool.zig").step(b, host, core);
+     _ = @import("minimax_tp.zig").step(b, host, core);
+     @import("minimax_ref_host.zig").ffn(b, host, core, cuda, umbrella);
+diff --git a/zig/src/families/minimax_m3/budget.zig b/zig/src/families/minimax_m3/budget.zig
+index 9fb1248..00e978a 100644
+--- a/zig/src/families/minimax_m3/budget.zig
++++ b/zig/src/families/minimax_m3/budget.zig
+@@ -3,6 +3,7 @@
+ const std = @import("std");
+ const kv = @import("core").kv_pool;
+ const pool = @import("pool.zig");
++const dspark = @import("dspark_config.zig");
+ 
+ pub const GiB: u64 = 1 << 30;
+ const gib_f: f64 = @floatFromInt(GiB);
+@@ -21,8 +22,23 @@ pub const Terms = struct {
+     /// Rows of a prefill chunk and the index heads a rank scores: they size the block-score chunk (fp32 per block).
+     prefill_rows: u32 = 8192,
+     index_heads: u32 = 2,
++    /// The dspark draft's weights, runtime and per-lane ring and scratch (dspark_config.cost); zero without a draft.
++    draft: dspark.Cost = .{ .weights = 0, .runtime = 0, .per_lane = 0 },
+ };
+ 
++/// `t` with the draft's cost on it: its weights and runtime are spent before any KV, each lane adds a ring.
++pub fn withDraft(t: Terms, cost: dspark.Cost) Terms {
++    var u = t;
++    u.draft = cost;
++    return u;
++}
++
++/// What the draft takes of a budget serving `lanes` streams.
++pub fn draftBytes(t: Terms, lanes: u32) u64 {
++    if (t.draft.weights == 0 and t.draft.runtime == 0 and t.draft.per_lane == 0) return 0;
++    return t.draft.weights + t.draft.runtime + @as(u64, lanes) * t.draft.per_lane;
++}
++
+ /// Unified memory's reserve default and floor (native/cuda_memory.zig: `floor(true)`), as the server applies them.
+ pub const unified_reserve_least_gib: f64 = 2;
+ pub const unified_reserve_floor: u64 = 4 * GiB;
+@@ -104,17 +120,27 @@ pub const Refusal = struct {
+     max_positions: u64,
+     token_bytes: u64,
+     lanes: u32,
++    /// Bytes of the budget the dspark draft takes (0: no draft), named in the words so the operator can drop it.
++    draft: u64 = 0,
+ 
+     pub fn format(r: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
+         switch (r.reason) {
+             .beyond_model => try w.print("CONTEXT={d} is past the model's {d} positions: use at most {d}", .{ r.requested, r.max_positions, r.max_positions }),
+-            .no_room => try w.print("the budget of {d:.2} GiB leaves no KV room beside the weights ({d:.2} GiB), the runtime and the reserve: free memory or lower the reserve", .{ g(r.available), g(r.weights) }),
++            .no_room => {
++                try w.print("the budget of {d:.2} GiB leaves no KV room beside the weights ({d:.2} GiB), the runtime and the reserve: free memory or lower the reserve", .{ g(r.available), g(r.weights) });
++                try draftClause(r, w);
++            },
+             .too_many_lanes => try w.print("--parallel {d} needs a page and a table row for each extra stream, and the budget leaves {d:.2} GiB for KV: serve fewer streams", .{ r.lanes, g(r.room_bytes) }),
+             .does_not_fit => try w.print(
+                 "CONTEXT={d} needs {d:.2} GiB of KV a rank ({d} bytes a token) but the budget of {d:.2} GiB leaves {d:.2} GiB after the weights ({d:.2} GiB), runtime, workspaces and reserve; the largest context that fits is {d} tokens (pool {d} tokens): set CONTEXT to at most {d}",
+                 .{ r.requested, g(r.need_bytes), r.token_bytes, g(r.available), g(r.room_bytes), g(r.weights), r.largest, r.largest_pool_tokens, r.largest },
+             ),
+         }
++        if (r.reason == .does_not_fit) try draftClause(r, w);
++    }
++
++    fn draftClause(r: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
++        if (r.draft != 0) try w.print("; the dspark draft takes {d:.2} GiB of that budget: serve without --drafter to use it for KV", .{g(r.draft)});
+     }
+ };
+ 
+@@ -142,7 +168,7 @@ pub fn workspaceBytes(t: Terms, context: u64) u64 {
+ fn roomFor(in: Input, context: u64) ?u64 {
+     const t = in.terms;
+     const spent = std.math.add(u64, in.weights, t.reserve) catch return null;
+-    const more = t.runtime + t.session_ram + t.staging + workspaceBytes(t, context);
++    const more = t.runtime + t.session_ram + t.staging + workspaceBytes(t, context) + draftBytes(t, in.lanes);
+     const all = std.math.add(u64, spent, more) catch return null;
+     return if (all > in.available) null else in.available - all;
+ }
+@@ -211,6 +237,7 @@ pub fn check(d: pool.Dims, in: Input, context: ?u64) Verdict {
+         .max_positions = in.max_positions,
+         .token_bytes = d.tokenBytes(),
+         .lanes = in.lanes,
++        .draft = draftBytes(in.terms, in.lanes),
+     };
+     if (best) |p| refuse.largest_pool_tokens = (grant(d, in, p) catch unreachable).cap.pool_tokens;
+     const want = context orelse largest;
+diff --git a/zig/src/families/minimax_m3/dspark_config.zig b/zig/src/families/minimax_m3/dspark_config.zig
+new file mode 100644
+index 0000000..1c777a2
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_config.zig
+@@ -0,0 +1,516 @@
++//! The base model's dspark draft: its config, what it must share with the target, its memory and its refusals.
++const std = @import("std");
++// Shapes are VERIFIED (the pack's config and header); what the tensors mean is not: see dspark_ref.zig.
++const target = @import("config.zig");
++const shard = @import("shard.zig");
++
++pub const max_taps = 8;
++pub const architecture = "DSparkMiniMaxDraftModel";
++
++pub const Error = error{
++    BadConfig, // a key is missing, has the wrong type, or two copies of one setting disagree
++    NotDspark, // not a DSparkMiniMaxDraftModel of model_type minimax_m3_vl
++    Unsupported, // a draft feature this family does not implement
++    BadShape, // a width or head count the kernels or the cuts cannot take
++};
++
++/// How the linear layers are stored: mxfp8 = float8 e4m3 codes, one power-of-two (ue8m0) scale a 1 x 32 block.
++pub const Quant = struct { block_k: u32, activation_dynamic: bool };
++
++pub const Config = struct {
++    layers: u32,
++    hidden: u32,
++    heads: u32,
++    kv_heads: u32,
++    head_dim: u32,
++    rotary_dim: u32,
++    vocab: u32,
++    eps: f32,
++    rope_theta: f64,
++    ffn: u32, // dspark_ffn_hidden_size: the dense swigluoai MLP's width
++    window: u32, // sliding_window: every layer is sliding_attention
++    block: u32, // dspark_block_size: rows of one pass
++    mask_token: u32, // dspark_noise_token_id: the rows after the anchor
++    markov_rank: u32,
++    swiglu_alpha: f32,
++    swiglu_limit: f32,
++    gemma_norm: bool, // use_gemma_norm (a switch in the reference decides what the draft really does)
++    confidence: bool,
++    confidence_markov: bool, // the confidence head also reads the Markov embedding of the previous token
++    taps: [max_taps]u32,
++    n_taps: u32,
++    quant: Quant,
++
++    pub fn tapIds(c: *const Config) []const u32 {
++        return c.taps[0..c.n_taps];
++    }
++
++    pub fn qWidth(c: *const Config) u32 {
++        return c.heads * c.head_dim;
++    }
++
++    pub fn kvWidth(c: *const Config) u32 {
++        return c.kv_heads * c.head_dim;
++    }
++
++    /// fc's input width: the taps' hidden states side by side.
++    pub fn fcIn(c: *const Config) u32 {
++        return c.n_taps * c.hidden;
++    }
++
++    /// The confidence projection's input: the hidden row, then (with Markov) the previous token's Markov embedding.
++    pub fn confIn(c: *const Config) u32 {
++        return c.hidden + if (c.confidence_markov) c.markov_rank else 0;
++    }
++};
++
++/// The shipped draft's config.json, spelled out (the fixture test proves parse() gives exactly this).
++pub const flash: Config = .{
++    .layers = 5,
++    .hidden = 6144,
++    .heads = 64,
++    .kv_heads = 4,
++    .head_dim = 128,
++    .rotary_dim = 64,
++    .vocab = 200064,
++    .eps = 1e-6,
++    .rope_theta = 1e7,
++    .ffn = 12288,
++    .window = 4096,
++    .block = 7,
++    .mask_token = 200058,
++    .markov_rank = 256,
++    .swiglu_alpha = 1.702,
++    .swiglu_limit = 7.0,
++    .gemma_norm = true,
++    .confidence = true,
++    .confidence_markov = true,
++    .taps = .{ 3, 17, 31, 45, 59, 0, 0, 0 },
++    .n_taps = 5,
++    .quant = .{ .block_k = 32, .activation_dynamic = true },
++};
++
++const Obj = std.json.ObjectMap;
++
++fn int(o: Obj, key: []const u8) Error!u32 {
++    const v = o.get(key) orelse return error.BadConfig;
++    if (v != .integer) return error.BadConfig;
++    return std.math.cast(u32, v.integer) orelse error.BadConfig;
++}
++
++fn float(o: Obj, key: []const u8) Error!f64 {
++    const v = o.get(key) orelse return error.BadConfig;
++    return switch (v) {
++        .float => |f| f,
++        .integer => |i| @floatFromInt(i),
++        else => error.BadConfig,
++    };
++}
++
++fn flag(o: Obj, key: []const u8) Error!bool {
++    const v = o.get(key) orelse return error.BadConfig;
++    return if (v == .bool) v.bool else error.BadConfig;
++}
++
++fn text(o: Obj, key: []const u8) Error![]const u8 {
++    const v = o.get(key) orelse return error.BadConfig;
++    return if (v == .string) v.string else error.BadConfig;
++}
++
++fn object(o: Obj, key: []const u8) Error!Obj {
++    const v = o.get(key) orelse return error.BadConfig;
++    return if (v == .object) v.object else error.BadConfig;
++}
++
++fn list(o: Obj, key: []const u8) Error![]const std.json.Value {
++    const v = o.get(key) orelse return error.BadConfig;
++    return if (v == .array) v.array.items else error.BadConfig;
++}
++
++/// A list of whole numbers into `out`; returns how many.
++fn ids(o: Obj, key: []const u8, out: []u32) Error!u32 {
++    const items = try list(o, key);
++    if (items.len == 0 or items.len > out.len) return error.BadConfig;
++    for (items, 0..) |e, i| {
++        if (e != .integer) return error.BadConfig;
++        out[i] = std.math.cast(u32, e.integer) orelse return error.BadConfig;
++    }
++    return @intCast(items.len);
++}
++
++/// Parses the draft's config.json; refuses what the loader, the kernels or the cuts cannot take.
++pub fn parse(gpa: std.mem.Allocator, json: []const u8) (Error || std.mem.Allocator.Error || error{SyntaxError})!Config {
++    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |e| return switch (e) {
++        error.OutOfMemory => error.OutOfMemory,
++        else => error.SyntaxError,
++    };
++    defer parsed.deinit();
++    if (parsed.value != .object) return error.BadConfig;
++    const root = parsed.value.object;
++    const arch = try list(root, "architectures");
++    if (arch.len != 1 or arch[0] != .string or !std.mem.eql(u8, arch[0].string, architecture)) return error.NotDspark;
++    if (!std.mem.eql(u8, try text(root, "model_type"), target.model_type)) return error.NotDspark;
++    const t = try object(root, "text_config");
++    const df = try object(t, "dflash_config");
++    const ds = try object(t, "dspark_config");
++
++    var c: Config = .{
++        .layers = try int(t, "num_hidden_layers"),
++        .hidden = try int(t, "hidden_size"),
++        .heads = try int(t, "num_attention_heads"),
++        .kv_heads = try int(t, "num_key_value_heads"),
++        .head_dim = try int(t, "head_dim"),
++        .rotary_dim = try int(t, "rotary_dim"),
++        .vocab = try int(t, "vocab_size"),
++        .eps = @floatCast(try float(t, "rms_norm_eps")),
++        .rope_theta = try float(t, "rope_theta"),
++        .ffn = try int(t, "dspark_ffn_hidden_size"),
++        .window = try int(t, "sliding_window"),
++        .block = try int(t, "dspark_block_size"),
++        .mask_token = try int(t, "dspark_noise_token_id"),
++        .markov_rank = try int(t, "dspark_markov_rank"),
++        .swiglu_alpha = @floatCast(try float(t, "swiglu_alpha")),
++        .swiglu_limit = @floatCast(try float(t, "swiglu_limit")),
++        .gemma_norm = try flag(t, "use_gemma_norm"),
++        .confidence = try flag(t, "enable_confidence_head"),
++        .confidence_markov = try flag(t, "confidence_head_with_markov"),
++        .taps = @splat(0),
++        .n_taps = 0,
++        .quant = undefined,
++    };
++    // the same setting is spelled in dspark_*, dspark_config and dflash_config: all copies must agree
++    var again: [max_taps]u32 = undefined;
++    c.n_taps = try ids(t, "dspark_target_layer_ids", &c.taps);
++    if (try ids(df, "target_layer_ids", &again) != c.n_taps or !std.mem.eql(u32, again[0..c.n_taps], c.taps[0..c.n_taps])) return error.BadConfig;
++    if (try int(df, "block_size") != c.block or try int(df, "mask_token_id") != c.mask_token or try int(df, "num_hidden_layers") != c.layers) return error.BadConfig;
++    if (try int(df, "sliding_window") != c.window or try int(ds, "mask_token_id") != c.mask_token or try int(ds, "markov_rank") != c.markov_rank) return error.BadConfig;
++    if (try int(ds, "ffn_hidden_size") != c.ffn) return error.BadConfig;
++    // the pack's features: dense FFN, plain Markov head, bf16 aux GEMMs, sliding layers, no hybrid fusion, MoE or MTP
++    if (!try flag(ds, "use_dense_ffn") or !try flag(t, "dspark_use_dense_ffn")) return error.Unsupported;
++    if (!std.mem.eql(u8, try text(ds, "markov_head_type"), "vanilla") or !std.mem.eql(u8, try text(t, "dspark_markov_head_type"), "vanilla")) return error.Unsupported;
++    if (!std.mem.eql(u8, try text(ds, "aux_gemm_precision"), "bf16")) return error.Unsupported;
++    if (try flag(ds, "hybrid_context_fusion") or try flag(t, "dspark_hybrid_context_fusion")) return error.Unsupported;
++    if (try flag(t, "attention_output_gate") or try flag(t, "tie_word_embeddings") or try flag(t, "use_mtp")) return error.Unsupported;
++    if (!try flag(t, "use_qk_norm") or !std.mem.eql(u8, try text(t, "qk_norm_type"), "per_head")) return error.Unsupported;
++    if (!std.mem.eql(u8, try text(t, "hidden_act"), "swigluoai")) return error.Unsupported;
++    if (t.get("rope_scaling") != null or t.get("rope_parameters") != null) return error.Unsupported;
++    if (t.get("sparse_attention_config") orelse std.json.Value{ .null = {} } != .null) return error.Unsupported;
++    for (try list(df, "layer_types")) |e| if (e != .string or !std.mem.eql(u8, e.string, "sliding_attention")) return error.Unsupported;
++    if ((try list(df, "layer_types")).len != c.layers) return error.BadConfig;
++    for (try list(t, "moe_layer_freq")) |e| if (e != .integer or e.integer != 0) return error.Unsupported;
++    // the quantization block of the pack: the draft's linear layers are mxfp8, 1 x 32 blocks
++    const q = try object(root, "quantization_config");
++    if (!std.mem.eql(u8, try text(q, "quant_method"), "mxfp8")) return error.Unsupported;
++    const wb = try list(q, "weight_block_size");
++    if (wb.len != 2 or wb[0] != .integer or wb[1] != .integer or wb[0].integer != 1 or wb[1].integer != 32) return error.Unsupported;
++    c.quant = .{ .block_k = 32, .activation_dynamic = std.mem.eql(u8, try text(q, "activation_scheme"), "dynamic") };
++    try check(c);
++    return c;
++}
++
++/// Widths and counts: what the cuts, the 128-wide units and the scale blocks need.
++fn check(c: Config) Error!void {
++    if (c.layers == 0 or c.layers > 16 or c.block < 2 or c.block > 16 or c.window < 128 or c.window % 128 != 0) return error.BadShape;
++    if (c.head_dim != 128 or c.rotary_dim == 0 or c.rotary_dim > c.head_dim or c.rotary_dim % 2 != 0) return error.BadShape;
++    if (c.heads == 0 or c.kv_heads == 0 or c.heads % c.kv_heads != 0) return error.BadShape;
++    if (c.mask_token >= c.vocab or c.markov_rank == 0 or c.markov_rank > 4096) return error.BadShape;
++    if (c.confidence_markov and !c.confidence) return error.BadConfig;
++    const wide = [_]u32{ c.hidden, c.heads * c.head_dim, c.kv_heads * c.head_dim, c.ffn, c.vocab };
++    for (wide) |w| if (w == 0 or w % 128 != 0) return error.BadShape;
++    // scale blocks run along the input axis: every K, and every rank's K cut, is whole blocks (cuts are 128s)
++    if (c.hidden % c.quant.block_k != 0 or c.ffn % c.quant.block_k != 0 or c.qWidth() % c.quant.block_k != 0) return error.BadShape;
++}
++
++pub const fixture = @embedFile("fixtures/dspark_config.json");
++
++test "the shipped dspark/config.json parses to the spelled-out shape" {
++    const c = try parse(std.testing.allocator, fixture);
++    inline for (@typeInfo(Config).@"struct".field_names) |name| {
++        if (comptime std.mem.eql(u8, name, "quant")) continue;
++        try std.testing.expectEqualDeep(@field(flash, name), @field(c, name));
++    }
++    try std.testing.expectEqualDeep(flash.quant, c.quant);
++    try std.testing.expectEqualSlices(u32, &.{ 3, 17, 31, 45, 59 }, c.tapIds());
++    try std.testing.expectEqual(@as(u32, 30720), c.fcIn());
++    try std.testing.expectEqual(@as(u32, 6400), c.confIn()); // confidence_head.proj.weight is [1, 6400]
++    try std.testing.expectEqual(@as(u32, 8192), c.qWidth());
++    try std.testing.expectEqual(@as(u32, 512), c.kvWidth());
++}
++
++fn patched(gpa: std.mem.Allocator, from: []const u8, to: []const u8) ![]u8 {
++    try std.testing.expect(std.mem.indexOf(u8, fixture, from) != null);
++    return std.mem.replaceOwned(u8, gpa, fixture, from, to);
++}
++
++fn refuses(want: anyerror, from: []const u8, to: []const u8) !void {
++    const gpa = std.testing.allocator;
++    const json = try patched(gpa, from, to);
++    defer gpa.free(json);
++    try std.testing.expectError(want, parse(gpa, json));
++}
++
++test "a different class, hybrid fusion, another Markov head, MoE or a non-mxfp8 pack is refused" {
++    try refuses(error.NotDspark, "\"DSparkMiniMaxDraftModel\"", "\"MiniMaxM3ForCausalLM\"");
++    try refuses(error.Unsupported, "\"hybrid_context_fusion\": false", "\"hybrid_context_fusion\": true");
++    try refuses(error.Unsupported, "\"markov_head_type\": \"vanilla\"", "\"markov_head_type\": \"gated\"");
++    try refuses(error.Unsupported, "\"aux_gemm_precision\": \"bf16\"", "\"aux_gemm_precision\": \"fp8\"");
++    try refuses(error.Unsupported, "\"quant_method\": \"mxfp8\"", "\"quant_method\": \"exl3\"");
++    try refuses(error.Unsupported, "\"use_dense_ffn\": true", "\"use_dense_ffn\": false");
++    try refuses(error.Unsupported, "\"hidden_act\": \"swigluoai\"", "\"hidden_act\": \"silu\"");
++    try refuses(error.Unsupported, "\"use_mtp\": false", "\"use_mtp\": true");
++    try refuses(error.Unsupported, "\"sparse_attention_config\": null", "\"sparse_attention_config\": {}");
++}
++
++test "settings spelled twice must agree, and widths must be whole" {
++    try refuses(error.BadConfig, "\"block_size\": 7", "\"block_size\": 6");
++    try refuses(error.BadConfig, "\"sliding_window\": 4096\n    }", "\"sliding_window\": 2048\n    }");
++    try refuses(error.BadConfig, "\"num_hidden_layers\": 5,\n      \"num_target_layers\"", "\"num_hidden_layers\": 4,\n      \"num_target_layers\"");
++    try refuses(error.BadConfig, "\"dspark_noise_token_id\": 200058,\n    \"dspark_use_dense_ffn\"", "\"dspark_noise_token_id\": 200064,\n    \"dspark_use_dense_ffn\""); // the copies disagree
++    try refuses(error.BadShape, "\"head_dim\": 128,\n    \"vocab_size\"", "\"head_dim\": 96,\n    \"vocab_size\"");
++}
++
++/// What a draft may and may not share with the target it reads: the same residual width, heads, rope and vocabulary.
++pub const Refusal = enum {
++    hidden_differs,
++    vocab_differs,
++    attention_differs,
++    rope_differs,
++    norm_eps_differs,
++    tap_out_of_range,
++    block_too_wide,
++    needs_two_ranks_or_one,
++    mask_token_is_special_hole,
++
++    pub fn text(r: Refusal) []const u8 {
++        return switch (r) {
++            .hidden_differs => "--drafter: the draft's hidden width is not the model's: the draft reads the model's own hidden states and cannot be attached to another model",
++            .vocab_differs => "--drafter: the draft's vocabulary is not the model's: it drafts through the model's own embedding and head",
++            .attention_differs => "--drafter: the draft's head counts or head width differ from the model's, so the shared sharding cannot cut it",
++            .rope_differs => "--drafter: the draft's rotary width or rope theta differ from the model's",
++            .norm_eps_differs => "--drafter: the draft's norm epsilon differs from the model's",
++            .tap_out_of_range => "--drafter: the draft taps a layer the model does not have",
++            .block_too_wide => "--drafter: a draft block plus its pending token does not fit one verify window of this engine",
++            .needs_two_ranks_or_one => "--drafter: this build runs the draft on one or two ranks only",
++            .mask_token_is_special_hole => "--drafter: the draft's mask token is not a token of the model's vocabulary",
++        };
++    }
++};
++
++/// Where the draft would run: its ranks and the verify window the engine's lanes take.
++pub const Place = struct { world: usize, window_rows: u32 };
++
++/// null when the draft can sit beside `t`; else the first thing that cannot be.
++pub fn admit(c: *const Config, t: *const target.Config, p: Place) ?Refusal {
++    if (c.hidden != t.hidden) return .hidden_differs;
++    if (c.vocab != t.vocab) return .vocab_differs;
++    if (c.heads != t.heads or c.kv_heads != t.kv_heads or c.head_dim != t.head_dim) return .attention_differs;
++    if (c.rotary_dim != t.rotary_dim or c.rope_theta != t.rope_theta) return .rope_differs;
++    if (c.eps != t.eps) return .norm_eps_differs;
++    for (c.tapIds()) |id| if (id >= t.layers) return .tap_out_of_range;
++    if (c.mask_token >= t.vocab) return .mask_token_is_special_hole;
++    if (c.block + 1 > p.window_rows) return .block_too_wide;
++    if (p.world == 0 or p.world > 2) return .needs_two_ranks_or_one;
++    return null;
++}
++
++/// The words of native.zig's `--drafter` refusal while the engine loads no draft (recipe-facing: start.sh / README).
++pub const drafter_refusal = "--drafter: MiniMax-M3.1-Flash has no MTP head; its dspark draft is not wired into this build yet " ++
++    "(docs/dspark-plan.md): serve without --drafter. Copy drafts stay available through --no-drafts being left off";
++
++test "the shipped draft sits beside the shipped model, and each mismatch has its own words" {
++    const c = try parse(std.testing.allocator, fixture);
++    const here: Place = .{ .world = 2, .window_rows = 16 };
++    try std.testing.expect(admit(&c, &target.flash, here) == null);
++    var t = target.flash;
++    t.hidden = 4096;
++    try std.testing.expectEqual(Refusal.hidden_differs, admit(&c, &t, here).?);
++    t = target.flash;
++    t.vocab = 128000;
++    try std.testing.expectEqual(Refusal.vocab_differs, admit(&c, &t, here).?);
++    t = target.flash;
++    t.kv_heads = 8;
++    try std.testing.expectEqual(Refusal.attention_differs, admit(&c, &t, here).?);
++    t = target.flash;
++    t.rope_theta = 1e6;
++    try std.testing.expectEqual(Refusal.rope_differs, admit(&c, &t, here).?);
++    t = target.flash;
++    t.layers = 59; // tap 59 is the last layer of a 60-layer model and past a 59-layer one
++    try std.testing.expectEqual(Refusal.tap_out_of_range, admit(&c, &t, here).?);
++    try std.testing.expectEqual(Refusal.block_too_wide, admit(&c, &target.flash, .{ .world = 2, .window_rows = 7 }).?);
++    try std.testing.expect(admit(&c, &target.flash, .{ .world = 2, .window_rows = 8 }) == null); // pending + 7 drafts
++    try std.testing.expectEqual(Refusal.needs_two_ranks_or_one, admit(&c, &target.flash, .{ .world = 3, .window_rows = 16 }).?);
++    inline for (std.enums.values(Refusal)) |r| try std.testing.expect(std.mem.startsWith(u8, r.text(), "--drafter: "));
++    try std.testing.expect(std.mem.startsWith(u8, drafter_refusal, "--drafter: "));
++}
++
++// ---- memory the draft adds to a rank ------------------------------------------------------------------------------
++
++/// Elements of one draft layer's linear weights for a rank holding `q` query rows, `kv` kv rows and `ffn` MLP rows.
++fn layerElems(c: *const Config, q: u64, kv: u64, ffn: u64) u64 {
++    const h: u64 = c.hidden;
++    return q * h + 2 * kv * h + h * q + 3 * h * ffn;
++}
++
++pub const Weights = struct {
++    codes: u64, // float8 weights, one byte each
++    scales: u64, // one ue8m0 byte per 32 input elements
++    fc: u64, // bf16
++    markov: u64, // bf16 w1 and w2
++    small: u64, // norms, the confidence projection
++    pub fn total(w: Weights) u64 {
++        return w.codes + w.scales + w.fc + w.markov + w.small;
++    }
++};
++
++/// Bytes on one rank: layers cut as the target's are; fc and Markov tables replicated (markov_cut: cut by vocab units).
++pub fn rankWeights(c: *const Config, s: shard.Share, markov_cut: bool) Weights {
++    const q = @as(u64, s.q_heads.len()) * c.head_dim;
++    const kv = @as(u64, s.kv_heads.len()) * c.head_dim;
++    const per_layer = layerElems(c, q, kv, s.dense.len());
++    const vocab_rows: u64 = if (markov_cut) s.vocab.len() else c.vocab;
++    const norms = 2 * @as(u64, c.hidden) * 2 + 2 * @as(u64, c.head_dim) * 2;
++    return .{
++        .codes = c.layers * per_layer,
++        .scales = c.layers * per_layer / c.quant.block_k,
++        .fc = @as(u64, c.hidden) * c.fcIn() * 2,
++        .markov = 2 * vocab_rows * c.markov_rank * 2,
++        .small = c.layers * norms + 2 * @as(u64, c.hidden) * 2 + if (c.confidence) @as(u64, c.confIn()) * 2 + 2 else 0,
++    };
++}
++
++/// The whole pack's bytes (one rank holding everything), as the safetensors header counts them.
++pub fn wholeWeights(c: *const Config) Weights {
++    return rankWeights(c, shard.Share.of(&target.flash, 0, 1) catch unreachable, false);
++}
++
++/// Rows a stream's context ring holds: the window and the rows one verify window can add before the oldest are due out.
++pub fn ringRows(c: *const Config, window_rows: u32) u64 {
++    return @as(u64, c.window) + window_rows;
++}
++
++/// Bytes a token adds to the context ring of one rank (per-layer K and V of the rank's kv heads), bf16.
++pub fn ringTokenBytes(c: *const Config, s: shard.Share) u64 {
++    return @as(u64, c.layers) * 2 * s.kv_heads.len() * c.head_dim * 2;
++}
++
++/// One stream's K/V ring on one rank; the 61,440-byte-a-token feature cache is never kept (see featureTokenBytes).
++pub fn ringBytes(c: *const Config, s: shard.Share, window_rows: u32) u64 {
++    return ringRows(c, window_rows) * ringTokenBytes(c, s);
++}
++
++/// bf16 tapped hidden states a token needs to be absorbed: 5 x 6144 x 2 = 61,440 bytes. Transient, per ingest chunk.
++pub fn featureTokenBytes(c: *const Config) u64 {
++    return @as(u64, c.fcIn()) * 2;
++}
++
++/// Scratch not growing with streams: one absorb chunk's tapped rows, fc out and hidden_norm out (an estimate).
++pub fn absorbScratch(c: *const Config, absorb_rows: u32) u64 {
++    return @as(u64, absorb_rows) * (featureTokenBytes(c) + 2 * @as(u64, c.hidden) * 2);
++}
++
++/// Scratch one stream's pass adds: the block's activations and the head slice's logits and candidates.
++pub fn laneScratch(c: *const Config, s: shard.Share) u64 {
++    const h: u64 = c.hidden;
++    const rows: u64 = c.block;
++    const kvw = @as(u64, s.kv_heads.len()) * c.head_dim;
++    const block = rows * (4 * h * 2 + @as(u64, s.q_heads.len()) * c.head_dim * 2 * 2 + 2 * kvw * 2 + 3 * @as(u64, s.dense.len()) * 4 + 2 * h * 4);
++    const head = rows * (@as(u64, s.vocab.len()) * 4 + 64 * 8 * 2); // logits slice fp32, 64 candidates (id, value) a rank
++    return block + head;
++}
++
++pub fn scratchBytes(c: *const Config, s: shard.Share, absorb_rows: u32, lanes: u32) u64 {
++    return absorbScratch(c, absorb_rows) + @as(u64, lanes) * laneScratch(c, s);
++}
++
++/// CUDA module, graphs and NCCL buffers the draft's kernels add: a planning figure, to be replaced by a measurement.
++pub const runtime_estimate: u64 = 512 << 20;
++
++/// What the draft costs a rank before KV: weights and runtime once, per_lane (ring and pass scratch) for every stream.
++pub const Cost = struct { weights: u64, runtime: u64, per_lane: u64 };
++
++pub fn cost(c: *const Config, s: shard.Share, window_rows: u32, absorb_rows: u32, markov_cut: bool) Cost {
++    return .{
++        .weights = rankWeights(c, s, markov_cut).total(),
++        .runtime = runtime_estimate + absorbScratch(c, absorb_rows),
++        .per_lane = ringBytes(c, s, window_rows) + laneScratch(c, s),
++    };
++}
++
++test "weight bytes: the whole pack equals the safetensors total, a rank holds 1.34 GiB" {
++    const c = flash;
++    const whole = wholeWeights(&c);
++    // model.safetensors.index.json total_size 2,301,852,674 = codes + scales + bf16 tensors
++    try std.testing.expectEqual(@as(u64, 2_301_852_674), whole.total());
++    try std.testing.expectEqual(@as(u64, 1_667_235_840), whole.codes);
++    try std.testing.expectEqual(@as(u64, 52_101_120), whole.scales);
++    try std.testing.expectEqual(@as(u64, 377_487_360), whole.fc);
++    try std.testing.expectEqual(@as(u64, 204_865_536), whole.markov);
++    try std.testing.expectEqual(@as(u64, 162_818), whole.small);
++    const r0 = try shard.Share.of(&target.flash, 0, 2);
++    const r1 = try shard.Share.of(&target.flash, 1, 2);
++    const w0 = rankWeights(&c, r0, false);
++    try std.testing.expectEqual(w0.total(), rankWeights(&c, r1, false).total());
++    try std.testing.expectEqual(@as(u64, 1_442_184_194), w0.total());
++    // the layers halve; fc, the Markov tables and the small tensors are replicated
++    try std.testing.expectEqual(whole.codes / 2, w0.codes);
++    try std.testing.expectEqual(whole.fc, w0.fc);
++    try std.testing.expectEqual(whole.markov, w0.markov);
++    // cutting the Markov tables by the head's units saves what rank 1's units are not
++    const cut0 = rankWeights(&c, r0, true);
++    try std.testing.expect(cut0.markov < w0.markov and cut0.markov > w0.markov / 2);
++}
++
++test "the context ring is bounded by the window: 5 KiB a token a rank, 21 MB a stream, never the 61,440-byte feature row" {
++    const c = flash;
++    const r0 = try shard.Share.of(&target.flash, 0, 2);
++    try std.testing.expectEqual(@as(u64, 61_440), featureTokenBytes(&c));
++    try std.testing.expectEqual(@as(u64, 5_120), ringTokenBytes(&c, r0));
++    try std.testing.expectEqual(@as(u64, 4112), ringRows(&c, 16));
++    try std.testing.expectEqual(@as(u64, 21_053_440), ringBytes(&c, r0, 16));
++    // the target's KV for the same rows is 76,800 B a token: the ring is 1/15 of it and does not grow past the window
++    const full = try shard.Share.of(&target.flash, 0, 1);
++    try std.testing.expectEqual(@as(u64, 10_240), ringTokenBytes(&c, full));
++}
++
++test "scratch splits into a fixed absorb chunk and a part per stream; one stream costs about 2.0 GiB a rank" {
++    const c = flash;
++    const r0 = try shard.Share.of(&target.flash, 0, 2);
++    const one = cost(&c, r0, 16, 2048, false);
++    try std.testing.expect(one.per_lane > ringBytes(&c, r0, 16));
++    // an absorb chunk of 2048 rows: 61,440 + 2 x 12,288 bytes a row; lanes add only their own part
++    try std.testing.expectEqual(@as(u64, 2048 * (61_440 + 24_576)), absorbScratch(&c, 2048));
++    try std.testing.expectEqual(scratchBytes(&c, r0, 2048, 1) + 3 * laneScratch(&c, r0), scratchBytes(&c, r0, 2048, 4));
++    // weights 1.34 GiB + 0.5 GiB module/graph estimate + 0.16 GiB absorb chunk + the stream: about 2.0 GiB a rank
++    const all = one.weights + one.runtime + one.per_lane;
++    try std.testing.expect(all > 1_900_000_000 * 1 and all < 2_300_000_000 * 1);
++}
++
++// ---- what a verify window costs on this MoE (an expectation, not a measurement) ----------------------------------
++
++/// Expected distinct experts a window of `rows` independent rows touches in one layer.
++pub fn distinctExperts(experts: u32, topk: u32, rows: u32) f64 {
++    const e: f64 = @floatFromInt(experts);
++    const keep = 1.0 - @as(f64, @floatFromInt(topk)) / e;
++    return e * (1.0 - std.math.pow(f64, keep, @floatFromInt(rows)));
++}
++
++/// Window bytes against a one-row step: (other + experts x distinct(rows) / distinct(1)) / (other + experts).
++pub fn windowCostRatio(other_bytes: f64, expert_bytes_one_row: f64, experts: u32, topk: u32, rows: u32) f64 {
++    const grow = distinctExperts(experts, topk, rows) / distinctExperts(experts, topk, 1);
++    return (other_bytes + expert_bytes_one_row * grow) / (other_bytes + expert_bytes_one_row);
++}
++
++test "window cost: one row costs one step; 8 rows read about 7x the experts and about 3.4x the bytes (independent routing)" {
++    try std.testing.expectApproxEqAbs(@as(f64, 4.0), distinctExperts(128, 4, 1), 1e-12);
++    try std.testing.expect(distinctExperts(128, 4, 8) > 28 and distinctExperts(128, 4, 8) < 29);
++    // engine-port-plan section 5: about 14.5 GB a token, 5.7 GB of it routed experts
++    try std.testing.expectApproxEqAbs(@as(f64, 1.0), windowCostRatio(8.8, 5.7, 128, 4, 1), 1e-12);
++    const r8 = windowCostRatio(8.8, 5.7, 128, 4, 8);
++    try std.testing.expect(r8 > 3.3 and r8 < 3.5);
++    var last: f64 = 0;
++    for (1..17) |rows| {
++        const r = windowCostRatio(8.8, 5.7, 128, 4, @intCast(rows));
++        try std.testing.expect(r > last);
++        last = r;
++    }
++}
+diff --git a/zig/src/families/minimax_m3/dspark_load.zig b/zig/src/families/minimax_m3/dspark_load.zig
+new file mode 100644
+index 0000000..4af0812
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_load.zig
+@@ -0,0 +1,259 @@
++//! The dspark draft's checkpoint plan for one rank, from the safetensors header alone; reuses load.zig and shard.zig.
++const std = @import("std");
++// Nothing is converted at load, and norms are not folded to 1 + w: the Gemma offset is an unverified switch.
++const core = @import("core");
++const st = core.safetensors;
++const layout = core.exl3_layout;
++const load = @import("load.zig");
++const dc = @import("dspark_config.zig");
++const dn = @import("dspark_names.zig");
++const names = @import("names.zig");
++const shard = @import("shard.zig");
++
++pub const Catalog = load.Catalog;
++pub const Ref = load.Ref;
++pub const Slot = load.Slot;
++pub const Item = load.Item;
++
++/// One draft linear layer on this rank: float8 codes [n, k] and one ue8m0 scale byte per 32 inputs [n, k / 32].
++pub const Mat = struct {
++    proj: dn.Lin,
++    layer: u16,
++    n: u32, // rank-local output rows
++    k: u32, // rank-local input width
++    codes: u32, // slot ids
++    scales: u32,
++};
++
++/// A bf16 tensor on this rank (as stored).
++pub const Tensor = struct {
++    role: dn.Plain,
++    layer: u16,
++    slot: u32,
++    rows: u32,
++    cols: u32, // 1 for vectors
++};
++
++pub const Options = struct {
++    /// Cut the Markov tables by the head's vocab units; false: both ranks hold them whole and run the chain alike.
++    markov_cut: bool = false,
++};
++
++pub const Plan = struct {
++    arena: std.heap.ArenaAllocator,
++    share: shard.Share,
++    opts: Options,
++    slots: []Slot,
++    items: []Item, // in (shard, offset) order
++    mats: []Mat,
++    plain: []Tensor,
++    ignored: usize, // tensors of other namespaces (the target's) left unread
++
++    pub fn deinit(p: *Plan) void {
++        p.arena.deinit();
++        p.* = undefined;
++    }
++
++    pub fn slotBytes(p: *const Plan) u64 {
++        var n: u64 = 0;
++        for (p.slots) |s| n += s.bytes;
++        return n;
++    }
++
++    pub fn mat(p: *const Plan, proj: dn.Lin, layer: u32) ?*const Mat {
++        for (p.mats) |*m| if (m.proj == proj and m.layer == layer) return m;
++        return null;
++    }
++
++    pub fn tensor(p: *const Plan, role: dn.Plain, layer: u32) ?*const Tensor {
++        for (p.plain) |*t| if (t.role == role and t.layer == layer) return t;
++        return null;
++    }
++
++    /// `cat` holds the draft's shards; `share` is this rank's cut of the TARGET. Refuses a missing or odd tensor.
++    pub fn build(gpa: std.mem.Allocator, cat: *Catalog, c: *const dc.Config, share: shard.Share, opts: Options) !Plan {
++        var arena = std.heap.ArenaAllocator.init(gpa);
++        errdefer arena.deinit();
++        var b: Builder = .{ .cat = cat, .c = c, .share = share, .a = arena.allocator() };
++        var used = cat.map.valueIterator();
++        while (used.next()) |r| r.used = false;
++        try b.all(opts);
++        std.mem.sort(Item, b.items.items, {}, struct {
++            fn less(_: void, x: Item, y: Item) bool {
++                return if (x.shard != y.shard) x.shard < y.shard else x.first() < y.first();
++            }
++        }.less);
++        return .{
++            .arena = arena,
++            .share = share,
++            .opts = opts,
++            .slots = b.slots.items,
++            .items = b.items.items,
++            .mats = b.mats.items,
++            .plain = b.plain.items,
++            .ignored = try b.leftovers(),
++        };
++    }
++};
++
++/// The scale byte types a checkpoint may spell its ue8m0 exponents with.
++fn isScale(r: *const Ref, shape: []const usize) bool {
++    return r.is(.u8, shape) or r.is(.f8_e8m0, shape);
++}
++
++const Builder = struct {
++    cat: *Catalog,
++    c: *const dc.Config,
++    share: shard.Share,
++    a: std.mem.Allocator,
++    slots: std.ArrayList(Slot) = .empty,
++    items: std.ArrayList(Item) = .empty,
++    mats: std.ArrayList(Mat) = .empty,
++    plain: std.ArrayList(Tensor) = .empty,
++
++    fn slot(b: *Builder, bytes: u64) !u32 {
++        try b.slots.append(b.a, .{ .bytes = bytes });
++        return @intCast(b.slots.items.len - 1);
++    }
++
++    fn find(b: *Builder, name: []const u8) !*Ref {
++        const r = b.cat.get(name) orelse {
++            std.log.warn("dspark checkpoint has no tensor {s}", .{name});
++            return error.MissingTensor;
++        };
++        r.used = true;
++        return r;
++    }
++
++    fn all(b: *Builder, opts: Options) !void {
++        const c = b.c;
++        const s = b.share;
++        if (c.layers == 0) return error.BadLayers;
++        try b.plainTensor(.fc, 0, &.{ c.hidden, c.fcIn() }, null);
++        try b.plainTensor(.hidden_norm, 0, &.{c.hidden}, null);
++        try b.plainTensor(.final_norm, 0, &.{c.hidden}, null);
++        const vocab_rows: ?shard.Span = if (opts.markov_cut) s.vocab else null;
++        try b.plainTensor(.markov_w1, 0, &.{ c.vocab, c.markov_rank }, vocab_rows);
++        try b.plainTensor(.markov_w2, 0, &.{ c.vocab, c.markov_rank }, vocab_rows);
++        if (c.confidence) {
++            try b.plainTensor(.conf_w, 0, &.{ 1, c.confIn() }, null);
++            try b.plainTensor(.conf_b, 0, &.{1}, null);
++        }
++        for (0..c.layers) |l| try b.layer(@intCast(l));
++    }
++
++    fn layer(b: *Builder, l: u16) !void {
++        const c = b.c;
++        const s = b.share;
++        const hd: usize = c.head_dim;
++        const q: shard.Span = .{ .lo = s.q_heads.lo * hd, .hi = s.q_heads.hi * hd };
++        const kv: shard.Span = .{ .lo = s.kv_heads.lo * hd, .hi = s.kv_heads.hi * hd };
++        try b.plainTensor(.input_ln, l, &.{c.hidden}, null);
++        try b.plainTensor(.post_ln, l, &.{c.hidden}, null);
++        try b.plainTensor(.q_norm, l, &.{c.head_dim}, null);
++        try b.plainTensor(.k_norm, l, &.{c.head_dim}, null);
++        try b.linear(.q, l, c.qWidth(), c.hidden, q);
++        try b.linear(.k, l, c.kvWidth(), c.hidden, kv);
++        try b.linear(.v, l, c.kvWidth(), c.hidden, kv);
++        try b.linear(.o, l, c.hidden, c.qWidth(), q);
++        try b.linear(.gate, l, c.ffn, c.hidden, s.dense);
++        try b.linear(.up, l, c.ffn, c.hidden, s.dense);
++        try b.linear(.down, l, c.hidden, c.ffn, s.dense);
++    }
++
++    fn bad(why: anyerror, name: []const u8, comptime fmt: []const u8, args: anytype) anyerror {
++        std.log.warn("{s}: " ++ fmt, .{name} ++ args);
++        return why;
++    }
++
++    fn plainTensor(b: *Builder, role: dn.Plain, l: u16, shape: []const usize, rows: ?shard.Span) !void {
++        var buf: dn.Buf = undefined;
++        const name = dn.plain(&buf, role, l);
++        const r = try b.find(name);
++        if (!r.is(.bf16, shape)) return bad(error.MisshapedTensor, name, "{t} {any} is not bf16 {any}", .{ r.dtype, r.shape[0..r.rank], shape });
++        const cols: usize = if (shape.len > 1) shape[1] else 1;
++        const row_bytes = cols * 2;
++        var offset: u64 = 0;
++        var len: u64 = r.len;
++        var n_rows: usize = shape[0];
++        if (rows) |sp| {
++            offset = sp.lo * row_bytes;
++            len = sp.len() * row_bytes;
++            n_rows = sp.len();
++        }
++        const id = try b.slot(len);
++        try b.items.append(b.a, .{ .shard = r.shard, .base = r.begin, .span = .{ .offset = offset, .len = len }, .slot = id, .dst = 0 });
++        try b.plain.append(b.a, .{ .role = role, .layer = l, .slot = id, .rows = @intCast(n_rows), .cols = @intCast(cols) });
++    }
++
++    /// One mxfp8 matrix [n, k]: this rank's cut `sp` (output rows for a col cut, input width for a row cut).
++    fn linear(b: *Builder, proj: dn.Lin, l: u16, n: usize, k: usize, sp: shard.Span) !void {
++        const blk: usize = b.c.quant.block_k;
++        var nb: [2]dn.Buf = undefined;
++        const wn = dn.lin(&nb[0], proj, l, .weight);
++        const sn = dn.lin(&nb[1], proj, l, .weight_scale_inv);
++        const w = try b.find(wn);
++        const sc = try b.find(sn);
++        if (!w.is(.f8_e4m3, &.{ n, k })) return bad(error.MisshapedTensor, wn, "{t} {any} is not float8 e4m3 [{d}, {d}]", .{ w.dtype, w.shape[0..w.rank], n, k });
++        if (k % blk != 0 or !isScale(sc, &.{ n, k / blk })) return bad(error.MisshapedTensor, sn, "{t} {any} is not one ue8m0 byte per {d} inputs [{d}, {d}]", .{ sc.dtype, sc.shape[0..sc.rank], blk, n, k / blk });
++        const whole = if (proj.cut() == .col) n else k;
++        if (sp.lo >= sp.hi or sp.hi > whole) return bad(error.SplitNotOnBlocks, wn, "cut [{d}, {d}) of {d}", .{ sp.lo, sp.hi, whole });
++        if (proj.cut() == .row and (sp.lo % blk != 0 or sp.hi % blk != 0)) return bad(error.SplitNotOnBlocks, wn, "input cut [{d}, {d}) is not whole {d}-blocks", .{ sp.lo, sp.hi, blk });
++        var code: layout.Span = undefined;
++        var scale: layout.Span = undefined;
++        var rn: usize = n;
++        var rk: usize = k;
++        switch (proj.cut()) {
++            .col => { // rows lo..hi of [n, k] are one run
++                code = .{ .offset = sp.lo * k, .len = sp.len() * k };
++                scale = .{ .offset = sp.lo * (k / blk), .len = sp.len() * (k / blk) };
++                rn = sp.len();
++            },
++            .row => { // columns lo..hi of every row: n runs, a row apart
++                code = .{ .offset = sp.lo, .len = sp.len(), .stride = k, .count = n };
++                scale = .{ .offset = sp.lo / blk, .len = sp.len() / blk, .stride = k / blk, .count = n };
++                rk = sp.len();
++            },
++        }
++        const cs = try b.slot(code.bytes());
++        const ss = try b.slot(scale.bytes());
++        try b.items.append(b.a, .{ .shard = w.shard, .base = w.begin, .span = code, .slot = cs, .dst = 0 });
++        try b.items.append(b.a, .{ .shard = sc.shard, .base = sc.begin, .span = scale, .slot = ss, .dst = 0 });
++        try b.mats.append(b.a, .{ .proj = proj, .layer = l, .n = @intCast(rn), .k = @intCast(rk), .codes = cs, .scales = ss });
++    }
++
++    /// A tensor in the draft's namespace no planned name took is a pack this plan does not understand.
++    fn leftovers(b: *Builder) !usize {
++        var ignored: usize = 0;
++        var it = b.cat.map.iterator();
++        while (it.next()) |kv| {
++            if (kv.value_ptr.used) continue;
++            if (std.mem.startsWith(u8, kv.key_ptr.*, dn.root)) {
++                std.log.warn("unexpected dspark tensor {s}", .{kv.key_ptr.*});
++                return error.UnexpectedTensor;
++            }
++            ignored += 1;
++        }
++        return ignored;
++    }
++};
++
++/// Adds one shard's JSON header (`data_len` data bytes after it) to `cat` as shard `index`, without a file.
++pub fn addHeader(cat: *Catalog, index: u16, json: []const u8, data_len: usize) !void {
++    const a = cat.arena.allocator();
++    const header = try st.parseHeader(a, json, data_len);
++    const data = 8 + json.len;
++    for (header.keys(), header.values()) |name, e| try cat.add(name, .{
++        .shard = index,
++        .dtype = e.dtype,
++        .rank = e.rank,
++        .shape = e.shape,
++        .begin = data + e.begin,
++        .len = e.end - e.begin,
++    });
++}
++
++/// The folder's checkpoint catalog: dspark/'s index.json and shard headers, read with direct I/O like the target's.
++pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Catalog {
++    return Catalog.open(gpa, io, dir);
++}
+diff --git a/zig/src/families/minimax_m3/dspark_model_test.zig b/zig/src/families/minimax_m3/dspark_model_test.zig
+new file mode 100644
+index 0000000..1aab311
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_model_test.zig
+@@ -0,0 +1,500 @@
++//! The float64 draft block on a tiny random draft: properties, switch liveness, twins and planted mutants.
++const std = @import("std");
++const core = @import("core");
++const mr = core.minimax_ref;
++const ref = @import("dspark_ref.zig");
++const twin = @import("dspark_twin.zig");
++
++const gpa = std.testing.allocator;
++
++var fixed_prng: std.Random.DefaultPrng = undefined;
++
++/// A fresh deterministic generator for a one-off vector.
++fn fixedRandom() std.Random {
++    fixed_prng = std.Random.DefaultPrng.init(5);
++    return fixed_prng.random();
++}
++
++// ---- a tiny random draft ------------------------------------------------------------------------------------------
++
++const Tiny = struct { vocab: usize = 24, rank: usize = 4, markov_scale: f64 = 1.0 };
++
++fn rnd(r: std.Random, a: std.mem.Allocator, n: usize, scale: f64) ![]f64 {
++    const v = try a.alloc(f64, n);
++    for (v) |*x| x.* = (r.float(f64) * 2 - 1) * scale;
++    return v;
++}
++
++fn dense(r: std.Random, a: std.mem.Allocator, n: usize, k: usize) !ref.Dense {
++    return .{ .n = n, .k = k, .w = try rnd(r, a, n * k, 1.5 / @sqrt(@as(f64, @floatFromInt(k)))) };
++}
++
++fn tinyConfig(t: Tiny, sw: ref.Switches) ref.Config {
++    return .{ .hidden = 32, .n_q = 4, .n_kv = 2, .head_dim = 16, .rot_dim = 8, .rope_theta = 100, .ffn = 24, .layers = 2, .n_taps = 3, .window = 6, .block = 4, .mask_token = t.vocab - 1, .rank = t.rank, .vocab = t.vocab, .candidates = 6, .limit = 0.3, .sw = sw };
++}
++
++fn tinyDraft(a: std.mem.Allocator, seed: u64, t: Tiny, sw: ref.Switches) !ref.Draft {
++    var prng = std.Random.DefaultPrng.init(seed);
++    const r = prng.random();
++    const c = tinyConfig(t, sw);
++    const ls = try a.alloc(ref.Layer, c.layers);
++    for (ls) |*l| l.* = .{
++        .input_norm = try rnd(r, a, c.hidden, 0.4),
++        .post_norm = try rnd(r, a, c.hidden, 0.4),
++        .q_norm = try rnd(r, a, c.head_dim, 0.4),
++        .k_norm = try rnd(r, a, c.head_dim, 0.4),
++        .q = try dense(r, a, c.n_q * c.head_dim, c.hidden),
++        .k = try dense(r, a, c.kvw(), c.hidden),
++        .v = try dense(r, a, c.kvw(), c.hidden),
++        .o = try dense(r, a, c.hidden, c.n_q * c.head_dim),
++        .gate = try dense(r, a, c.ffn, c.hidden),
++        .up = try dense(r, a, c.ffn, c.hidden),
++        .down = try dense(r, a, c.hidden, c.ffn),
++    };
++    return .{
++        .cfg = c,
++        .fc = try dense(r, a, c.hidden, c.n_taps * c.hidden),
++        .hidden_norm = try rnd(r, a, c.hidden, 0.2),
++        .final_norm = try rnd(r, a, c.hidden, 0.4),
++        .layers = ls,
++        .markov_w1 = try rnd(r, a, c.vocab * c.rank, t.markov_scale),
++        .markov_w2 = try rnd(r, a, c.vocab * c.rank, t.markov_scale),
++        .conf_w = try rnd(r, a, c.hidden + c.rank, 0.3),
++        .conf_b = 0.1,
++        .embed = try rnd(r, a, c.vocab * c.hidden, 1.0),
++        .head = try dense(r, a, c.vocab, c.hidden),
++    };
++}
++
++/// Tapped features of `n` positions from a fake target of `layers` layers (the residual streams are random).
++fn features(a: std.mem.Allocator, seed: u64, c: ref.Config, ids: []const usize, target_layers: usize, n: usize, final_norm: []const f64) ![]f64 {
++    var prng = std.Random.DefaultPrng.init(seed);
++    const r = prng.random();
++    const out = try a.alloc(f64, n * c.n_taps * c.hidden);
++    const resid = try a.alloc([]const f64, target_layers + 1);
++    for (0..n) |j| {
++        for (resid) |*row| row.* = try rnd(r, a, c.hidden, 2.0);
++        ref.tapRow(c, ids, target_layers, resid, final_norm, true, out[j * c.n_taps * c.hidden ..][0 .. c.n_taps * c.hidden]);
++    }
++    return out;
++}
++
++const tap_ids = [_]usize{ 1, 3, 5 }; // of a 6-layer fake target: the last tap is the last layer
++const fake_layers = 6;
++
++fn maxDiff(x: []const f64, y: []const f64) f64 {
++    var m: f64 = 0;
++    for (x, y) |a, b| m = @max(m, @abs(a - b));
++    return m;
++}
++
++/// The whole path, reference form: taps -> context K/V for all positions -> block -> chain; the result as one vector.
++fn pipeline(a: std.mem.Allocator, sw: ref.Switches) ![]f64 {
++    const t: Tiny = .{ .markov_scale = 3.0 };
++    const d = try tinyDraft(a, 11, t, sw);
++    const c = d.cfg;
++    const fnorm = try rnd(fixedRandom(), a, c.hidden, 0.3);
++    const p: usize = 10; // more than the window of 6
++    const feats = try features(a, 21, c, &tap_ids, fake_layers, p, fnorm);
++    const cx = try ref.buildCtx(&d, a, feats, 0, p);
++    const b = try ref.blockForward(&d, a, &cx, 5, p);
++    const n = ref.draftCount(c.sw, c.block);
++    const drafts = try a.alloc(usize, n);
++    const conf = try a.alloc(f64, n);
++    try ref.chain(&d, a, b, 5, drafts, conf);
++    const out = try a.alloc(f64, b.pre.len + b.post.len + 2 * n);
++    @memcpy(out[0..b.pre.len], b.pre);
++    @memcpy(out[b.pre.len..][0..b.post.len], b.post);
++    for (drafts, conf, 0..) |dt, q, i| {
++        out[b.pre.len + b.post.len + 2 * i] = @floatFromInt(dt);
++        out[b.pre.len + b.post.len + 2 * i + 1] = q;
++    }
++    return out;
++}
++
++// ---- reference properties -----------------------------------------------------------------------------------------
++
++test "the draft block is deterministic and finite" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const x = try pipeline(a, .{});
++    const y = try pipeline(a, .{});
++    try std.testing.expectEqualSlices(f64, x, y);
++    for (x) |v| try std.testing.expect(std.math.isFinite(v));
++}
++
++test "every switch is live: its other setting changes the result" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const base = try pipeline(a, .{});
++    const flips = .{
++        .{ "base.rope_layout", ref.Switches{ .base = .{ .rope_layout = .gptj_interleaved } } },
++        .{ "base.up_plus_one", ref.Switches{ .base = .{ .up_plus_one = false } } },
++        .{ "base.gate_clamp", ref.Switches{ .base = .{ .gate_clamp = .symmetric } } },
++        .{ "base.gemma_layer_norms", ref.Switches{ .base = .{ .gemma_layer_norms = false } } },
++        .{ "base.gemma_qk_norms", ref.Switches{ .base = .{ .gemma_qk_norms = false } } },
++        .{ "base.bf16_proj_out", ref.Switches{ .base = .{ .bf16_proj_out = true } } },
++        .{ "base.bf16_residual", ref.Switches{ .base = .{ .bf16_residual = true } } },
++        .{ "tap_site", ref.Switches{ .tap_site = .layer_input } },
++        .{ "last_tap_post_norm", ref.Switches{ .last_tap_post_norm = true } },
++        .{ "tap_bf16", ref.Switches{ .tap_bf16 = false } },
++        .{ "concat_order", ref.Switches{ .concat_order = .reversed } },
++        .{ "gemma_hidden_norm", ref.Switches{ .gemma_hidden_norm = false } },
++        .{ "gemma_final_norm", ref.Switches{ .gemma_final_norm = false } },
++        .{ "ctx_input_norm", ref.Switches{ .ctx_input_norm = true } },
++        .{ "window_rule", ref.Switches{ .window_rule = .context_tail } },
++        .{ "block_attention", ref.Switches{ .block_attention = .causal } },
++        .{ "block_positions", ref.Switches{ .block_positions = .all_pending } },
++        .{ "draft_rows", ref.Switches{ .draft_rows = .rows_after_anchor } },
++        .{ "markov_domain", ref.Switches{ .markov_domain = .candidates } },
++        .{ "markov_swap", ref.Switches{ .markov_swap = true } },
++        .{ "first_prev", ref.Switches{ .first_prev = .none } },
++        .{ "conf_input", ref.Switches{ .conf_input = .pre_final_norm } },
++        .{ "conf_sigmoid", ref.Switches{ .conf_sigmoid = false } },
++        .{ "aux_bf16", ref.Switches{ .aux_bf16 = false } },
++    };
++    inline for (flips) |f| {
++        const got = try pipeline(a, f[1]);
++        if (got.len == base.len and maxDiff(base, got) <= 1e-7) {
++            std.debug.print("switch {s} changed nothing\n", .{f[0]});
++            return error.DeadSwitch;
++        }
++    }
++}
++
++test "tap sources: layer output by default, the last layer normed only when asked" {
++    const sw: ref.Switches = .{};
++    try std.testing.expectEqual(ref.TapSource{ .r = 4, .normed = false }, ref.tapSource(sw, 3, 60));
++    try std.testing.expectEqual(ref.TapSource{ .r = 60, .normed = false }, ref.tapSource(sw, 59, 60));
++    try std.testing.expectEqual(ref.TapSource{ .r = 60, .normed = true }, ref.tapSource(.{ .last_tap_post_norm = true }, 59, 60));
++    try std.testing.expectEqual(ref.TapSource{ .r = 45, .normed = false }, ref.tapSource(.{ .tap_site = .layer_input, .last_tap_post_norm = true }, 45, 60));
++    try std.testing.expectEqual(ref.TapSource{ .r = 59, .normed = false }, ref.tapSource(.{ .tap_site = .layer_input }, 59, 60));
++}
++
++test "the sliding window: a context row outside it cannot matter, one inside it does (per_row), and block rows see each other (bidirectional)" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const d = try tinyDraft(a, 3, .{}, .{});
++    const c = d.cfg;
++    const fnorm = try rnd(fixedRandom(), a, c.hidden, 0.3);
++    const p: usize = 12; // window 6: row 0 sees positions 7 .. 11, row 3 (position 15) sees 10 .. 11
++    const feats = try features(a, 9, c, &tap_ids, fake_layers, p, fnorm);
++    const base = try ref.blockForward(&d, a, &(try ref.buildCtx(&d, a, feats, 0, p)), 2, p);
++    const row = c.n_taps * c.hidden;
++    const old = try a.dupe(f64, feats);
++    for (old[3 * row ..][0..row]) |*v| v.* += 1.0; // position 3: outside every row's window
++    const same = try ref.blockForward(&d, a, &(try ref.buildCtx(&d, a, old, 0, p)), 2, p);
++    try std.testing.expectEqualSlices(f64, base.post, same.post);
++    const near = try a.dupe(f64, feats);
++    for (near[9 * row ..][0..row]) |*v| v.* += 1.0; // position 9: row 0 sees it (15 - ... 12 - 9 < 6)
++    const moved = try ref.blockForward(&d, a, &(try ref.buildCtx(&d, a, near, 0, p)), 2, p);
++    try std.testing.expect(maxDiff(base.post[0..c.hidden], moved.post[0..c.hidden]) > 1e-6);
++    // position 7 is inside row 0's window (12 - 7 = 5 < 6) but outside row 3's (15 - 7 = 8 >= 6)
++    const edge = try a.dupe(f64, feats);
++    for (edge[7 * row ..][0..row]) |*v| v.* += 1.0;
++    const e = try ref.blockForward(&d, a, &(try ref.buildCtx(&d, a, edge, 0, p)), 2, p);
++    try std.testing.expect(maxDiff(base.post[0..c.hidden], e.post[0..c.hidden]) > 1e-6);
++}
++
++test "causal block attention: a later block row cannot change an earlier one; bidirectional lets it" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]ref.BlockAttention{ .causal, .bidirectional }) |mode| {
++        var d = try tinyDraft(a, 4, .{}, .{ .block_attention = mode });
++        const c = d.cfg;
++        const fnorm = try rnd(fixedRandom(), a, c.hidden, 0.3);
++        const feats = try features(a, 9, c, &tap_ids, fake_layers, 8, fnorm);
++        const cx = try ref.buildCtx(&d, a, feats, 0, 8);
++        const one = try ref.blockForward(&d, a, &cx, 2, 8);
++        // rows 1.. start from the mask token's embedding: moving it moves row 0 only if the rows see each other
++        const e = @constCast(d.embed);
++        for (e[c.mask_token * c.hidden ..][0..c.hidden]) |*v| v.* += 0.5;
++        const two = try ref.blockForward(&d, a, &cx, 2, 8);
++        // row 0 (the anchor) reads rows 1.. only if the block is bidirectional
++        const moved = maxDiff(one.post[0..c.hidden], two.post[0..c.hidden]) > 1e-6;
++        try std.testing.expectEqual(mode == .bidirectional, moved);
++    }
++}
++
++test "contextKv: layer K is normed and rotated at the token's position, V is the plain projection" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const d = try tinyDraft(a, 8, .{}, .{});
++    const c = d.cfg;
++    const st = try rnd(fixedRandom(), a, c.hidden, 1.0);
++    const k = try a.alloc(f64, c.kvw());
++    const v = try a.alloc(f64, c.kvw());
++    try ref.contextKv(&d, a, 1, st, 7, k, v);
++    const want_v = try a.alloc(f64, c.kvw());
++    d.layers[1].v.apply(st, want_v);
++    try std.testing.expectEqualSlices(f64, want_v, v);
++    const want_k = try a.alloc(f64, c.kvw());
++    d.layers[1].k.apply(st, want_k);
++    for (0..c.n_kv) |g| {
++        const h = want_k[g * c.head_dim ..][0..c.head_dim];
++        var t: [16]f64 = undefined;
++        mr.gemmaNorm(h, d.layers[1].k_norm, c.eps, true, &t);
++        @memcpy(h, &t);
++        mr.rope(h, c.rot_dim, 7, c.rope_theta, .neox_half);
++    }
++    try std.testing.expect(maxDiff(want_k, k) < 1e-12);
++}
++
++// ---- the engine-layout twins and their mutants --------------------------------------------------------------------
++
++fn ringRun(a: std.mem.Allocator, sw: ref.Switches, cap_extra: usize, m: twin.RingMutant) !f64 {
++    const d = try tinyDraft(a, 31, .{}, sw);
++    const c = d.cfg;
++    const fnorm = try rnd(fixedRandom(), a, c.hidden, 0.3);
++    const total: usize = 16;
++    const feats = try features(a, 41, c, &tap_ids, fake_layers, total, fnorm);
++    const row = c.n_taps * c.hidden;
++    var ring = try twin.Ring.init(a, &d, c.window + cap_extra, m);
++    var worst: f64 = 0;
++    var next: usize = 0;
++    for ([_]usize{ 3, 7, 8, 13, 16 }) |p| { // pending positions: a step absorbs the kept rows, then drafts
++        while (next < p) : (next += 1) try ring.absorb(a, feats[next * row ..][0..row], next + 1 == p);
++        const cx_ref = try ref.buildCtx(&d, a, feats, 0, p);
++        const want = try ref.blockForward(&d, a, &cx_ref, 4, p);
++        const cx = try ring.ctx(a);
++        const got = try ref.blockForward(&d, a, &cx, 4, p);
++        worst = @max(worst, maxDiff(want.pre, got.pre));
++        worst = @max(worst, maxDiff(want.post, got.post));
++    }
++    return worst;
++}
++
++test "ring twin: the incremental K/V ring equals recomputing the context from features, at the window and with slack" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]ref.WindowRule{ .per_row, .context_tail }) |rule| {
++        // a ring of window + 4 (the engine keeps window + window_rows) and one of exactly the window match bit for bit
++        try std.testing.expectEqual(@as(f64, 0), try ringRun(a, .{ .window_rule = rule }, 4, .none));
++        try std.testing.expectEqual(@as(f64, 0), try ringRun(a, .{ .window_rule = rule }, 0, .none));
++    }
++}
++
++test "ring twin mutants: each planted fault is caught" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]ref.WindowRule{ .per_row, .context_tail }) |rule| {
++        for ([_]twin.RingMutant{ .short_ring, .rope_at_slot, .stale_slot, .drop_last_absorb }) |m| {
++            const worst = try ringRun(a, .{ .window_rule = rule }, 4, m);
++            if (worst <= 1e-6) {
++                std.debug.print("ring mutant {t} under {t} slipped through ({e})\n", .{ m, rule, worst });
++                return error.MutantSurvived;
++            }
++        }
++    }
++}
++
++fn tpRun(a: std.mem.Allocator, sw: ref.Switches, world: usize, m: twin.TpMutant) !f64 {
++    const d = try tinyDraft(a, 51, .{}, sw);
++    const c = d.cfg;
++    const fnorm = try rnd(fixedRandom(), a, c.hidden, 0.3);
++    const p: usize = 9;
++    const feats = try features(a, 61, c, &tap_ids, fake_layers, p, fnorm);
++    const cx = try ref.buildCtx(&d, a, feats, 0, p);
++    const want = try ref.blockForward(&d, a, &cx, 3, p);
++    const got = try twin.blockForwardTp(&d, a, &cx, 3, p, world, m);
++    return @max(maxDiff(want.pre, got.pre), maxDiff(want.post, got.post));
++}
++
++test "tp twin: one rank and two ranks (heads, kv groups, FFN rows cut; partial sums added in rank order) equal the reference" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]usize{ 1, 2 }) |world| {
++        try std.testing.expect(try tpRun(a, .{}, world, .none) < 1e-10);
++        try std.testing.expect(try tpRun(a, .{ .block_attention = .causal, .window_rule = .context_tail }, world, .none) < 1e-10);
++        try std.testing.expect(try tpRun(a, .{ .base = .{ .bf16_proj_out = true, .bf16_act_out = true } }, world, .none) < 1e-2);
++    }
++}
++
++test "tp twin mutants: each planted fault is caught" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]twin.TpMutant{ .drop_last_head, .swap_kv_groups, .ffn_overlap, .drop_exchange }) |m| {
++        const worst = try tpRun(a, .{}, 2, m);
++        if (worst <= 1e-6) {
++            std.debug.print("tp mutant {t} slipped through ({e})\n", .{ m, worst });
++            return error.MutantSurvived;
++        }
++    }
++}
++
++// ---- the Markov chain, the confidence head, the per-rank gather ---------------------------------------------------
++
++/// A draft over 8 tokens whose Markov head forces the chain prev -> sigma(prev), for hand-checkable drafts.
++fn chainDraft(a: std.mem.Allocator, sw: ref.Switches) !ref.Draft {
++    var d = try tinyDraft(a, 77, .{ .vocab = 8, .rank = 8, .markov_scale = 0 }, sw);
++    const sigma = [_]usize{ 3, 5, 0, 7, 1, 2, 6, 4 };
++    const w1 = try a.alloc(f64, 64);
++    const w2 = try a.alloc(f64, 64);
++    @memset(w1, 0);
++    @memset(w2, 0);
++    for (0..8) |prev| {
++        w1[prev * 8 + prev] = 1000; // bias(prev, id) = 1000 * w2[id][prev]
++        w2[sigma[prev] * 8 + prev] = 1; // ... which is 1000 for id = sigma(prev)
++    }
++    d.markov_w1 = w1;
++    d.markov_w2 = w2;
++    return d;
++}
++
++fn chainOf(a: std.mem.Allocator, d: *const ref.Draft, anchor: usize) ![]usize {
++    const c = d.cfg;
++    const fnorm = try rnd(fixedRandom(), a, c.hidden, 0.3);
++    const feats = try features(a, 81, c, &tap_ids, fake_layers, 5, fnorm);
++    const cx = try ref.buildCtx(d, a, feats, 0, 5);
++    const b = try ref.blockForward(d, a, &cx, anchor, 5);
++    const drafts = try a.alloc(usize, ref.draftCount(c.sw, c.block));
++    const conf = try a.alloc(f64, drafts.len);
++    try ref.chain(d, a, b, anchor, drafts, conf);
++    return drafts;
++}
++
++test "chain: a Markov head that forces prev -> sigma(prev) is followed from the anchor, whatever the base logits say" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const sigma = [_]usize{ 3, 5, 0, 7, 1, 2, 6, 4 };
++    const d = try chainDraft(a, .{});
++    for ([_]usize{ 0, 4, 6 }) |anchor| {
++        const got = try chainOf(a, &d, anchor);
++        var prev = anchor;
++        for (got) |t| {
++            try std.testing.expectEqual(sigma[prev], t);
++            prev = t;
++        }
++    }
++    // swapped tables: the bias is 1000 * w1[id][prev-th w2 column], which does not follow sigma
++    const swapped = try chainDraft(a, .{ .markov_swap = true });
++    const got = try chainOf(a, &swapped, 0);
++    var prev: usize = 0;
++    var follows = true;
++    for (got) |t| {
++        follows = follows and t == sigma[prev];
++        prev = t;
++    }
++    try std.testing.expect(!follows);
++    // no previous token for the first draft: it is the base argmax; the rest follow sigma
++    const none = try chainDraft(a, .{ .first_prev = .none });
++    const g = try chainOf(a, &none, 0);
++    try std.testing.expectEqual(sigma[g[0]], g[1]);
++    try std.testing.expectEqual(sigma[g[1]], g[2]);
++    // DFlash's rows: one draft fewer
++    const rows = try chainDraft(a, .{ .draft_rows = .rows_after_anchor });
++    try std.testing.expectEqual(@as(usize, 3), (try chainOf(a, &rows, 0)).len);
++}
++
++test "chain: candidates = the whole vocabulary equals the full vocabulary; a small candidate list stays inside the base top" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const full = try tinyDraft(a, 90, .{ .markov_scale = 2.0 }, .{});
++    var wide = try tinyDraft(a, 90, .{ .markov_scale = 2.0 }, .{ .markov_domain = .candidates });
++    wide.cfg.candidates = wide.cfg.vocab;
++    try std.testing.expectEqualSlices(usize, try chainOf(a, &full, 3), try chainOf(a, &wide, 3));
++    var narrow = try tinyDraft(a, 90, .{ .markov_scale = 2.0 }, .{ .markov_domain = .candidates });
++    narrow.cfg.candidates = 1;
++    var plain = try tinyDraft(a, 90, .{ .markov_scale = 0 }, .{});
++    // one candidate: every draft is its row's base argmax, which a zero Markov table also gives
++    try std.testing.expectEqualSlices(usize, try chainOf(a, &plain, 3), try chainOf(a, &narrow, 3));
++}
++
++test "confidence: sigmoid(w . [h ; markov_w1[prev]] + b), the logit when asked, no Markov part without a previous token" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var d = try tinyDraft(a, 5, .{}, .{ .aux_bf16 = false });
++    const c = d.cfg;
++    const z = try a.alloc(f64, c.hidden);
++    @memset(z, 0);
++    const w = try a.alloc(f64, c.hidden + c.rank);
++    @memset(w, 0);
++    d.conf_w = w;
++    d.conf_b = 0.75;
++    try std.testing.expectApproxEqAbs(mr.sigmoid(0.75), try ref.confidence(&d, a, z, z, 7), 1e-15);
++    // h = e0, w[0] = 2; markov part: w1[3] . w[hidden..]
++    z[0] = 1;
++    w[0] = 2;
++    for (w[c.hidden..], 0..) |*x, i| x.* = @floatFromInt(i + 1);
++    var want: f64 = 0.75 + 2.0;
++    try std.testing.expectApproxEqAbs(mr.sigmoid(want), try ref.confidence(&d, a, z, z, null), 1e-15);
++    for (d.markov_w1[3 * c.rank ..][0..c.rank], 0..) |x, i| want += x * @as(f64, @floatFromInt(i + 1));
++    try std.testing.expectApproxEqAbs(mr.sigmoid(want), try ref.confidence(&d, a, z, z, 3), 1e-12);
++    d.cfg.sw.conf_sigmoid = false;
++    try std.testing.expectApproxEqAbs(want, try ref.confidence(&d, a, z, z, 3), 1e-12);
++}
++
++test "confidence gate: the running product cuts earlier than each alone; the first `least` drafts always stay" {
++    const conf = [_]f64{ 0.9, 0.9, 0.9, 0.9 };
++    try std.testing.expectEqual(@as(usize, 3), ref.gateLen(.{}, &conf, 0.7, 0));
++    try std.testing.expectEqual(@as(usize, 4), ref.gateLen(.{ .conf_gate = .each }, &conf, 0.7, 0));
++    const cliff = [_]f64{ 0.9, 0.9, 0.5, 0.99 };
++    try std.testing.expectEqual(@as(usize, 2), ref.gateLen(.{}, &cliff, 0.6, 0));
++    try std.testing.expectEqual(@as(usize, 2), ref.gateLen(.{ .conf_gate = .each }, &cliff, 0.6, 0));
++    try std.testing.expectEqual(@as(usize, 2), ref.gateLen(.{}, &cliff, 0.85, 2));
++    try std.testing.expectEqual(@as(usize, 1), ref.gateLen(.{}, &cliff, 0.85, 0));
++}
++
++test "gather twin: per-rank candidate lists agree with the full argmax; planted mutants are caught" {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const d = try tinyDraft(a, 123, .{ .vocab = 24, .rank = 4, .markov_scale = 1.0 }, .{});
++    var base: [24]f64 = undefined;
++    for (&base, 0..) |*b, i| b.* = @as(f64, @floatFromInt((i * 7) % 24)) * 0.1; // distinct
++    // make the true winner (base + bias) live in the last rank's slice and keep it inside its top 3
++    const prev: usize = 2;
++    var winner: usize = 12;
++    var bz: f64 = -1e9;
++    for (0..24) |id| {
++        const z = base[id] + ref.markovBias(&d, prev, id);
++        if (z > bz) {
++            bz = z;
++            winner = id;
++        }
++    }
++    // clean: with per = the slice, the gather is the whole vocabulary
++    try std.testing.expectEqual(winner, try twin.gatherPick(&d, &base, prev, 2, 12, .none, a));
++    // ... and the engine's narrow lists agree whenever the winner is in them: widen the winner's base so it is
++    var boosted = base;
++    boosted[winner] += 5;
++    var best: usize = 0;
++    var bb: f64 = -1e9;
++    for (0..24) |id| {
++        const z = boosted[id] + ref.markovBias(&d, prev, id);
++        if (z > bb) {
++            bb = z;
++            best = id;
++        }
++    }
++    try std.testing.expectEqual(best, try twin.gatherPick(&d, &boosted, prev, 2, 3, .none, a));
++    // mutants: dropping the last rank loses a winner living there; unshifted ids move the pick; a tie shows the rule
++    try std.testing.expect(best != try twin.gatherPick(&d, &boosted, prev, 2, 3, .ids_not_offset, a) or best < 12);
++    if (best >= 12) try std.testing.expect(best != try twin.gatherPick(&d, &boosted, prev, 2, 3, .drop_last_rank, a));
++    // an exact tie in z between a higher-base id listed first and a lower id: the lower id must win
++    var tie: [24]f64 = @splat(-100);
++    const hi_id: usize = 5;
++    const lo_id: usize = 2;
++    const bias_hi = ref.markovBias(&d, prev, hi_id);
++    const bias_lo = ref.markovBias(&d, prev, lo_id);
++    tie[hi_id] = 50 + (bias_lo - bias_hi) * 0 + 1; // z_hi = 51 + bias_hi
++    tie[lo_id] = tie[hi_id] + bias_hi - bias_lo; // z_lo = z_hi exactly (same sum, up to rounding)
++    const zhi = tie[hi_id] + bias_hi;
++    const zlo = tie[lo_id] + bias_lo;
++    if (zhi == zlo) {
++        try std.testing.expectEqual(lo_id, try twin.gatherPick(&d, &tie, prev, 2, 3, .none, a));
++        if (tie[hi_id] > tie[lo_id]) try std.testing.expectEqual(hi_id, try twin.gatherPick(&d, &tie, prev, 2, 3, .first_lowest, a));
++    }
++}
+diff --git a/zig/src/families/minimax_m3/dspark_names.zig b/zig/src/families/minimax_m3/dspark_names.zig
+new file mode 100644
+index 0000000..7ca6813
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_names.zig
+@@ -0,0 +1,193 @@
++//! The draft's tensor names (VERIFIED from the pack's header): `language_model.model.dspark.` and its layers.
++const std = @import("std");
++// It has no embedding or head tensor: it must use the target's (UNVERIFIED).
++const names = @import("names.zig");
++
++pub const root = "language_model.model.dspark.";
++pub const Buf = names.Buf;
++pub const Cut = names.Cut;
++
++/// The seven linear layers of a draft layer: float8 codes `weight` [n, k] and a ue8m0 `weight_scale_inv` [n, k / 32].
++pub const Lin = enum {
++    q,
++    k,
++    v,
++    o,
++    gate,
++    up,
++    down,
++
++    fn tail(p: Lin) []const u8 {
++        return switch (p) {
++            .q => "self_attn.q_proj",
++            .k => "self_attn.k_proj",
++            .v => "self_attn.v_proj",
++            .o => "self_attn.o_proj",
++            .gate => "mlp.gate_proj",
++            .up => "mlp.up_proj",
++            .down => "mlp.down_proj",
++        };
++    }
++
++    /// The axis a tensor-parallel rank cuts, as the target's matrices are: o and down cut input rows (partial sums).
++    pub fn cut(p: Lin) Cut {
++        return switch (p) {
++            .o, .down => .row,
++            else => .col,
++        };
++    }
++};
++
++pub const Part = enum {
++    weight,
++    weight_scale_inv,
++
++    fn tail(p: Part) []const u8 {
++        return @tagName(p);
++    }
++};
++
++/// Tensors stored as bf16: the quantization_config ignores fc, the Markov tables and the confidence projection.
++pub const Plain = enum {
++    fc, // [hidden, taps x hidden]
++    hidden_norm, // [hidden]
++    final_norm, // [hidden]
++    markov_w1, // [vocab, rank]
++    markov_w2, // [vocab, rank]
++    conf_w, // [1, hidden + rank]
++    conf_b, // [1]
++    input_ln, // layer: [hidden]
++    post_ln,
++    q_norm, // layer: [head_dim]
++    k_norm,
++
++    pub fn isLayer(p: Plain) bool {
++        return switch (p) {
++            .input_ln, .post_ln, .q_norm, .k_norm => true,
++            else => false,
++        };
++    }
++
++    /// RMS norm weights (what a Gemma-style offset could apply to).
++    pub fn isNorm(p: Plain) bool {
++        return p.isLayer() or p == .hidden_norm or p == .final_norm;
++    }
++
++    fn tail(p: Plain) []const u8 {
++        return switch (p) {
++            .fc => "fc.weight",
++            .hidden_norm => "hidden_norm.weight",
++            .final_norm => "final_norm.weight",
++            .markov_w1 => "markov_head.markov_w1.weight",
++            .markov_w2 => "markov_head.markov_w2.weight",
++            .conf_w => "confidence_head.proj.weight",
++            .conf_b => "confidence_head.proj.bias",
++            .input_ln => "input_layernorm.weight",
++            .post_ln => "post_attention_layernorm.weight",
++            .q_norm => "self_attn.q_norm.weight",
++            .k_norm => "self_attn.k_norm.weight",
++        };
++    }
++};
++
++const layer_mid = "layers.{d}.decoder_layer.";
++
++pub fn lin(buf: *Buf, p: Lin, layer: u32, part: Part) []const u8 {
++    return std.fmt.bufPrint(buf, root ++ layer_mid ++ "{s}.{s}", .{ layer, p.tail(), part.tail() }) catch unreachable;
++}
++
++pub fn plain(buf: *Buf, p: Plain, layer: u32) []const u8 {
++    const r = if (p.isLayer()) std.fmt.bufPrint(buf, root ++ layer_mid ++ "{s}", .{ layer, p.tail() }) else std.fmt.bufPrint(buf, root ++ "{s}", .{p.tail()});
++    return r catch unreachable;
++}
++
++/// A tensor name taken apart.
++pub const Name = struct {
++    layer: u32 = 0,
++    what: union(enum) { plain: Plain, lin: struct { proj: Lin, part: Part } },
++};
++
++fn number(s: *[]const u8) ?u32 {
++    const end = std.mem.indexOfScalar(u8, s.*, '.') orelse return null;
++    if (end == 0 or end > 3 or (end > 1 and s.*[0] == '0')) return null; // one spelling per index
++    const n = std.fmt.parseInt(u32, s.*[0..end], 10) catch return null;
++    s.* = s.*[end + 1 ..];
++    return n;
++}
++
++/// The role of a checkpoint tensor name, or null for a name this family does not know.
++pub fn parse(name: []const u8) ?Name {
++    if (!std.mem.startsWith(u8, name, root)) return null;
++    var rest = name[root.len..];
++    for (std.enums.values(Plain)) |p| {
++        if (!p.isLayer() and std.mem.eql(u8, rest, p.tail())) return .{ .what = .{ .plain = p } };
++    }
++    const lead = "layers.";
++    if (!std.mem.startsWith(u8, rest, lead)) return null;
++    rest = rest[lead.len..];
++    var out: Name = .{ .what = undefined };
++    out.layer = number(&rest) orelse return null;
++    const mid = "decoder_layer.";
++    if (!std.mem.startsWith(u8, rest, mid)) return null;
++    rest = rest[mid.len..];
++    for (std.enums.values(Plain)) |p| {
++        if (p.isLayer() and std.mem.eql(u8, rest, p.tail())) {
++            out.what = .{ .plain = p };
++            return out;
++        }
++    }
++    for (std.enums.values(Lin)) |p| {
++        const t = p.tail();
++        if (rest.len > t.len + 1 and std.mem.startsWith(u8, rest, t) and rest[t.len] == '.') {
++            const part = std.meta.stringToEnum(Part, rest[t.len + 1 ..]) orelse return null;
++            out.what = .{ .lin = .{ .proj = p, .part = part } };
++            return out;
++        }
++    }
++    return null;
++}
++
++test "names round-trip through parse for every role" {
++    var b1: Buf = undefined;
++    for (std.enums.values(Plain)) |p| {
++        const n = parse(plain(&b1, p, 4)).?;
++        try std.testing.expectEqual(p, n.what.plain);
++        try std.testing.expectEqual(@as(u32, if (p.isLayer()) 4 else 0), n.layer);
++    }
++    for (std.enums.values(Lin)) |p| for (std.enums.values(Part)) |w| {
++        const n = parse(lin(&b1, p, 3, w)).?;
++        try std.testing.expectEqual(p, n.what.lin.proj);
++        try std.testing.expectEqual(w, n.what.lin.part);
++        try std.testing.expectEqual(@as(u32, 3), n.layer);
++    };
++}
++
++test "the checkpoint's spellings" {
++    var b: Buf = undefined;
++    try std.testing.expectEqualStrings("language_model.model.dspark.layers.2.decoder_layer.mlp.down_proj.weight_scale_inv", lin(&b, .down, 2, .weight_scale_inv));
++    try std.testing.expectEqualStrings("language_model.model.dspark.layers.0.decoder_layer.self_attn.q_norm.weight", plain(&b, .q_norm, 0));
++    try std.testing.expectEqualStrings("language_model.model.dspark.markov_head.markov_w2.weight", plain(&b, .markov_w2, 9));
++    try std.testing.expectEqualStrings("language_model.model.dspark.confidence_head.proj.bias", plain(&b, .conf_b, 9));
++    try std.testing.expectEqualStrings("language_model.model.dspark.fc.weight", plain(&b, .fc, 9));
++}
++
++test "unknown, misspelled and non-canonical names are not roles" {
++    for ([_][]const u8{
++        "language_model.model.layers.3.self_attn.q_proj.weight", // the target's namespace
++        "language_model.model.dspark.layers.03.decoder_layer.mlp.up_proj.weight",
++        "language_model.model.dspark.layers.0.decoder_layer.mlp.up_proj.bias",
++        "language_model.model.dspark.layers.0.decoder_layer.mlp.up_proj.weight_scale",
++        "language_model.model.dspark.layers.0.decoder_layer.self_attn.index_q_proj.weight",
++        "language_model.model.dspark.layers.0.input_layernorm.weight", // no decoder_layer
++        "language_model.model.dspark.embed_tokens.weight", // the draft carries no embedding
++        "language_model.model.dspark.lm_head.weight", // and no head
++        "language_model.model.dspark.markov_head.embed.weight", // DeepSeek's spelling, not this pack's
++        "language_model.model.dspark.layers.0.decoder_layer.",
++    }) |bad| try std.testing.expect(parse(bad) == null);
++}
++
++test "o and down cut input rows, everything else output columns" {
++    for (std.enums.values(Lin)) |p| {
++        try std.testing.expectEqual(if (p == .o or p == .down) Cut.row else Cut.col, p.cut());
++    }
++}
+diff --git a/zig/src/families/minimax_m3/dspark_ref.zig b/zig/src/families/minimax_m3/dspark_ref.zig
+new file mode 100644
+index 0000000..424ddf0
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_ref.zig
+@@ -0,0 +1,539 @@
++//! The dspark draft on the CPU in float64: mxfp8 decode, taps, context state, a draft block, Markov chain, confidence.
++const std = @import("std");
++// The upstream modeling code was unavailable: every semantic not forced by a shape is a `Switches` field, UNVERIFIED.
++const core = @import("core");
++// Defaults follow what TensorFold ships (deepseek_v41 DSpark chain, qwen3_5 DFlash2 taps, fc and K/V ring).
++const mr = core.minimax_ref;
++
++// ---- mxfp8 ------------------------------------------------------------------------------------------------------
++
++/// float8 e4m3 (OCP "FN" form, bias 7, no infinities): 0x7F and 0xFF are NaN, exponent 0 is subnormal (m / 8 * 2^-6).
++pub fn e4m3(code: u8) f64 {
++    const sign: f64 = if (code & 0x80 != 0) -1 else 1;
++    const e: i32 = (code >> 3) & 0xF;
++    const m: f64 = @floatFromInt(code & 7);
++    if (e == 0xF and (code & 7) == 7) return std.math.nan(f64);
++    if (e == 0) return sign * m * 0x1p-9;
++    return sign * (1 + m / 8) * std.math.ldexp(@as(f64, 1), e - 7);
++}
++
++/// A ue8m0 scale byte: 2^(byte - bias), 255 is NaN. UNVERIFIED bias 127 (k_proj bytes sit at 114-118).
++pub fn ue8m0(b: u8, bias: i32) f64 {
++    if (b == 255) return std.math.nan(f64);
++    return std.math.ldexp(@as(f64, 1), @as(i32, b) - bias);
++}
++
++/// w[j][i] = e4m3(codes[j][i]) * ue8m0(scales[j][i / block]) for a [n, k] matrix.
++pub fn dequant(codes: []const u8, scales: []const u8, n: usize, k: usize, block: usize, bias: i32, out: []f64) void {
++    for (0..n) |j| for (0..k) |i| {
++        out[j * k + i] = e4m3(codes[j * k + i]) * ue8m0(scales[j * (k / block) + i / block], bias);
++    };
++}
++
++// ---- switches ---------------------------------------------------------------------------------------------------
++
++/// UNVERIFIED: which residual a tap of layer `id` reads: its output (HF hidden_states[id + 1]) or its input.
++pub const TapSite = enum { layer_output, layer_input };
++/// UNVERIFIED: fc's input is the taps side by side in config order; reversed is the planted alternative.
++pub const ConcatOrder = enum { listed, reversed };
++/// UNVERIFIED: sliding_window: per_row (seen iff rp - kp < window) or context_tail (the last `window` context rows).
++pub const WindowRule = enum { per_row, context_tail };
++/// UNVERIFIED: rows of the draft block see each other (DFlash/DSpark blocks are parallel) or only earlier rows.
++pub const BlockAttention = enum { bidirectional, causal };
++/// UNVERIFIED: block row i sits at position P + i (P: the pending token's), or every row at P.
++pub const BlockPositions = enum { consecutive, all_pending };
++/// UNVERIFIED: next_token_all_rows (row i gives the token at P + 1 + i, `block` drafts) or rows 1.. (DFlash).
++pub const DraftRows = enum { next_token_all_rows, rows_after_anchor };
++/// UNVERIFIED: the Markov bias is added over the whole vocabulary or only to the top `candidates` of the base logits.
++pub const MarkovDomain = enum { full_vocab, candidates };
++/// UNVERIFIED: the first draft's previous token is the anchor (pending token) or none (no bias, zero embedding).
++pub const FirstPrev = enum { anchor, none };
++/// UNVERIFIED: the confidence head reads the block's hidden row after final_norm or before it.
++pub const ConfInput = enum { post_final_norm, pre_final_norm };
++/// UNVERIFIED: how per-draft confidences cut a block: the running product, or each one alone.
++pub const ConfGate = enum { product, each };
++
++pub const Switches = struct {
++    /// Target-side switches the draft shares (rope layout, swigluoai, Gemma offsets, bf16 points): mr.Switches.
++    base: mr.Switches = .{},
++    tap_site: TapSite = .layer_output,
++    /// UNVERIFIED: the tap of the last layer is read after the model's final norm (HF's last hidden_states entry is).
++    last_tap_post_norm: bool = false,
++    /// UNVERIFIED: the taps reach fc as bf16 (the engine would store them so).
++    tap_bf16: bool = true,
++    concat_order: ConcatOrder = .listed,
++    /// UNVERIFIED: hidden_norm and final_norm use 1 + w (hidden_norm's mean is 0.05, final_norm's 0.41).
++    gemma_hidden_norm: bool = true,
++    gemma_final_norm: bool = true,
++    /// UNVERIFIED: the context state passes each layer's input_layernorm before that layer's k_proj and v_proj.
++    ctx_input_norm: bool = false,
++    window_rule: WindowRule = .per_row,
++    block_attention: BlockAttention = .bidirectional,
++    block_positions: BlockPositions = .consecutive,
++    draft_rows: DraftRows = .next_token_all_rows,
++    markov_domain: MarkovDomain = .full_vocab,
++    /// UNVERIFIED: bias(prev, id) = markov_w2[id] . markov_w1[prev]; true swaps the two tables.
++    markov_swap: bool = false,
++    first_prev: FirstPrev = .anchor,
++    conf_input: ConfInput = .post_final_norm,
++    /// UNVERIFIED: the confidence is sigmoid(w . [h ; markov_w1[prev]] + b); false returns the logit.
++    conf_sigmoid: bool = true,
++    conf_gate: ConfGate = .product,
++    /// UNVERIFIED: the auxiliary GEMMs (head logits, Markov, confidence) take bf16 inputs (dspark_aux_gemm_precision).
++    aux_bf16: bool = true,
++    /// UNVERIFIED: ue8m0 exponent bias.
++    scale_bias: i32 = 127,
++};
++
++/// The draft's draft count and the row giving draft i under the switch.
++pub fn draftCount(sw: Switches, block: usize) usize {
++    return switch (sw.draft_rows) {
++        .next_token_all_rows => block,
++        .rows_after_anchor => block - 1,
++    };
++}
++
++pub fn rowFor(sw: Switches, i: usize) usize {
++    return switch (sw.draft_rows) {
++        .next_token_all_rows => i,
++        .rows_after_anchor => i + 1,
++    };
++}
++
++pub const Config = struct {
++    hidden: usize = 6144,
++    n_q: usize = 64,
++    n_kv: usize = 4,
++    head_dim: usize = 128,
++    rot_dim: usize = 64,
++    rope_theta: f64 = 1e7,
++    eps: f64 = 1e-6,
++    ffn: usize = 12288,
++    layers: usize = 5,
++    n_taps: usize = 5,
++    window: usize = 4096,
++    block: usize = 7,
++    mask_token: usize = 200058,
++    rank: usize = 256,
++    vocab: usize = 200064,
++    candidates: usize = 64,
++    alpha: f64 = 1.702,
++    limit: f64 = 7.0,
++    sw: Switches = .{},
++
++    pub fn rep(c: Config) usize {
++        return c.n_q / c.n_kv;
++    }
++    pub fn kvw(c: Config) usize {
++        return c.n_kv * c.head_dim;
++    }
++};
++
++/// y = W x for W stored [n][k] row-major, the checkpoint's layout (the target's ref.Linear is [k][n]).
++pub const Dense = struct {
++    n: usize,
++    k: usize,
++    w: []const f64,
++
++    pub fn apply(d: Dense, x: []const f64, out: []f64) void {
++        d.applyRows(0, d.n, x, out);
++    }
++
++    /// Output rows [lo, hi) only.
++    pub fn applyRows(d: Dense, lo: usize, hi: usize, x: []const f64, out: []f64) void {
++        for (lo..hi) |j| {
++            var s: f64 = 0;
++            for (x[0..d.k], d.w[j * d.k ..][0..d.k]) |a, b| s += a * b;
++            out[j - lo] = s;
++        }
++    }
++
++    /// Inputs [lo, lo + x.len) only, all output rows: the partial sum of a row-cut layer.
++    pub fn applyCols(d: Dense, lo: usize, x: []const f64, out: []f64) void {
++        for (0..d.n) |j| {
++            var s: f64 = 0;
++            for (x, d.w[j * d.k + lo ..][0..x.len]) |a, b| s += a * b;
++            out[j] = s;
++        }
++    }
++};
++
++pub const Layer = struct {
++    input_norm: []const f64,
++    post_norm: []const f64,
++    q_norm: []const f64,
++    k_norm: []const f64,
++    q: Dense,
++    k: Dense,
++    v: Dense,
++    o: Dense,
++    gate: Dense,
++    up: Dense,
++    down: Dense,
++};
++
++pub const Draft = struct {
++    cfg: Config,
++    fc: Dense, // [hidden, n_taps x hidden]
++    hidden_norm: []const f64,
++    final_norm: []const f64,
++    layers: []const Layer,
++    markov_w1: []const f64, // [vocab][rank]
++    markov_w2: []const f64,
++    conf_w: []const f64, // [hidden + rank]
++    conf_b: f64,
++    /// The TARGET's embedding [vocab][hidden] and lm_head [vocab, hidden]: the draft has neither (UNVERIFIED reuse).
++    embed: []const f64,
++    head: Dense,
++};
++
++// ---- small pieces -----------------------------------------------------------------------------------------------
++
++pub fn norm(c: Config, x: []const f64, w: []const f64, gemma: bool, out: []f64) void {
++    mr.gemmaNorm(x, w, c.eps, gemma, out);
++    mr.roundAll(c.sw.base.bf16_norm_out, out);
++}
++
++/// Per-head norm then RoPE at `pos` (null: none) over `n` heads of x.
++pub fn heads(c: Config, x: []f64, n: usize, w: []const f64, pos: ?usize) void {
++    const d = c.head_dim;
++    var t: [256]f64 = undefined;
++    for (0..n) |h| {
++        const s = x[h * d ..][0..d];
++        norm(c, s, w, c.sw.base.gemma_qk_norms, t[0..d]);
++        @memcpy(s, t[0..d]);
++        if (pos) |p| mr.rope(s, c.rot_dim, p, c.rope_theta, c.sw.base.rope_layout);
++        mr.roundAll(c.sw.base.bf16_rope_out, s);
++    }
++}
++
++/// A target residual a tap reads: index r (0 = embeddings, r = output of layer r - 1), and whether final norm applies.
++pub const TapSource = struct { r: usize, normed: bool };
++
++pub fn tapSource(sw: Switches, id: usize, target_layers: usize) TapSource {
++    const r = switch (sw.tap_site) {
++        .layer_output => id + 1,
++        .layer_input => id,
++    };
++    return .{ .r = r, .normed = sw.last_tap_post_norm and r == target_layers };
++}
++
++/// One token's tapped row (n_taps x hidden, config order) from the target's residuals; bf16 rounding: contextState.
++pub fn tapRow(c: Config, ids: []const usize, target_layers: usize, resid: []const []const f64, target_final_norm: []const f64, target_gemma: bool, out: []f64) void {
++    for (ids, 0..) |id, t| {
++        const src = tapSource(c.sw, id, target_layers);
++        const dst = out[t * c.hidden ..][0..c.hidden];
++        if (src.normed) mr.gemmaNorm(resid[src.r], target_final_norm, c.eps, target_gemma, dst) else @memcpy(dst, resid[src.r][0..c.hidden]);
++    }
++}
++
++// ---- the context --------------------------------------------------------------------------------------------------
++
++/// The context state of one token: hidden_norm(fc(taps)). `taps` is n_taps x hidden in config order.
++pub fn contextState(d: *const Draft, a: std.mem.Allocator, taps: []const f64, out: []f64) !void {
++    const c = d.cfg;
++    const in = try a.alloc(f64, c.n_taps * c.hidden);
++    defer a.free(in);
++    for (0..c.n_taps) |t| {
++        const src = if (c.sw.concat_order == .listed) t else c.n_taps - 1 - t;
++        @memcpy(in[t * c.hidden ..][0..c.hidden], taps[src * c.hidden ..][0..c.hidden]);
++    }
++    mr.roundAll(c.sw.tap_bf16, in);
++    const y = try a.alloc(f64, c.hidden);
++    defer a.free(y);
++    d.fc.apply(in, y);
++    mr.roundAll(c.sw.base.bf16_proj_out, y);
++    norm(c, y, d.hidden_norm, c.sw.gemma_hidden_norm, out);
++}
++
++/// Layer `l`'s K (normed, rotated at `pos`) and V of one context token, all kv heads: [n_kv x head_dim] each.
++pub fn contextKv(d: *const Draft, a: std.mem.Allocator, l: usize, ctx_state: []const f64, pos: usize, k: []f64, v: []f64) !void {
++    const c = d.cfg;
++    const ly = d.layers[l];
++    var x = ctx_state;
++    var tmp: ?[]f64 = null;
++    defer if (tmp) |t| a.free(t);
++    if (c.sw.ctx_input_norm) {
++        tmp = try a.alloc(f64, c.hidden);
++        norm(c, ctx_state, ly.input_norm, c.sw.base.gemma_layer_norms, tmp.?);
++        x = tmp.?;
++    }
++    ly.k.apply(x, k);
++    ly.v.apply(x, v);
++    mr.roundAll(c.sw.base.bf16_proj_out, k);
++    mr.roundAll(c.sw.base.bf16_proj_out, v);
++    heads(c, k, c.n_kv, ly.k_norm, pos);
++}
++
++/// The context K/V of positions first .. first + n - 1, every layer: `k[l]` and `v[l]` are [n][kvw].
++pub const Ctx = struct {
++    first: usize,
++    n: usize,
++    k: [][]f64,
++    v: [][]f64,
++
++    pub fn alloc(a: std.mem.Allocator, c: Config, first: usize, n: usize) !Ctx {
++        const k = try a.alloc([]f64, c.layers);
++        const v = try a.alloc([]f64, c.layers);
++        for (k, v) |*kk, *vv| {
++            kk.* = try a.alloc(f64, n * c.kvw());
++            vv.* = try a.alloc(f64, n * c.kvw());
++        }
++        return .{ .first = first, .n = n, .k = k, .v = v };
++    }
++};
++
++/// The reference context: every row recomputed from its tapped features (`feats`: [n][n_taps x hidden]).
++pub fn buildCtx(d: *const Draft, a: std.mem.Allocator, feats: []const f64, first: usize, n: usize) !Ctx {
++    const c = d.cfg;
++    const cx = try Ctx.alloc(a, c, first, n);
++    const st = try a.alloc(f64, c.hidden);
++    defer a.free(st);
++    for (0..n) |j| {
++        try contextState(d, a, feats[j * c.n_taps * c.hidden ..][0 .. c.n_taps * c.hidden], st);
++        for (0..c.layers) |l| try contextKv(d, a, l, st, first + j, cx.k[l][j * c.kvw() ..][0..c.kvw()], cx.v[l][j * c.kvw() ..][0..c.kvw()]);
++    }
++    return cx;
++}
++
++// ---- one draft block ----------------------------------------------------------------------------------------------
++
++/// The block's hidden rows [block][hidden]: `pre` before final_norm, `post` after it.
++pub const Block = struct { pre: []f64, post: []f64 };
++
++/// Whether a key at position `kp` is seen by the row at `rp` (the pending token sits at `p`).
++pub fn sees(sw: Switches, window: usize, kp: usize, rp: usize, p: usize) bool {
++    return switch (sw.window_rule) {
++        .per_row => kp <= rp and rp - kp < window,
++        .context_tail => kp + window >= p,
++    };
++}
++
++/// The block for the pending token `anchor` at position `p`, over the context `cx` (positions first .. p - 1 at most).
++pub fn blockForward(d: *const Draft, a: std.mem.Allocator, cx: *const Ctx, anchor: usize, p: usize) !Block {
++    const c = d.cfg;
++    const sw = c.sw;
++    const hd = c.head_dim;
++    const kvw = c.kvw();
++    const nb = c.block;
++    const rep = c.rep();
++    if (cx.first + cx.n > p) return error.ContextPastPending;
++    const h = try a.alloc(f64, nb * c.hidden);
++    for (0..nb) |i| {
++        const tok = if (i == 0) anchor else c.mask_token;
++        @memcpy(h[i * c.hidden ..][0..c.hidden], d.embed[tok * c.hidden ..][0..c.hidden]);
++    }
++    const x = try a.alloc(f64, c.hidden);
++    defer a.free(x);
++    const scale = std.math.pow(f64, @floatFromInt(hd), -0.5);
++    for (d.layers, 0..) |ly, l| {
++        const q = try a.alloc(f64, nb * c.n_q * hd);
++        defer a.free(q);
++        const kb = try a.alloc(f64, nb * kvw);
++        defer a.free(kb);
++        const vb = try a.alloc(f64, nb * kvw);
++        defer a.free(vb);
++        for (0..nb) |i| {
++            norm(c, h[i * c.hidden ..][0..c.hidden], ly.input_norm, sw.base.gemma_layer_norms, x);
++            const qi = q[i * c.n_q * hd ..][0 .. c.n_q * hd];
++            const ki = kb[i * kvw ..][0..kvw];
++            const vi = vb[i * kvw ..][0..kvw];
++            ly.q.apply(x, qi);
++            ly.k.apply(x, ki);
++            ly.v.apply(x, vi);
++            for ([_][]f64{ qi, ki, vi }) |t| mr.roundAll(sw.base.bf16_proj_out, t);
++            const pos = switch (sw.block_positions) {
++                .consecutive => p + i,
++                .all_pending => p,
++            };
++            heads(c, qi, c.n_q, ly.q_norm, pos);
++            heads(c, ki, c.n_kv, ly.k_norm, pos);
++        }
++        const attn = try a.alloc(f64, nb * c.n_q * hd);
++        defer a.free(attn);
++        for (0..nb) |i| {
++            const rp = switch (sw.block_positions) {
++                .consecutive => p + i,
++                .all_pending => p,
++            };
++            for (0..c.n_q) |hh| {
++                const g = hh / rep;
++                const qh = q[(i * c.n_q + hh) * hd ..][0..hd];
++                const total = cx.n + nb;
++                const s = try a.alloc(f64, total);
++                defer a.free(s);
++                var best: f64 = -std.math.inf(f64);
++                for (0..total) |j| {
++                    s[j] = -std.math.inf(f64);
++                    var key: []const f64 = undefined;
++                    if (j < cx.n) {
++                        if (!sees(sw, c.window, cx.first + j, rp, p)) continue;
++                        key = cx.k[l][j * kvw + g * hd ..][0..hd];
++                    } else {
++                        const m = j - cx.n;
++                        if (sw.block_attention == .causal and m > i) continue;
++                        key = kb[m * kvw + g * hd ..][0..hd];
++                    }
++                    var dot: f64 = 0;
++                    for (qh, key) |u, w| dot += u * w;
++                    s[j] = dot * scale;
++                    best = @max(best, s[j]);
++                }
++                var z: f64 = 0;
++                const out = attn[(i * c.n_q + hh) * hd ..][0..hd];
++                @memset(out, 0);
++                for (0..total) |j| {
++                    if (s[j] == -std.math.inf(f64)) continue;
++                    const w = @exp(s[j] - best);
++                    z += w;
++                    const val = if (j < cx.n) cx.v[l][j * kvw + g * hd ..][0..hd] else vb[(j - cx.n) * kvw + g * hd ..][0..hd];
++                    for (out, val) |*o, vv| o.* += w * vv;
++                }
++                for (out) |*o| o.* /= z;
++            }
++        }
++        mr.roundAll(sw.base.bf16_attn_out, attn);
++        const o = try a.alloc(f64, c.hidden);
++        defer a.free(o);
++        const g = try a.alloc(f64, c.ffn);
++        defer a.free(g);
++        const u = try a.alloc(f64, c.ffn);
++        defer a.free(u);
++        const f = try a.alloc(f64, c.hidden);
++        defer a.free(f);
++        for (0..nb) |i| {
++            const hi = h[i * c.hidden ..][0..c.hidden];
++            ly.o.apply(attn[i * c.n_q * hd ..][0 .. c.n_q * hd], o);
++            for (hi, o) |*hv, ov| hv.* = mr.round16(sw.base.bf16_residual, hv.* + ov);
++            norm(c, hi, ly.post_norm, sw.base.gemma_layer_norms, x);
++            ly.gate.apply(x, g);
++            ly.up.apply(x, u);
++            for (g, u) |*gv, uv| gv.* = mr.round16(sw.base.bf16_act_out, mr.swigluoai(gv.*, uv, c.alpha, c.limit, sw.base));
++            ly.down.apply(g, f);
++            for (hi, f) |*hv, fv| hv.* = mr.round16(sw.base.bf16_residual, hv.* + fv);
++        }
++    }
++    const post = try a.alloc(f64, nb * c.hidden);
++    for (0..nb) |i| norm(c, h[i * c.hidden ..][0..c.hidden], d.final_norm, sw.gemma_final_norm, post[i * c.hidden ..][0..c.hidden]);
++    return .{ .pre = h, .post = post };
++}
++
++// ---- heads ------------------------------------------------------------------------------------------------------
++
++fn auxRound(c: Config, x: []f64) void {
++    mr.roundAll(c.sw.aux_bf16, x);
++}
++
++/// The target's head applied to a (final-normed) draft row: logits over the vocabulary.
++pub fn baseLogits(d: *const Draft, a: std.mem.Allocator, row: []const f64, out: []f64) !void {
++    const x = try a.dupe(f64, row);
++    defer a.free(x);
++    auxRound(d.cfg, x);
++    d.head.apply(x, out);
++}
++
++/// Markov bias of candidate `id` after `prev`: the two tables' rows dotted (vanilla head, no nonlinearity).
++pub fn markovBias(d: *const Draft, prev: usize, id: usize) f64 {
++    const r = d.cfg.rank;
++    const a1 = if (d.cfg.sw.markov_swap) d.markov_w2 else d.markov_w1;
++    const a2 = if (d.cfg.sw.markov_swap) d.markov_w1 else d.markov_w2;
++    var s: f64 = 0;
++    for (a1[prev * r ..][0..r], a2[id * r ..][0..r]) |x, y| s += x * y;
++    return s;
++}
++
++/// The confidence of the draft that follows `prev` (null: the first draft with first_prev = none) from the block's row.
++pub fn confidence(d: *const Draft, a: std.mem.Allocator, pre: []const f64, post: []const f64, prev: ?usize) !f64 {
++    const c = d.cfg;
++    const row = try a.dupe(f64, if (c.sw.conf_input == .post_final_norm) post else pre);
++    defer a.free(row);
++    auxRound(c, row);
++    var s: f64 = d.conf_b;
++    for (row, d.conf_w[0..c.hidden]) |x, w| s += x * w;
++    if (prev) |pv| for (d.markov_w1[pv * c.rank ..][0..c.rank], d.conf_w[c.hidden..][0..c.rank]) |x, w| {
++        s += x * w;
++    };
++    return if (c.sw.conf_sigmoid) mr.sigmoid(s) else s;
++}
++
++/// One pass's chain: draft i = argmax of base_i[id] + bias(prev_i, id), ties to the lower id; prev_0 is the anchor.
++pub fn chain(d: *const Draft, a: std.mem.Allocator, b: Block, anchor: usize, drafts: []usize, conf: []f64) !void {
++    const c = d.cfg;
++    std.debug.assert(drafts.len == draftCount(c.sw, c.block) and conf.len == drafts.len);
++    const base = try a.alloc(f64, c.vocab);
++    defer a.free(base);
++    const allowed = try a.alloc(bool, c.vocab);
++    defer a.free(allowed);
++    var prev: ?usize = if (c.sw.first_prev == .anchor) anchor else null;
++    for (drafts, conf, 0..) |*t, *q, i| {
++        const row = rowFor(c.sw, i);
++        try baseLogits(d, a, b.post[row * c.hidden ..][0..c.hidden], base);
++        @memset(allowed, c.sw.markov_domain == .full_vocab);
++        if (c.sw.markov_domain == .candidates) {
++            for (0..c.candidates) |_| {
++                var top: ?usize = null;
++                for (0..c.vocab) |id| {
++                    if (allowed[id]) continue;
++                    if (top == null or base[id] > base[top.?]) top = id;
++                }
++                allowed[top.?] = true;
++            }
++        }
++        var best: ?usize = null;
++        var bz: f64 = 0;
++        for (0..c.vocab) |id| {
++            if (!allowed[id]) continue;
++            const z = base[id] + if (prev) |pv| markovBias(d, pv, id) else 0;
++            if (best == null or z > bz) {
++                best = id;
++                bz = z;
++            }
++        }
++        q.* = try confidence(d, a, b.pre[row * c.hidden ..][0..c.hidden], b.post[row * c.hidden ..][0..c.hidden], prev);
++        t.* = best.?;
++        prev = t.*;
++    }
++}
++
++/// Drafts kept before the first whose confidence (running product, or alone) falls under `threshold`; at least `least`.
++pub fn gateLen(sw: Switches, conf: []const f64, threshold: f64, least: usize) usize {
++    var running: f64 = 1;
++    var n: usize = 0;
++    for (conf) |q| {
++        running *= q;
++        const v = if (sw.conf_gate == .product) running else q;
++        if (v < threshold and n >= least) break;
++        n += 1;
++    }
++    return n;
++}
++
++test "e4m3 and ue8m0 against hand values" {
++    try std.testing.expectEqual(@as(f64, 1), e4m3(0x38));
++    try std.testing.expectEqual(@as(f64, -1), e4m3(0xB8));
++    try std.testing.expectEqual(@as(f64, 448), e4m3(0x7E));
++    try std.testing.expectEqual(@as(f64, 0x1p-9), e4m3(0x01)); // smallest subnormal
++    try std.testing.expectEqual(@as(f64, 0x1p-6 * 7 / 8.0), e4m3(0x07));
++    try std.testing.expectEqual(@as(f64, 0x1p-6), e4m3(0x08)); // smallest normal
++    try std.testing.expectEqual(@as(f64, 1.5), e4m3(0x3C));
++    try std.testing.expect(std.math.isNan(e4m3(0x7F)) and std.math.isNan(e4m3(0xFF)));
++    try std.testing.expectEqual(@as(f64, 0), e4m3(0x00));
++    try std.testing.expectEqual(@as(f64, 1), ue8m0(127, 127));
++    try std.testing.expectEqual(@as(f64, 0x1p-12), ue8m0(115, 127));
++    try std.testing.expectEqual(@as(f64, 0x1p-13), ue8m0(115, 128)); // the bias is a switch
++    try std.testing.expect(std.math.isNan(ue8m0(255, 127)));
++}
++
++test "dequant: one scale per 32 inputs of a row" {
++    var codes: [2 * 64]u8 = @splat(0x38); // 1.0
++    codes[63] = 0xB8; // -1.0 in the last block of row 0
++    const scales = [_]u8{ 127, 128, 126, 127 }; // row 0: 1, 2; row 1: 0.5, 1
++    var w: [2 * 64]f64 = undefined;
++    dequant(&codes, &scales, 2, 64, 32, 127, &w);
++    try std.testing.expectEqual(@as(f64, 1), w[0]);
++    try std.testing.expectEqual(@as(f64, 1), w[31]);
++    try std.testing.expectEqual(@as(f64, 2), w[32]);
++    try std.testing.expectEqual(@as(f64, -2), w[63]);
++    try std.testing.expectEqual(@as(f64, 0.5), w[64]);
++    try std.testing.expectEqual(@as(f64, 1), w[127]);
++}
+diff --git a/zig/src/families/minimax_m3/dspark_test.zig b/zig/src/families/minimax_m3/dspark_test.zig
+new file mode 100644
+index 0000000..0987dcb
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_test.zig
+@@ -0,0 +1,286 @@
++//! test-minimax-dspark: the pack's header and config (fixtures) against the name map, the rank plan and the budget.
++const std = @import("std");
++// The float64 forward runs on a tiny random draft (dspark_model_test.zig): no test reads the 2.3 GB of weights.
++const core = @import("core");
++// A passing test shows the code agrees with ITSELF, never that the semantics match the upstream model.
++const mr = core.minimax_ref;
++const target = @import("config.zig");
++const shard = @import("shard.zig");
++const load = @import("load.zig");
++const dc = @import("dspark_config.zig");
++const dn = @import("dspark_names.zig");
++const dl = @import("dspark_load.zig");
++const ref = @import("dspark_ref.zig");
++const twin = @import("dspark_twin.zig");
++const budget = @import("budget.zig");
++const pool = @import("pool.zig");
++
++test {
++    _ = @import("dspark_model_test.zig");
++    _ = dc;
++    _ = dn;
++    _ = ref;
++    _ = budget;
++}
++
++const gpa = std.testing.allocator;
++
++// ---- the pack's real header: names, shapes, cuts -----------------------------------------------------------------
++
++const header_json = @embedFile("fixtures/dspark_header.json");
++const header_data_len: usize = 2_301_852_674; // model.safetensors.index.json total_size
++
++fn catalog() !load.Catalog {
++    var cat = load.Catalog.init(gpa);
++    errdefer cat.deinit();
++    try dl.addHeader(&cat, 0, header_json, header_data_len);
++    return cat;
++}
++
++fn catalogWith(from: []const u8, to: []const u8) !load.Catalog {
++    const json = try std.mem.replaceOwned(u8, gpa, header_json, from, to);
++    defer gpa.free(json);
++    try std.testing.expect(!std.mem.eql(u8, json, header_json));
++    var cat = load.Catalog.init(gpa);
++    errdefer cat.deinit();
++    try dl.addHeader(&cat, 0, json, header_data_len);
++    return cat;
++}
++
++test "the header has the 97 tensors the name map says, every one a role, nothing else" {
++    var cat = try catalog();
++    defer cat.deinit();
++    try std.testing.expectEqual(@as(usize, 97), cat.map.count());
++    var plain: usize = 0;
++    var lin: usize = 0;
++    var it = cat.map.iterator();
++    while (it.next()) |kv| {
++        const n = dn.parse(kv.key_ptr.*) orelse return error.UnknownTensor;
++        switch (n.what) {
++            .plain => |p| {
++                plain += 1;
++                try std.testing.expectEqual(st_bf16, kv.value_ptr.dtype);
++                _ = p;
++            },
++            .lin => |l| {
++                lin += 1;
++                try std.testing.expectEqual(if (l.part == .weight) core.safetensors.DType.f8_e4m3 else core.safetensors.DType.u8, kv.value_ptr.dtype);
++            },
++        }
++    }
++    try std.testing.expectEqual(@as(usize, 27), plain); // 7 global + 5 x 4 per layer
++    try std.testing.expectEqual(@as(usize, 70), lin); // 5 layers x 7 linears x (codes, scales)
++}
++const st_bf16 = core.safetensors.DType.bf16;
++
++fn share(rank: usize, world: usize) !shard.Share {
++    return shard.Share.of(&target.flash, rank, world);
++}
++
++test "the plan for one rank and for two: bytes equal the arithmetic of dspark_config" {
++    const c = dc.flash;
++    for ([_]usize{ 1, 2 }) |world| for (0..world) |rank| {
++        var cat = try catalog();
++        defer cat.deinit();
++        var plan = try dl.Plan.build(gpa, &cat, &c, try share(rank, world), .{});
++        defer plan.deinit();
++        const want = dc.rankWeights(&c, try share(rank, world), false);
++        try std.testing.expectEqual(want.total(), plan.slotBytes());
++        try std.testing.expectEqual(@as(usize, 35), plan.mats.len);
++        try std.testing.expectEqual(@as(usize, 27), plan.plain.len);
++        try std.testing.expectEqual(@as(usize, 0), plan.ignored);
++        // the item runs read exactly the slot bytes, none twice
++        var read: u64 = 0;
++        for (plan.items) |i| read += i.span.bytes();
++        try std.testing.expectEqual(plan.slotBytes(), read);
++    };
++}
++
++test "two ranks' runs tile every tensor exactly once; replicated tensors are read whole by both" {
++    const c = dc.flash;
++    var cat = try catalog();
++    defer cat.deinit();
++    var plans: [2]dl.Plan = undefined;
++    for (&plans, 0..) |*p, r| p.* = try dl.Plan.build(gpa, &cat, &c, try share(r, 2), .{});
++    defer for (&plans) |*p| p.deinit();
++    // each tensor's runs of both ranks sorted: cut tensors abut exactly, replicated ones are two whole copies
++    var by_base: std.AutoHashMapUnmanaged(u64, std.ArrayList([2]u64)) = .empty;
++    defer {
++        var vit = by_base.valueIterator();
++        while (vit.next()) |v| v.deinit(gpa);
++        by_base.deinit(gpa);
++    }
++    for (plans) |p| for (p.items) |i| {
++        const e = try by_base.getOrPut(gpa, i.base);
++        if (!e.found_existing) e.value_ptr.* = .empty;
++        for (0..i.span.count) |n| try e.value_ptr.append(gpa, .{ i.span.at(n), i.span.at(n) + i.span.len });
++    };
++    var it = cat.map.iterator();
++    while (it.next()) |kv| {
++        const runs = by_base.getPtr(kv.value_ptr.begin) orelse return error.TensorNotRead;
++        std.mem.sort([2]u64, runs.items, {}, struct {
++            fn less(_: void, a: [2]u64, b: [2]u64) bool {
++                return a[0] < b[0];
++            }
++        }.less);
++        const n = dn.parse(kv.key_ptr.*).?;
++        const whole = n.what == .plain and (n.what.plain != .fc or true); // plain tensors are replicated
++        if (whole) {
++            // two identical copies of [0, len)
++            try std.testing.expectEqual(@as(usize, 2), runs.items.len);
++            for (runs.items) |r| try std.testing.expectEqual([2]u64{ 0, kv.value_ptr.len }, r);
++        } else {
++            var at: u64 = 0;
++            for (runs.items) |r| {
++                try std.testing.expectEqual(at, r[0]);
++                at = r[1];
++            }
++            try std.testing.expectEqual(kv.value_ptr.len, at);
++        }
++    }
++}
++
++test "the cuts: q 4096 rows, kv 256, o and down input halves, gate/up 6144 rows; scales follow in 32s" {
++    const c = dc.flash;
++    var cat = try catalog();
++    defer cat.deinit();
++    var plan = try dl.Plan.build(gpa, &cat, &c, try share(1, 2), .{});
++    defer plan.deinit();
++    const want = [_]struct { p: dn.Lin, n: u32, k: u32 }{
++        .{ .p = .q, .n = 4096, .k = 6144 },
++        .{ .p = .k, .n = 256, .k = 6144 },
++        .{ .p = .v, .n = 256, .k = 6144 },
++        .{ .p = .o, .n = 6144, .k = 4096 },
++        .{ .p = .gate, .n = 6144, .k = 6144 },
++        .{ .p = .up, .n = 6144, .k = 6144 },
++        .{ .p = .down, .n = 6144, .k = 6144 },
++    };
++    for (want) |w| {
++        const m = plan.mat(w.p, 4).?;
++        try std.testing.expectEqual(w.n, m.n);
++        try std.testing.expectEqual(w.k, m.k);
++        try std.testing.expectEqual(@as(u64, w.n) * w.k, plan.slots[m.codes].bytes);
++        try std.testing.expectEqual(@as(u64, w.n) * w.k / 32, plan.slots[m.scales].bytes);
++    }
++    // rank 1's o_proj: columns [4096, 8192) of every row, 6144 runs a row apart (scale runs: 128 bytes)
++    var runs: usize = 0;
++    for (plan.items) |i| if (i.slot == plan.mat(.o, 0).?.codes) {
++        try std.testing.expectEqual(@as(u64, 4096), i.span.offset);
++        try std.testing.expectEqual(@as(u64, 4096), i.span.len);
++        try std.testing.expectEqual(@as(u64, 8192), i.span.stride);
++        try std.testing.expectEqual(@as(u64, 6144), i.span.count);
++        runs += 1;
++    };
++    try std.testing.expectEqual(@as(usize, 1), runs);
++    // the Markov tables whole by default, by the head's vocabulary units when asked
++    try std.testing.expectEqual(@as(u32, 200064), plan.tensor(.markov_w1, 0).?.rows);
++    var cut = try dl.Plan.build(gpa, &cat, &c, try share(1, 2), .{ .markov_cut = true });
++    defer cut.deinit();
++    try std.testing.expectEqual(@as(u32, 781 * 128), cut.tensor(.markov_w2, 0).?.rows);
++    // nothing is folded: the norms are stored as they are (the Gemma offset is an unverified switch)
++    for (plan.items) |i| try std.testing.expect(!i.fold);
++}
++
++test "a missing, misshaped, retyped or extra tensor refuses the plan" {
++    const c = dc.flash;
++    const s = try share(0, 2);
++    {
++        var cat = try catalogWith("language_model.model.dspark.fc.weight", "language_model.model.dspark.fx.weight");
++        defer cat.deinit();
++        try std.testing.expectError(error.MissingTensor, dl.Plan.build(gpa, &cat, &c, s, .{}));
++    }
++    {
++        // codes retyped to e5m2 (same size)
++        var cat = try catalogWith("layers.2.decoder_layer.mlp.up_proj.weight\":{\"dtype\":\"F8_E4M3\"", "layers.2.decoder_layer.mlp.up_proj.weight\":{\"dtype\":\"F8_E5M2\"");
++        defer cat.deinit();
++        try std.testing.expectError(error.MisshapedTensor, dl.Plan.build(gpa, &cat, &c, s, .{}));
++    }
++    {
++        // scales retyped to i8
++        var cat = try catalogWith("layers.4.decoder_layer.mlp.up_proj.weight_scale_inv\":{\"dtype\":\"U8\"", "layers.4.decoder_layer.mlp.up_proj.weight_scale_inv\":{\"dtype\":\"I8\"");
++        defer cat.deinit();
++        try std.testing.expectError(error.MisshapedTensor, dl.Plan.build(gpa, &cat, &c, s, .{}));
++    }
++    {
++        // a tensor of the draft's namespace no role names (the draft has no head of its own)
++        var cat = try catalog();
++        defer cat.deinit();
++        try cat.add("language_model.model.dspark.lm_head.weight", .{ .shard = 0, .dtype = .bf16, .rank = 1, .shape = .{ 1, 1, 1, 1, 1 }, .begin = 0, .len = 2 });
++        try std.testing.expectError(error.UnexpectedTensor, dl.Plan.build(gpa, &cat, &c, s, .{}));
++    }
++    {
++        // a tensor of another namespace is ignored, not refused
++        var cat = try catalog();
++        defer cat.deinit();
++        try cat.add("language_model.model.layers.0.input_layernorm.weight", .{ .shard = 0, .dtype = .bf16, .rank = 1, .shape = .{ 6144, 1, 1, 1, 1 }, .begin = 0, .len = 12288 });
++        var plan = try dl.Plan.build(gpa, &cat, &c, s, .{});
++        defer plan.deinit();
++        try std.testing.expectEqual(@as(usize, 1), plan.ignored);
++    }
++}
++
++// ---- the float8 decode against TensorFold's own codec ----------------------------------------------------------
++
++test "e4m3 and ue8m0 equal TensorFold's codec for every byte" {
++    const codec = core.exlr8.codec;
++    for (0..256) |i| {
++        const code: u8 = @intCast(i);
++        const mine = ref.e4m3(code);
++        const theirs: f64 = codec.e4m3Value(code);
++        if (std.math.isNan(theirs)) try std.testing.expect(std.math.isNan(mine)) else try std.testing.expectEqual(theirs, mine);
++        // exlr8_dense.zig dequantizes an mxfp8 scale as ldexp(1, byte - 127); the NaN byte is qmmf.cu's
++        if (i < 255) try std.testing.expectEqual(std.math.ldexp(@as(f64, 1), @as(i32, @intCast(i)) - 127), ref.ue8m0(code, 127));
++    }
++    try std.testing.expect(std.math.isNan(ref.ue8m0(255, 127)));
++}
++
++// ---- memory: what the draft adds to a rank's budget -----------------------------------------------------------------
++
++test "budget: the draft takes its weights and runtime before any KV and a ring a stream; the refusal names it" {
++    const c = dc.flash;
++    const s = try share(0, 2);
++    const dims = try pool.Dims.of(&target.flash, s);
++    const total: u64 = 119 * budget.GiB; // assumed GB10 memory; the real number is measured at start-up
++    const plain = try budget.tensorfold(total, null);
++    const cost = dc.cost(&c, s, 16, 2048, false);
++    const drafted = budget.withDraft(plain, cost);
++    var in: budget.Input = .{ .available = total, .weights = 91 * budget.GiB, .terms = plain };
++    var in_d = in;
++    in_d.terms = drafted;
++    const without = budget.check(dims, in, null).ok;
++    const with = budget.check(dims, in_d, null).ok;
++    // the draft costs weights + runtime + one stream's ring and scratch, which the pool gives up in whole pages
++    const spent = cost.weights + cost.runtime + cost.per_lane;
++    const lost = (without.pool_tokens - with.pool_tokens) * dims.tokenBytes();
++    // (whole pages, and the score chunk shrinks with the shorter context: a few pages of slack either way)
++    try std.testing.expect(@abs(@as(i64, @intCast(lost)) - @as(i64, @intCast(spent))) <= @as(i64, @intCast(3 * dims.pageBytes())));
++    try std.testing.expect(with.context < without.context);
++    try std.testing.expectEqual(spent, budget.draftBytes(drafted, 1));
++    try std.testing.expectEqual(@as(u64, 0), budget.draftBytes(plain, 4));
++    // a context that fit without the draft but not with it is refused with the draft named
++    in_d.weights = 106 * budget.GiB;
++    in.weights = 106 * budget.GiB;
++    const lone = budget.check(dims, in, null);
++    switch (lone) {
++        .ok => |cap| {
++            const asked = cap.context;
++            const verdict = budget.check(dims, in_d, asked);
++            if (verdict == .refused) {
++                const text = try budget.refusalText(gpa, verdict.refused);
++                defer gpa.free(text);
++                try std.testing.expect(std.mem.indexOf(u8, text, "the dspark draft takes") != null);
++                try std.testing.expect(std.mem.indexOf(u8, text, "serve without --drafter") != null);
++            } else return error.DraftCostNothing;
++        },
++        .refused => {},
++    }
++    // lanes: each extra stream adds its ring
++    var four = in_d;
++    four.lanes = 4;
++    try std.testing.expectEqual(cost.weights + cost.runtime + 4 * cost.per_lane, budget.draftBytes(four.terms, 4));
++}
++
++test "the draft's recipe-facing words" {
++    try std.testing.expect(std.mem.indexOf(u8, dc.drafter_refusal, "no MTP head") != null);
++    try std.testing.expect(std.mem.indexOf(u8, dc.drafter_refusal, "docs/dspark-plan.md") != null);
++}
+diff --git a/zig/src/families/minimax_m3/dspark_twin.zig b/zig/src/families/minimax_m3/dspark_twin.zig
+new file mode 100644
+index 0000000..229c2de
+--- /dev/null
++++ b/zig/src/families/minimax_m3/dspark_twin.zig
+@@ -0,0 +1,252 @@
++//! Host twins of the draft's planned engine layout, each with planted mutants (like tests/minimax_*_twin.zig).
++const std = @import("std");
++// The K/V ring the engine would keep, the two-rank tensor-parallel block, and the per-rank candidate gather.
++const core = @import("core");
++// dspark_model_test.zig runs each clean twin against dspark_ref.zig and requires every mutant to be caught.
++const mr = core.minimax_ref;
++const ref = @import("dspark_ref.zig");
++
++// ---- the context ring ---------------------------------------------------------------------------------------------
++
++pub const RingMutant = enum {
++    none,
++    short_ring, // six rows too few: the oldest rows the window still sees are gone
++    rope_at_slot, // K rotated by the ring slot, not the token position
++    stale_slot, // a slot already written is never overwritten after the ring wraps
++    drop_last_absorb, // the newest absorbed row is not stored
++};
++
++/// The engine's per-stream context: the draft layers' K/V of the last `cap` positions at slot (position mod cap).
++pub const Ring = struct {
++    d: *const ref.Draft,
++    cap: usize,
++    k: [][]f64,
++    v: [][]f64,
++    end: usize = 0, // next position to absorb
++    m: RingMutant,
++
++    pub fn init(a: std.mem.Allocator, d: *const ref.Draft, cap: usize, m: RingMutant) !Ring {
++        const c = d.cfg;
++        const eff = if (m == .short_ring) cap - 6 else cap;
++        const k = try a.alloc([]f64, c.layers);
++        const v = try a.alloc([]f64, c.layers);
++        for (k, v) |*kk, *vv| {
++            kk.* = try a.alloc(f64, eff * c.kvw());
++            vv.* = try a.alloc(f64, eff * c.kvw());
++            @memset(kk.*, 0);
++            @memset(vv.*, 0);
++        }
++        return .{ .d = d, .cap = eff, .k = k, .v = v, .m = m };
++    }
++
++    /// Takes the tapped row of position `end` (positions are absorbed in order, as the verify keeps them).
++    pub fn absorb(r: *Ring, a: std.mem.Allocator, feats: []const f64, last: bool) !void {
++        const c = r.d.cfg;
++        const pos = r.end;
++        r.end += 1;
++        if (last and r.m == .drop_last_absorb) return;
++        const slot = pos % r.cap;
++        if (r.m == .stale_slot and pos >= r.cap) return;
++        const st = try a.alloc(f64, c.hidden);
++        defer a.free(st);
++        try ref.contextState(r.d, a, feats, st);
++        for (0..c.layers) |l| {
++            const rope_pos = if (r.m == .rope_at_slot) slot else pos;
++            try ref.contextKv(r.d, a, l, st, rope_pos, r.k[l][slot * c.kvw() ..][0..c.kvw()], r.v[l][slot * c.kvw() ..][0..c.kvw()]);
++        }
++    }
++
++    /// The valid rows as a Ctx in position order (what the attention kernel walks through the ring's slot list).
++    pub fn ctx(r: *const Ring, a: std.mem.Allocator) !ref.Ctx {
++        const c = r.d.cfg;
++        const n = @min(r.end, r.cap);
++        const first = r.end - n;
++        const cx = try ref.Ctx.alloc(a, c, first, n);
++        for (0..n) |j| {
++            const slot = (first + j) % r.cap;
++            for (0..c.layers) |l| {
++                @memcpy(cx.k[l][j * c.kvw() ..][0..c.kvw()], r.k[l][slot * c.kvw() ..][0..c.kvw()]);
++                @memcpy(cx.v[l][j * c.kvw() ..][0..c.kvw()], r.v[l][slot * c.kvw() ..][0..c.kvw()]);
++            }
++        }
++        return cx;
++    }
++};
++
++// ---- two-rank tensor parallel block -----------------------------------------------------------------------------
++
++pub const TpMutant = enum {
++    none,
++    drop_last_head, // the last rank's last query head is not computed
++    swap_kv_groups, // the last rank reads the first rank's kv group
++    ffn_overlap, // the last rank's FFN cut starts one row early
++    drop_exchange, // only rank 0's attention partial is added
++};
++
++/// blockForward as `world` ranks run it: kv groups, their query heads and FFN rows cut; partials added in rank order.
++pub fn blockForwardTp(d: *const ref.Draft, a: std.mem.Allocator, cx: *const ref.Ctx, anchor: usize, p: usize, world: usize, m: TpMutant) !ref.Block {
++    const c = d.cfg;
++    const sw = c.sw;
++    const hd = c.head_dim;
++    const kvw = c.kvw();
++    const nb = c.block;
++    const rep = c.rep();
++    const groups = c.n_kv / world;
++    const ffn_cut = c.ffn / world;
++    const h = try a.alloc(f64, nb * c.hidden);
++    for (0..nb) |i| {
++        const tok = if (i == 0) anchor else c.mask_token;
++        @memcpy(h[i * c.hidden ..][0..c.hidden], d.embed[tok * c.hidden ..][0..c.hidden]);
++    }
++    const x = try a.alloc(f64, c.hidden);
++    const scale = std.math.pow(f64, @floatFromInt(hd), -0.5);
++    for (d.layers, 0..) |ly, l| {
++        // attention: every rank computes its own heads for every row, then the partial o_proj sums are exchanged
++        const part = try a.alloc(f64, world * nb * c.hidden);
++        @memset(part, 0);
++        for (0..world) |r| {
++            var g0 = r * groups;
++            if (m == .swap_kv_groups and r == world - 1) g0 = 0;
++            const own_q0 = r * groups * rep; // the q heads this rank multiplies o_proj columns for
++            var nq = groups * rep;
++            if (m == .drop_last_head and r == world - 1) nq -= 1;
++            const q = try a.alloc(f64, nb * nq * hd);
++            const kb = try a.alloc(f64, nb * groups * hd);
++            const vb = try a.alloc(f64, nb * groups * hd);
++            for (0..nb) |i| {
++                ref.norm(c, h[i * c.hidden ..][0..c.hidden], ly.input_norm, sw.base.gemma_layer_norms, x);
++                const pos = if (sw.block_positions == .consecutive) p + i else p;
++                const qi = q[i * nq * hd ..][0 .. nq * hd];
++                ly.q.applyRows(own_q0 * hd, (own_q0 + nq) * hd, x, qi);
++                ly.k.applyRows(g0 * hd, (g0 + groups) * hd, x, kb[i * groups * hd ..][0 .. groups * hd]);
++                ly.v.applyRows(g0 * hd, (g0 + groups) * hd, x, vb[i * groups * hd ..][0 .. groups * hd]);
++                for ([_][]f64{ qi, kb[i * groups * hd ..][0 .. groups * hd], vb[i * groups * hd ..][0 .. groups * hd] }) |t| mr.roundAll(sw.base.bf16_proj_out, t);
++                ref.heads(c, qi, nq, ly.q_norm, pos);
++                ref.heads(c, kb[i * groups * hd ..][0 .. groups * hd], groups, ly.k_norm, pos);
++            }
++            const attn = try a.alloc(f64, nb * nq * hd);
++            for (0..nb) |i| {
++                const rp = if (sw.block_positions == .consecutive) p + i else p;
++                for (0..nq) |hh| {
++                    const g = hh / rep; // the rank-local kv group
++                    const qh = q[(i * nq + hh) * hd ..][0..hd];
++                    const total = cx.n + nb;
++                    const s = try a.alloc(f64, total);
++                    var best: f64 = -std.math.inf(f64);
++                    for (0..total) |j| {
++                        s[j] = -std.math.inf(f64);
++                        var key: []const f64 = undefined;
++                        if (j < cx.n) {
++                            if (!ref.sees(sw, c.window, cx.first + j, rp, p)) continue;
++                            key = cx.k[l][j * kvw + (g0 + g) * hd ..][0..hd];
++                        } else {
++                            const mm = j - cx.n;
++                            if (sw.block_attention == .causal and mm > i) continue;
++                            key = kb[mm * groups * hd + g * hd ..][0..hd];
++                        }
++                        var dot: f64 = 0;
++                        for (qh, key) |u, w| dot += u * w;
++                        s[j] = dot * scale;
++                        best = @max(best, s[j]);
++                    }
++                    var z: f64 = 0;
++                    const out = attn[(i * nq + hh) * hd ..][0..hd];
++                    @memset(out, 0);
++                    for (0..total) |j| {
++                        if (s[j] == -std.math.inf(f64)) continue;
++                        const w = @exp(s[j] - best);
++                        z += w;
++                        const val = if (j < cx.n) cx.v[l][j * kvw + (g0 + g) * hd ..][0..hd] else vb[(j - cx.n) * groups * hd + g * hd ..][0..hd];
++                        for (out, val) |*o, vv| o.* += w * vv;
++                    }
++                    for (out) |*o| o.* /= z;
++                }
++            }
++            mr.roundAll(sw.base.bf16_attn_out, attn);
++            for (0..nb) |i| ly.o.applyCols(own_q0 * hd, attn[i * nq * hd ..][0 .. nq * hd], part[(r * nb + i) * c.hidden ..][0..c.hidden]);
++        }
++        // exchange: partials added in rank order 0 then 1, every rank holds the same sum
++        for (0..nb) |i| {
++            const hi = h[i * c.hidden ..][0..c.hidden];
++            for (0..c.hidden) |e| {
++                var s: f64 = 0;
++                for (0..world) |r| {
++                    if (m == .drop_exchange and r != 0) continue;
++                    s += part[(r * nb + i) * c.hidden + e];
++                }
++                hi[e] = mr.round16(sw.base.bf16_residual, hi[e] + s);
++            }
++        }
++        // FFN
++        @memset(part, 0);
++        for (0..world) |r| {
++            var lo = r * ffn_cut;
++            if (m == .ffn_overlap and r == world - 1) lo -= 1;
++            const hi_row = (r + 1) * ffn_cut;
++            const g = try a.alloc(f64, hi_row - lo);
++            const u = try a.alloc(f64, hi_row - lo);
++            for (0..nb) |i| {
++                ref.norm(c, h[i * c.hidden ..][0..c.hidden], ly.post_norm, sw.base.gemma_layer_norms, x);
++                ly.gate.applyRows(lo, hi_row, x, g);
++                ly.up.applyRows(lo, hi_row, x, u);
++                for (g, u) |*gv, uv| gv.* = mr.round16(sw.base.bf16_act_out, mr.swigluoai(gv.*, uv, c.alpha, c.limit, sw.base));
++                ly.down.applyCols(lo, g, part[(r * nb + i) * c.hidden ..][0..c.hidden]);
++            }
++        }
++        for (0..nb) |i| {
++            const hi = h[i * c.hidden ..][0..c.hidden];
++            for (0..c.hidden) |e| {
++                var s: f64 = 0;
++                for (0..world) |r| s += part[(r * nb + i) * c.hidden + e];
++                hi[e] = mr.round16(sw.base.bf16_residual, hi[e] + s);
++            }
++        }
++    }
++    const post = try a.alloc(f64, nb * c.hidden);
++    for (0..nb) |i| ref.norm(c, h[i * c.hidden ..][0..c.hidden], d.final_norm, sw.gemma_final_norm, post[i * c.hidden ..][0..c.hidden]);
++    return .{ .pre = h, .post = post };
++}
++
++// ---- the head's per-rank candidates -----------------------------------------------------------------------------
++
++pub const GatherMutant = enum {
++    none,
++    drop_last_rank, // the last rank's candidates never arrive
++    ids_not_offset, // a rank's local candidate ids are not moved to global ids
++    first_lowest, // the merge keeps the first of equal values instead of the lowest id
++};
++
++/// One pick as the engine makes it: per-rank top `per` base logits gathered, Markov bias on the gathered ids only.
++pub fn gatherPick(d: *const ref.Draft, base: []const f64, prev: ?usize, world: usize, per: usize, m: GatherMutant, a: std.mem.Allocator) !usize {
++    const c = d.cfg;
++    const slice = c.vocab / world;
++    var ids: std.ArrayList(usize) = .empty;
++    defer ids.deinit(a);
++    for (0..world) |r| {
++        if (m == .drop_last_rank and r == world - 1) continue;
++        const lo = r * slice;
++        const taken = try a.alloc(bool, slice);
++        defer a.free(taken);
++        @memset(taken, false);
++        for (0..per) |_| {
++            var top: ?usize = null;
++            for (0..slice) |i| {
++                if (taken[i]) continue;
++                if (top == null or base[lo + i] > base[lo + top.?]) top = i;
++            }
++            taken[top.?] = true;
++            try ids.append(a, if (m == .ids_not_offset) top.? else lo + top.?);
++        }
++    }
++    var best: ?usize = null;
++    var bz: f64 = 0;
++    for (ids.items) |id| {
++        const z = base[id] + if (prev) |pv| ref.markovBias(d, pv, id) else 0;
++        const better = best == null or z > bz or (z == bz and m != .first_lowest and id < best.?);
++        if (better) {
++            best = id;
++            bz = z;
++        }
++    }
++    return best.?;
++}
+diff --git a/zig/src/families/minimax_m3/fixtures/dspark_config.json b/zig/src/families/minimax_m3/fixtures/dspark_config.json
+new file mode 100644
+index 0000000..4e3a8a4
+--- /dev/null
++++ b/zig/src/families/minimax_m3/fixtures/dspark_config.json
+@@ -0,0 +1,297 @@
++{
++  "transformers_version": "5.12.1",
++  "architectures": [
++    "DSparkMiniMaxDraftModel"
++  ],
++  "output_hidden_states": false,
++  "return_dict": true,
++  "dtype": "bfloat16",
++  "chunk_size_feed_forward": 0,
++  "is_encoder_decoder": false,
++  "id2label": {
++    "0": "LABEL_0",
++    "1": "LABEL_1"
++  },
++  "label2id": {
++    "LABEL_0": 0,
++    "LABEL_1": 1
++  },
++  "problem_type": null,
++  "model_type": "minimax_m3_vl",
++  "text_config": {
++    "architectures": [
++      "DSparkMiniMaxDraftModel"
++    ],
++    "output_hidden_states": false,
++    "return_dict": true,
++    "dtype": "bfloat16",
++    "chunk_size_feed_forward": 0,
++    "is_encoder_decoder": false,
++    "id2label": {
++      "0": "LABEL_0",
++      "1": "LABEL_1"
++    },
++    "label2id": {
++      "LABEL_0": 0,
++      "LABEL_1": 1
++    },
++    "problem_type": null,
++    "_name_or_path": "",
++    "hidden_size": 6144,
++    "intermediate_size": 3072,
++    "num_hidden_layers": 5,
++    "num_attention_heads": 64,
++    "num_key_value_heads": 4,
++    "head_dim": 128,
++    "vocab_size": 200064,
++    "max_position_embeddings": 1048576,
++    "rms_norm_eps": 1e-06,
++    "use_gemma_norm": true,
++    "attention_output_gate": false,
++    "rope_theta": 10000000,
++    "rotary_dim": 64,
++    "partial_rotary_factor": 0.5,
++    "hidden_act": "swigluoai",
++    "use_qk_norm": true,
++    "tie_word_embeddings": false,
++    "dense_intermediate_size": 12288,
++    "shared_intermediate_size": 3072,
++    "num_local_experts": 128,
++    "num_experts_per_tok": 4,
++    "n_shared_experts": 1,
++    "scoring_func": "sigmoid",
++    "use_routing_bias": true,
++    "moe_layer_freq": [
++      0,
++      0,
++      0,
++      0,
++      0
++    ],
++    "qk_norm_type": "per_head",
++    "swiglu_alpha": 1.702,
++    "swiglu_limit": 7.0,
++    "routed_scaling_factor": 2.0,
++    "sparse_attention_config": null,
++    "dspark_block_size": 7,
++    "dspark_markov_rank": 256,
++    "dspark_markov_head_type": "vanilla",
++    "dspark_aux_gemm_precision": "bf16",
++    "dspark_noise_token_id": 200058,
++    "dspark_use_dense_ffn": true,
++    "dspark_ffn_hidden_size": 12288,
++    "dspark_target_layer_ids": [
++      3,
++      17,
++      31,
++      45,
++      59
++    ],
++    "dspark_config": {
++      "markov_rank": 256,
++      "markov_head_type": "vanilla",
++      "mask_token_id": 200058,
++      "hybrid_context_fusion": false,
++      "aux_gemm_precision": "bf16",
++      "use_dense_ffn": true,
++      "ffn_hidden_size": 12288
++    },
++    "dspark_hybrid_context_fusion": false,
++    "dflash_config": {
++      "num_hidden_layers": 5,
++      "num_target_layers": 60,
++      "context_source": "target_layers",
++      "block_size": 7,
++      "mask_token_id": 200058,
++      "target_layer_ids": [
++        3,
++        17,
++        31,
++        45,
++        59
++      ],
++      "layer_types": [
++        "sliding_attention",
++        "sliding_attention",
++        "sliding_attention",
++        "sliding_attention",
++        "sliding_attention"
++      ],
++      "sliding_window": 4096
++    },
++    "enable_confidence_head": true,
++    "confidence_head_with_markov": true,
++    "num_nextn_predict_layers": 0,
++    "use_mtp": false,
++    "num_mtp_modules": 0,
++    "layer_types": [
++      "sliding_attention",
++      "sliding_attention",
++      "sliding_attention",
++      "sliding_attention",
++      "sliding_attention"
++    ],
++    "sliding_window": 4096,
++    "v_head_dim": 128,
++    "swa_head_dim": 128,
++    "swa_v_head_dim": 128,
++    "model_type": "",
++    "output_attentions": false
++  },
++  "img_token_compression_config": {
++    "image_token_compression_method": "patch_merge",
++    "spatial_merge_size": 2,
++    "temporal_patch_size": 2
++  },
++  "image_grid_pinpoints": "[(336, 336), (336, 672), (336, 1008), (336, 1344), (336, 1680), (336, 2016), (672, 336), (672, 672), (672, 1008), (672, 1344), (672, 1680), (672, 2016), (1008, 336), (1008, 672), (1008, 1008), (1008, 1344), (1008, 1680), (1008, 2016), (1344, 336), (1344, 672), (1344, 1008), (1344, 1344), (1344, 1680), (1344, 2016), (1680, 336), (1680, 672), (1680, 1008), (1680, 1344), (1680, 1680), (1680, 2016), (2016, 336), (2016, 672), (2016, 1008), (2016, 1344), (2016, 1680), (2016, 2016)]",
++  "image_seq_length": 576,
++  "image_token_index": 200025,
++  "video_token_index": 200026,
++  "multimodal_projector_bias": true,
++  "num_reward_heads": 0,
++  "process_image_mode": "dynamic_res",
++  "projector_hidden_act": "gelu",
++  "vision_feature_layer": -1,
++  "vision_feature_select_strategy": "full",
++  "projector_hidden_size": 6144,
++  "quantization_config": {
++    "quant_method": "mxfp8",
++    "activation_scheme": "dynamic",
++    "weight_block_size": [
++      1,
++      32
++    ],
++    "ignored_layers": [
++      "language_model.model.dspark.confidence_head.proj",
++      "language_model.model.dspark.fc",
++      "language_model.model.dspark.markov_head.markov_w1",
++      "language_model.model.dspark.markov_head.markov_w2",
++      "language_model.model.layers.10.block_sparse_moe.gate",
++      "language_model.model.layers.11.block_sparse_moe.gate",
++      "language_model.model.layers.12.block_sparse_moe.gate",
++      "language_model.model.layers.13.block_sparse_moe.gate",
++      "language_model.model.layers.14.block_sparse_moe.gate",
++      "language_model.model.layers.15.block_sparse_moe.gate",
++      "language_model.model.layers.16.block_sparse_moe.gate",
++      "language_model.model.layers.17.block_sparse_moe.gate",
++      "language_model.model.layers.18.block_sparse_moe.gate",
++      "language_model.model.layers.19.block_sparse_moe.gate",
++      "language_model.model.layers.20.block_sparse_moe.gate",
++      "language_model.model.layers.21.block_sparse_moe.gate",
++      "language_model.model.layers.22.block_sparse_moe.gate",
++      "language_model.model.layers.23.block_sparse_moe.gate",
++      "language_model.model.layers.24.block_sparse_moe.gate",
++      "language_model.model.layers.25.block_sparse_moe.gate",
++      "language_model.model.layers.26.block_sparse_moe.gate",
++      "language_model.model.layers.27.block_sparse_moe.gate",
++      "language_model.model.layers.28.block_sparse_moe.gate",
++      "language_model.model.layers.29.block_sparse_moe.gate",
++      "language_model.model.layers.3.block_sparse_moe.gate",
++      "language_model.model.layers.30.block_sparse_moe.gate",
++      "language_model.model.layers.31.block_sparse_moe.gate",
++      "language_model.model.layers.32.block_sparse_moe.gate",
++      "language_model.model.layers.33.block_sparse_moe.gate",
++      "language_model.model.layers.34.block_sparse_moe.gate",
++      "language_model.model.layers.35.block_sparse_moe.gate",
++      "language_model.model.layers.36.block_sparse_moe.gate",
++      "language_model.model.layers.37.block_sparse_moe.gate",
++      "language_model.model.layers.38.block_sparse_moe.gate",
++      "language_model.model.layers.39.block_sparse_moe.gate",
++      "language_model.model.layers.4.block_sparse_moe.gate",
++      "language_model.model.layers.40.block_sparse_moe.gate",
++      "language_model.model.layers.41.block_sparse_moe.gate",
++      "language_model.model.layers.42.block_sparse_moe.gate",
++      "language_model.model.layers.43.block_sparse_moe.gate",
++      "language_model.model.layers.44.block_sparse_moe.gate",
++      "language_model.model.layers.45.block_sparse_moe.gate",
++      "language_model.model.layers.46.block_sparse_moe.gate",
++      "language_model.model.layers.47.block_sparse_moe.gate",
++      "language_model.model.layers.48.block_sparse_moe.gate",
++      "language_model.model.layers.49.block_sparse_moe.gate",
++      "language_model.model.layers.5.block_sparse_moe.gate",
++      "language_model.model.layers.50.block_sparse_moe.gate",
++      "language_model.model.layers.51.block_sparse_moe.gate",
++      "language_model.model.layers.52.block_sparse_moe.gate",
++      "language_model.model.layers.53.block_sparse_moe.gate",
++      "language_model.model.layers.54.block_sparse_moe.gate",
++      "language_model.model.layers.55.block_sparse_moe.gate",
++      "language_model.model.layers.56.block_sparse_moe.gate",
++      "language_model.model.layers.57.block_sparse_moe.gate",
++      "language_model.model.layers.58.block_sparse_moe.gate",
++      "language_model.model.layers.59.block_sparse_moe.gate",
++      "language_model.model.layers.6.block_sparse_moe.gate",
++      "language_model.model.layers.7.block_sparse_moe.gate",
++      "language_model.model.layers.8.block_sparse_moe.gate",
++      "language_model.model.layers.9.block_sparse_moe.gate",
++      "lm_head",
++      "model.embed_tokens",
++      "multi_modal_projector",
++      "patch_merge_mlp",
++      "vision_tower"
++    ],
++    "group_size": 16,
++    "moe_quant_algo": "NVFP4",
++    "moe_quant_format": "nvfp4-pack-quantized"
++  },
++  "tie_word_embeddings": false,
++  "dspark_block_size": 7,
++  "dspark_markov_rank": 256,
++  "dspark_markov_head_type": "vanilla",
++  "dspark_aux_gemm_precision": "bf16",
++  "dspark_noise_token_id": 200058,
++  "dspark_use_dense_ffn": true,
++  "dspark_ffn_hidden_size": 12288,
++  "dspark_target_layer_ids": [
++    3,
++    17,
++    31,
++    45,
++    59
++  ],
++  "dspark_config": {
++    "markov_rank": 256,
++    "markov_head_type": "vanilla",
++    "mask_token_id": 200058,
++    "hybrid_context_fusion": false,
++    "aux_gemm_precision": "bf16",
++    "use_dense_ffn": true,
++    "ffn_hidden_size": 12288
++  },
++  "dspark_hybrid_context_fusion": false,
++  "enable_confidence_head": true,
++  "confidence_head_with_markov": true,
++  "dflash_config": {
++    "num_hidden_layers": 5,
++    "num_target_layers": 60,
++    "context_source": "target_layers",
++    "block_size": 7,
++    "mask_token_id": 200058,
++    "target_layer_ids": [
++      3,
++      17,
++      31,
++      45,
++      59
++    ],
++    "layer_types": [
++      "sliding_attention",
++      "sliding_attention",
++      "sliding_attention",
++      "sliding_attention",
++      "sliding_attention"
++    ],
++    "sliding_window": 4096
++  },
++  "markov_rank": 256,
++  "markov_head_type": "vanilla",
++  "hidden_size": 6144,
++  "vocab_size": 200064,
++  "num_hidden_layers": 5,
++  "num_nextn_predict_layers": 0,
++  "use_mtp": false,
++  "num_mtp_modules": 0,
++  "context_len": 1048576,
++  "encoder_only": false,
++  "language_only": false,
++  "output_attentions": false
++}
+diff --git a/zig/src/families/minimax_m3/fixtures/dspark_header.json b/zig/src/families/minimax_m3/fixtures/dspark_header.json
+new file mode 100644
+index 0000000..bc27ca8
+--- /dev/null
++++ b/zig/src/families/minimax_m3/fixtures/dspark_header.json
+@@ -0,0 +1 @@
++{"__metadata__":{"format":"pt"},"language_model.model.dspark.confidence_head.proj.bias":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"language_model.model.dspark.confidence_head.proj.weight":{"dtype":"BF16","shape":[1,6400],"data_offsets":[2,12802]},"language_model.model.dspark.fc.weight":{"dtype":"BF16","shape":[6144,30720],"data_offsets":[12802,377500162]},"language_model.model.dspark.final_norm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377500162,377512450]},"language_model.model.dspark.hidden_norm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377512450,377524738]},"language_model.model.dspark.layers.0.decoder_layer.input_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377524738,377537026]},"language_model.model.dspark.layers.0.decoder_layer.post_attention_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377537026,377549314]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.k_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377549314,377549570]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.q_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377549570,377549826]},"language_model.model.dspark.layers.1.decoder_layer.input_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377549826,377562114]},"language_model.model.dspark.layers.1.decoder_layer.post_attention_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377562114,377574402]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.k_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377574402,377574658]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.q_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377574658,377574914]},"language_model.model.dspark.layers.2.decoder_layer.input_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377574914,377587202]},"language_model.model.dspark.layers.2.decoder_layer.post_attention_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377587202,377599490]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.k_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377599490,377599746]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.q_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377599746,377600002]},"language_model.model.dspark.layers.3.decoder_layer.input_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377600002,377612290]},"language_model.model.dspark.layers.3.decoder_layer.post_attention_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377612290,377624578]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.k_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377624578,377624834]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.q_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377624834,377625090]},"language_model.model.dspark.layers.4.decoder_layer.input_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377625090,377637378]},"language_model.model.dspark.layers.4.decoder_layer.post_attention_layernorm.weight":{"dtype":"BF16","shape":[6144],"data_offsets":[377637378,377649666]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.k_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377649666,377649922]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.q_norm.weight":{"dtype":"BF16","shape":[128],"data_offsets":[377649922,377650178]},"language_model.model.dspark.markov_head.markov_w1.weight":{"dtype":"BF16","shape":[200064,256],"data_offsets":[377650178,480082946]},"language_model.model.dspark.markov_head.markov_w2.weight":{"dtype":"BF16","shape":[200064,256],"data_offsets":[480082946,582515714]},"language_model.model.dspark.layers.0.decoder_layer.mlp.down_proj.weight":{"dtype":"F8_E4M3","shape":[6144,12288],"data_offsets":[582515714,658013186]},"language_model.model.dspark.layers.0.decoder_layer.mlp.down_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,384],"data_offsets":[658013186,660372482]},"language_model.model.dspark.layers.0.decoder_layer.mlp.gate_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[660372482,735869954]},"language_model.model.dspark.layers.0.decoder_layer.mlp.gate_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[735869954,738229250]},"language_model.model.dspark.layers.0.decoder_layer.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[738229250,813726722]},"language_model.model.dspark.layers.0.decoder_layer.mlp.up_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[813726722,816086018]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.k_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[816086018,819231746]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.k_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[819231746,819330050]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.o_proj.weight":{"dtype":"F8_E4M3","shape":[6144,8192],"data_offsets":[819330050,869661698]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.o_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,256],"data_offsets":[869661698,871234562]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.q_proj.weight":{"dtype":"F8_E4M3","shape":[8192,6144],"data_offsets":[871234562,921566210]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.q_proj.weight_scale_inv":{"dtype":"U8","shape":[8192,192],"data_offsets":[921566210,923139074]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.v_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[923139074,926284802]},"language_model.model.dspark.layers.0.decoder_layer.self_attn.v_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[926284802,926383106]},"language_model.model.dspark.layers.1.decoder_layer.mlp.down_proj.weight":{"dtype":"F8_E4M3","shape":[6144,12288],"data_offsets":[926383106,1001880578]},"language_model.model.dspark.layers.1.decoder_layer.mlp.down_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,384],"data_offsets":[1001880578,1004239874]},"language_model.model.dspark.layers.1.decoder_layer.mlp.gate_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[1004239874,1079737346]},"language_model.model.dspark.layers.1.decoder_layer.mlp.gate_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[1079737346,1082096642]},"language_model.model.dspark.layers.1.decoder_layer.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[1082096642,1157594114]},"language_model.model.dspark.layers.1.decoder_layer.mlp.up_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[1157594114,1159953410]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.k_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[1159953410,1163099138]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.k_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[1163099138,1163197442]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.o_proj.weight":{"dtype":"F8_E4M3","shape":[6144,8192],"data_offsets":[1163197442,1213529090]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.o_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,256],"data_offsets":[1213529090,1215101954]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.q_proj.weight":{"dtype":"F8_E4M3","shape":[8192,6144],"data_offsets":[1215101954,1265433602]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.q_proj.weight_scale_inv":{"dtype":"U8","shape":[8192,192],"data_offsets":[1265433602,1267006466]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.v_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[1267006466,1270152194]},"language_model.model.dspark.layers.1.decoder_layer.self_attn.v_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[1270152194,1270250498]},"language_model.model.dspark.layers.2.decoder_layer.mlp.down_proj.weight":{"dtype":"F8_E4M3","shape":[6144,12288],"data_offsets":[1270250498,1345747970]},"language_model.model.dspark.layers.2.decoder_layer.mlp.down_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,384],"data_offsets":[1345747970,1348107266]},"language_model.model.dspark.layers.2.decoder_layer.mlp.gate_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[1348107266,1423604738]},"language_model.model.dspark.layers.2.decoder_layer.mlp.gate_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[1423604738,1425964034]},"language_model.model.dspark.layers.2.decoder_layer.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[1425964034,1501461506]},"language_model.model.dspark.layers.2.decoder_layer.mlp.up_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[1501461506,1503820802]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.k_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[1503820802,1506966530]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.k_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[1506966530,1507064834]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.o_proj.weight":{"dtype":"F8_E4M3","shape":[6144,8192],"data_offsets":[1507064834,1557396482]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.o_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,256],"data_offsets":[1557396482,1558969346]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.q_proj.weight":{"dtype":"F8_E4M3","shape":[8192,6144],"data_offsets":[1558969346,1609300994]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.q_proj.weight_scale_inv":{"dtype":"U8","shape":[8192,192],"data_offsets":[1609300994,1610873858]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.v_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[1610873858,1614019586]},"language_model.model.dspark.layers.2.decoder_layer.self_attn.v_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[1614019586,1614117890]},"language_model.model.dspark.layers.3.decoder_layer.mlp.down_proj.weight":{"dtype":"F8_E4M3","shape":[6144,12288],"data_offsets":[1614117890,1689615362]},"language_model.model.dspark.layers.3.decoder_layer.mlp.down_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,384],"data_offsets":[1689615362,1691974658]},"language_model.model.dspark.layers.3.decoder_layer.mlp.gate_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[1691974658,1767472130]},"language_model.model.dspark.layers.3.decoder_layer.mlp.gate_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[1767472130,1769831426]},"language_model.model.dspark.layers.3.decoder_layer.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[1769831426,1845328898]},"language_model.model.dspark.layers.3.decoder_layer.mlp.up_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[1845328898,1847688194]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.k_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[1847688194,1850833922]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.k_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[1850833922,1850932226]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.o_proj.weight":{"dtype":"F8_E4M3","shape":[6144,8192],"data_offsets":[1850932226,1901263874]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.o_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,256],"data_offsets":[1901263874,1902836738]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.q_proj.weight":{"dtype":"F8_E4M3","shape":[8192,6144],"data_offsets":[1902836738,1953168386]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.q_proj.weight_scale_inv":{"dtype":"U8","shape":[8192,192],"data_offsets":[1953168386,1954741250]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.v_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[1954741250,1957886978]},"language_model.model.dspark.layers.3.decoder_layer.self_attn.v_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[1957886978,1957985282]},"language_model.model.dspark.layers.4.decoder_layer.mlp.down_proj.weight":{"dtype":"F8_E4M3","shape":[6144,12288],"data_offsets":[1957985282,2033482754]},"language_model.model.dspark.layers.4.decoder_layer.mlp.down_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,384],"data_offsets":[2033482754,2035842050]},"language_model.model.dspark.layers.4.decoder_layer.mlp.gate_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[2035842050,2111339522]},"language_model.model.dspark.layers.4.decoder_layer.mlp.gate_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[2111339522,2113698818]},"language_model.model.dspark.layers.4.decoder_layer.mlp.up_proj.weight":{"dtype":"F8_E4M3","shape":[12288,6144],"data_offsets":[2113698818,2189196290]},"language_model.model.dspark.layers.4.decoder_layer.mlp.up_proj.weight_scale_inv":{"dtype":"U8","shape":[12288,192],"data_offsets":[2189196290,2191555586]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.k_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[2191555586,2194701314]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.k_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[2194701314,2194799618]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.o_proj.weight":{"dtype":"F8_E4M3","shape":[6144,8192],"data_offsets":[2194799618,2245131266]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.o_proj.weight_scale_inv":{"dtype":"U8","shape":[6144,256],"data_offsets":[2245131266,2246704130]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.q_proj.weight":{"dtype":"F8_E4M3","shape":[8192,6144],"data_offsets":[2246704130,2297035778]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.q_proj.weight_scale_inv":{"dtype":"U8","shape":[8192,192],"data_offsets":[2297035778,2298608642]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.v_proj.weight":{"dtype":"F8_E4M3","shape":[512,6144],"data_offsets":[2298608642,2301754370]},"language_model.model.dspark.layers.4.decoder_layer.self_attn.v_proj.weight_scale_inv":{"dtype":"U8","shape":[512,192],"data_offsets":[2301754370,2301852674]}}
+\ No newline at end of file
+diff --git a/zig/src/families/minimax_m3/native.zig b/zig/src/families/minimax_m3/native.zig
+index 6442788..52f376d 100644
+--- a/zig/src/families/minimax_m3/native.zig
++++ b/zig/src/families/minimax_m3/native.zig
+@@ -16,6 +16,7 @@ const engine = @import("engine.zig");
+ const engine_dev = @import("engine_dev.zig");
+ const follow = @import("follow.zig");
+ const backend = @import("backend.zig");
++const dspark_config = @import("dspark_config.zig");
+ 
+ pub const model_type = config.model_type;
+ pub const formats: []const []const u8 = &.{"exl3"};
+@@ -25,6 +26,9 @@ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = iface.prefill_rows;
+ pub const window_rows: u32 = iface.window_rows;
+ pub const explains_open = true;
++// --drafter is refused in dspark_config.drafter_refusal's words: no MTP head, the dspark draft is not wired in yet
++pub const takes_drafter = false;
++pub const drafter_refusal = dspark_config.drafter_refusal;
+ // Decision M2: the backend owns a radix prompt cache over the pool's pages, so the host builds no snapshot store.
+ pub const owns_prompt_cache = iface.decisions.owns_prompt_cache;
+ 
+-- 
+2.43.0
+

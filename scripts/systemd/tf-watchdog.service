@@ -1,0 +1,20 @@
+# One watchdog tick for the TP=2 pair (scripts/serve.sh watch --once), run by tf-watchdog.timer. Healing: WATCH_HEAL=1
+# (it restarts both ranks with scripts/serve.sh restart; WATCH_RESTART_CMD overrides). GUARD_CONFIG makes it obey the
+# guard's lifecycle. Settings come from config/prod.env like every other script.
+# Ported from the DeepSeek-V4.1 recipe (PR #48).
+[Unit]
+Description=TensorFold watchdog tick
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/minimax-m31-tensorfold-spark
+Environment=CONFIG=config/prod.env
+# Environment=GUARD_CONFIG=%h/.config/tf-guard/guard.json
+# Environment=WATCH_HEAL=1
+ExecStart=/usr/bin/env bash scripts/serve.sh watch --once
+# an unhealthy tick is logged, not a unit failure that trips start limits
+SuccessExitStatus=1
+# the heal runs detached: keep it alive when the oneshot exits
+KillMode=process
+TimeoutStartSec=120

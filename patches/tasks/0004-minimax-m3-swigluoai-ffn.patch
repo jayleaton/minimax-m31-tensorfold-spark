@@ -1,0 +1,1324 @@
+From 101fa05d5f26175d2bc8adf939105e334808c6ae Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:05:13 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: swigluoai FFN epilogues, pointwise kernel
+ and router (T4)
+
+Adds act_mode 2/3 (swigluoai: gate clamped above, or both sides; alpha, limit and
+the "+1" are kernel arguments, not constants) to the grouped-expert and EXL3
+epilogues: exl3_experts.cu (decode gateup epilogue, plan_finish, prompt_gu),
+x3gm/x3gm2/x3gm3 and x3ld_epi. act_mode 0/1 take the same code as before.
+minimax_m3_act.cu holds the pointwise swigluoai for the dense layers and the
+shared expert, and tf_mm3_route_warp, a router ranking by sigmoid(logit) + bias
+(moe_glue's tf_moe_topk_sigmoid ranks by logit + bias, which differs once the
+correction bias is non-zero).
+
+Zig: exl3_experts.Layer.act_mode/alpha/up_bias, Stage and launch plumbing,
+exl3_block Act/Epi/GmArgs fields, cuda/minimax_m3_act.zig, families/minimax_m3/ffn.zig
+(switch -> argument mapping, route plan), registry records, a contract test with
+float64 reference and two planted controls. Nothing here has run on a GPU.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/cuda.zig                         |   1 +
+ zig/build/cuda_kernels.zig                 |   1 +
+ zig/build/cuda_row_contracts.zig           |   2 +-
+ zig/build/minimax_ref_host.zig             |  14 ++
+ zig/kernels/cuda/contract_controls.cu      |  23 +++
+ zig/kernels/cuda/exl3_block/x3gm.cu        |  16 +-
+ zig/kernels/cuda/exl3_block/x3gm2.cuh      |  13 +-
+ zig/kernels/cuda/exl3_block/x3gm3.cu       |  13 +-
+ zig/kernels/cuda/exl3_block/x3ld_epi.cu    |  12 +-
+ zig/kernels/cuda/exl3_experts.cu           |  19 +-
+ zig/kernels/cuda/exl3_prompt.cuh           |   9 +-
+ zig/kernels/cuda/minimax_m3_act.cu         |  94 ++++++++++
+ zig/kernels/cuda/minimax_m3_act.cuh        |  30 ++++
+ zig/src/core/contract/registry.zig         |   6 +-
+ zig/src/core/contract/registry_minimax.zig |   9 +
+ zig/src/cuda/exl3_block_exl3.zig           |  19 +-
+ zig/src/cuda/exl3_block_x3gm.zig           |  11 +-
+ zig/src/cuda/exl3_experts.zig              |   6 +-
+ zig/src/cuda/exl3_grouped.zig              |   4 +-
+ zig/src/cuda/exl3_prompt.zig               |   4 +-
+ zig/src/cuda/kernels.zig                   |   1 +
+ zig/src/cuda/minimax_m3_act.zig            | 134 ++++++++++++++
+ zig/src/cuda/root.zig                      |   2 +
+ zig/src/families/minimax_m3/ffn.zig        | 192 +++++++++++++++++++++
+ zig/tests/cuda/contract_minimax_act.zig    | 175 +++++++++++++++++++
+ zig/tests/cuda/contract_tests.zig          |  10 +-
+ 26 files changed, 788 insertions(+), 32 deletions(-)
+ create mode 100644 zig/kernels/cuda/minimax_m3_act.cu
+ create mode 100644 zig/kernels/cuda/minimax_m3_act.cuh
+ create mode 100644 zig/src/core/contract/registry_minimax.zig
+ create mode 100644 zig/src/cuda/minimax_m3_act.zig
+ create mode 100644 zig/src/families/minimax_m3/ffn.zig
+ create mode 100644 zig/tests/cuda/contract_minimax_act.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 0f42b0d..055b512 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -271,6 +271,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("living_dense.zig").host(b, cuda, mods.qwen35, draft_ids, runtime, family, kernels.len);
+     @import("cuda_family_host.zig").steps(b, cuda, mods, step);
+     @import("minimax_ref_host.zig").steps(b, host, mods.core, step);
++    @import("minimax_ref_host.zig").ffn(b, host, mods.core, cuda, step);
+     const exl3_host = b.step("test-exl3-cuda-host", "EXL3 loader and CUDA host regressions without a GPU");
+     const exl3_compile = b.addObject(.{ .name = "exl3_host_compile", .root_module = b.createModule(.{
+         .root_source_file = b.path("zig/tests/exl3_compile.zig"),
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 9315da5..108b565 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -87,6 +87,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "window_attention", .flags = &.{"-O3"} }, // ours: sliding-window attention (cuda/window_attention.zig)
+     .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k and the weighted combine (cuda/moe_glue.zig)
+     .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig)
++    .{ .name = "minimax_m3_act", .flags = &.{"-O3"} }, // ours: MiniMax-M3.1-Flash swigluoai for the dense and shared experts (cuda/minimax_m3_act.zig)
+     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
+     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // GLM: the Python family's glm5_next/cuda/kda.cu
+     .{ .name = "glm_glue", .flags = &.{"-O3"} }, // ours: the Python family's Triton glue by hand, its PTX op for op
+diff --git a/zig/build/cuda_row_contracts.zig b/zig/build/cuda_row_contracts.zig
+index 9bb49f8..da02ebd 100644
+--- a/zig/build/cuda_row_contracts.zig
++++ b/zig/build/cuda_row_contracts.zig
+@@ -2,7 +2,7 @@
+ const std = @import("std");
+ 
+ pub fn host(b: *std.Build, target: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, step: *std.Build.Step) void {
+-    for ([_][]const u8{ "contract_norms_tail.zig", "contract_act_round.zig", "contract_embed.zig", "contract_qk_round.zig" }) |name| {
++    for ([_][]const u8{ "contract_norms_tail.zig", "contract_act_round.zig", "contract_embed.zig", "contract_qk_round.zig", "contract_minimax_act.zig" }) |name| {
+         const m = b.createModule(.{
+             .root_source_file = b.path(b.pathJoin(&.{ "zig/tests/cuda", name })),
+             .target = target,
+diff --git a/zig/build/minimax_ref_host.zig b/zig/build/minimax_ref_host.zig
+index b94dec1..b14bdc9 100644
+--- a/zig/build/minimax_ref_host.zig
++++ b/zig/build/minimax_ref_host.zig
+@@ -18,3 +18,17 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Mod
+     b.step("test-minimax-ref", "MiniMax-M3.1-Flash float64 CPU reference tests without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
+ }
++
++/// The FFN wiring's host tests (T4): switches to kernel arguments, layer descriptors, the router plan.
++pub fn ffn(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module, cuda: *std.Build.Module, umbrella: *std.Build.Step) void {
++    const m = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/ffn.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda } },
++    });
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
++    b.step("test-minimax-ffn", "MiniMax-M3.1-Flash FFN wiring (swigluoai switches, router plan) without a GPU").dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++}
+diff --git a/zig/kernels/cuda/contract_controls.cu b/zig/kernels/cuda/contract_controls.cu
+index afa625a..85683b0 100644
+--- a/zig/kernels/cuda/contract_controls.cu
++++ b/zig/kernels/cuda/contract_controls.cu
+@@ -135,3 +135,26 @@ TF_CTL_TAIL(tf_ctl_tail_drop_branch_out, tf_rms_tail::BRANCH_OUT)
+ TF_CTL_TAIL(tf_ctl_tail_drop_sum, tf_rms_tail::SUM)
+ TF_CTL_TAIL(tf_ctl_tail_drop_row, tf_rms_tail::ROW)
+ #undef TF_CTL_TAIL
++
++// Gate 1 (mode 0) and gate 3 (mode 1): minimax_m3_act.cu's swigluoai bf16 rows with one fault each. Mode 0 clamps by
++// fminf/fmaxf, which hand back the limit for a NaN (the plan's "fminf drops NaN"), so a NaN input reads as a finite number.
++// Mode 1 is right at whole 256-value tiles and loses the last value of a row otherwise.
++#include "minimax_m3_act.cuh"
++
++extern "C" __global__ void __launch_bounds__(256) tf_ctl_mm3_act(const __nv_bfloat16* gate, const __nv_bfloat16* up,
++                                                                  __nv_bfloat16* out, int n, float alpha, float limit,
++                                                                  float up_bias, int mode) {
++    const int64_t r = blockIdx.x;
++    const int i = blockIdx.y * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    if (mode == 1 && n % 256 != 0 && i == n - 1) return;
++    float g = __bfloat162float(gate[r * n + i]);
++    float u = __bfloat162float(up[r * n + i]);
++    if (mode == 0) {
++        g = fminf(g, limit);
++        u = fminf(fmaxf(u, -limit), limit);
++        out[r * n + i] = __float2bfloat16_rn(tf_mm3::swigluoai(g, u, alpha, 0.f, up_bias, false));
++        return;
++    }
++    out[r * n + i] = __float2bfloat16_rn(tf_mm3::swigluoai(g, u, alpha, limit, up_bias, false));
++}
+diff --git a/zig/kernels/cuda/exl3_block/x3gm.cu b/zig/kernels/cuda/exl3_block/x3gm.cu
+index b03465d..289052e 100644
+--- a/zig/kernels/cuda/exl3_block/x3gm.cu
++++ b/zig/kernels/cuda/exl3_block/x3gm.cu
+@@ -8,6 +8,7 @@
+ #include <cuda_bf16.h>
+ 
+ #include "../exl3_decode.cuh"
++#include "../minimax_m3_act.cuh"
+ #include "experts_grouped.cuh"
+ 
+ namespace dsv41_x3gm {
+@@ -99,6 +100,8 @@ struct Args {
+     float* y;                 // down out [P, N]
+     int K, N;
+     float limit;
++    int act_mode;             // 0: the silu path above; 2, 3: minimax_m3_act.cuh's swigluoai (gate/up only)
++    float alpha, up_bias;     // act_mode 2 and 3
+ };
+ 
+ template <int MATS, int XM, int K2, int MTL, int NG, int KS, int NSA, int NGR>
+@@ -237,9 +240,16 @@ __global__ void __launch_bounds__(Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>::THRE
+                     tf_exl3::fwht128(u, lane);
+ #pragma unroll
+                     for (int j = 0; j < 4; ++j) {                 // upstream gateup_epilogue, ACT_F32
+-                        const float gg = fminf(v[j] * HAD * __half2float(a.sv0[col + j]), a.limit);
+-                        const float uu = fminf(fmaxf(u[j] * HAD * __half2float(a.sv1[col + j]), -a.limit), a.limit);
+-                        const float act = gg / (1.f + expf(-gg)) * uu;
++                        const float gr = v[j] * HAD * __half2float(a.sv0[col + j]);
++                        const float ur = u[j] * HAD * __half2float(a.sv1[col + j]);
++                        float act;
++                        if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {                // MiniMax swigluoai (act_mode 2, 3)
++                            act = tf_mm3::swigluoai(gr, ur, a.alpha, a.limit, a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++                        } else {
++                            const float gg = fminf(gr, a.limit);
++                            const float uu = fminf(fmaxf(ur, -a.limit), a.limit);
++                            act = gg / (1.f + expf(-gg)) * uu;
++                        }
+                         v[j] = act * __half2float(a.sd[col + j]);
+                     }
+                     tf_exl3::fwht128(v, lane);
+diff --git a/zig/kernels/cuda/exl3_block/x3gm2.cuh b/zig/kernels/cuda/exl3_block/x3gm2.cuh
+index 5260925..5bf2eba 100644
+--- a/zig/kernels/cuda/exl3_block/x3gm2.cuh
++++ b/zig/kernels/cuda/exl3_block/x3gm2.cuh
+@@ -176,9 +176,16 @@ __device__ __forceinline__ void gm2_item(const Args& a, unsigned char* smem, con
+                 tf_exl3::fwht128(u, lane);
+ #pragma unroll
+                 for (int j = 0; j < 4; ++j) {                 // upstream gateup_epilogue, ACT_F32
+-                    const float gg = fminf(v[j] * HAD * __half2float(a.sv0[col + j]), a.limit);
+-                    const float uu = fminf(fmaxf(u[j] * HAD * __half2float(a.sv1[col + j]), -a.limit), a.limit);
+-                    const float act = gg / (1.f + expf(-gg)) * uu;
++                    const float gr = v[j] * HAD * __half2float(a.sv0[col + j]);
++                    const float ur = u[j] * HAD * __half2float(a.sv1[col + j]);
++                    float act;
++                    if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {                // MiniMax swigluoai (act_mode 2, 3)
++                        act = tf_mm3::swigluoai(gr, ur, a.alpha, a.limit, a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++                    } else {
++                        const float gg = fminf(gr, a.limit);
++                        const float uu = fminf(fmaxf(ur, -a.limit), a.limit);
++                        act = gg / (1.f + expf(-gg)) * uu;
++                    }
+                     v[j] = act * __half2float(a.sd[col + j]);
+                 }
+                 tf_exl3::fwht128(v, lane);
+diff --git a/zig/kernels/cuda/exl3_block/x3gm3.cu b/zig/kernels/cuda/exl3_block/x3gm3.cu
+index f9c2a53..24ca735 100644
+--- a/zig/kernels/cuda/exl3_block/x3gm3.cu
++++ b/zig/kernels/cuda/exl3_block/x3gm3.cu
+@@ -223,9 +223,16 @@ __device__ __forceinline__ void gm3_item(const Args& a, unsigned char* smem, con
+                 tf_exl3::fwht128(u, lane);
+ #pragma unroll
+                 for (int j = 0; j < 4; ++j) {
+-                    const float gg = fminf(v[j] * HAD * __half2float(a.sv0[col + j]), a.limit);
+-                    const float uu = fminf(fmaxf(u[j] * HAD * __half2float(a.sv1[col + j]), -a.limit), a.limit);
+-                    const float act = gg / (1.f + expf(-gg)) * uu;
++                    const float gr = v[j] * HAD * __half2float(a.sv0[col + j]);
++                    const float ur = u[j] * HAD * __half2float(a.sv1[col + j]);
++                    float act;
++                    if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {                // MiniMax swigluoai (act_mode 2, 3)
++                        act = tf_mm3::swigluoai(gr, ur, a.alpha, a.limit, a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++                    } else {
++                        const float gg = fminf(gr, a.limit);
++                        const float uu = fminf(fmaxf(ur, -a.limit), a.limit);
++                        act = gg / (1.f + expf(-gg)) * uu;
++                    }
+                     v[j] = act * __half2float(a.sd[col + j]);
+                 }
+                 tf_exl3::fwht128(v, lane);
+diff --git a/zig/kernels/cuda/exl3_block/x3ld_epi.cu b/zig/kernels/cuda/exl3_block/x3ld_epi.cu
+index 3c5da62..dfbce2f 100644
+--- a/zig/kernels/cuda/exl3_block/x3ld_epi.cu
++++ b/zig/kernels/cuda/exl3_block/x3ld_epi.cu
+@@ -4,6 +4,7 @@
+ 
+ #include "x3ld.cu"
+ #include "exl3_experts.cu"
++#include "../minimax_m3_act.cuh"
+ 
+ namespace dsv41_x3ld_epi {
+ 
+@@ -28,13 +29,14 @@ struct Epi {
+     int E;
+     float limit;
+     int act_mode;
++    float alpha, up_bias;  // act_mode 2, 3 (minimax_m3_act.cuh's swigluoai); 0 elsewhere
+ };
+ 
+ // gateup_epilogue_kernel's body for program (p, blk) on one warp (Z read through L2: other CTAs wrote it).
+ __device__ __forceinline__ void gateup_block(const float* __restrict__ Z, int e, const half* __restrict__ svh_g,
+                                              const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+                                              half* __restrict__ xd, int p, int blk, int lane, int P, int N, int SK,
+-                                             float limit, int act_mode) {
++                                             float limit, int act_mode, float alpha, float up_bias) {
+     const int n = blk * 128 + 4 * lane;
+     float gv[4], uv[4];
+ #pragma unroll
+@@ -53,7 +55,11 @@ __device__ __forceinline__ void gateup_block(const float* __restrict__ Z, int e,
+ #pragma unroll
+     for (int j = 0; j < 4; ++j) {
+         float act;
+-        if (act_mode == 0) {
++        if (act_mode >= tf_mm3::ACT_SWIGLUOAI) {
++            act = tf_mm3::swigluoai(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]),
++                                    uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]), alpha, limit, up_bias,
++                                    act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++        } else if (act_mode == 0) {
+             float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
+             float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
+                              limit);
+@@ -187,7 +193,7 @@ __device__ __forceinline__ void epi_body(const half* __restrict__ X0, const half
+             if (p < 0) continue;
+             const int ep = a.pick[p];
+             if (ep < 0 || ep >= a.E) continue;                       // gateup_epilogue_kernel's exit
+-            gateup_block(Z, ep, a.sv0, a.sv1, a.sd, a.xd, p, blockIdx.y, lane, P, N, SK, a.limit, a.act_mode);
++            gateup_block(Z, ep, a.sv0, a.sv1, a.sd, a.xd, p, blockIdx.y, lane, P, N, SK, a.limit, a.act_mode, a.alpha, a.up_bias);
+         }
+     } else {
+         // ---- down_combine's per-slot part from the complete Z in shared memory (SK 1) ----
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index ecb651d..a5d979f 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -5,6 +5,7 @@
+ #include <cuda_fp16.h>
+ 
+ #include "exl3_decode.cuh"
++#include "minimax_m3_act.cuh"
+ 
+ namespace tf_exl3 {
+ 
+@@ -274,6 +275,7 @@ struct GateUpArgs {
+     int p, n, sk, experts;
+     float limit;
+     int act_mode;
++    float alpha, up_bias; // act_mode 2 and 3 (swigluoai); ignored by 0 and 1
+ };
+ 
+ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
+@@ -299,7 +301,11 @@ extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
+ #pragma unroll
+     for (int j = 0; j < 4; ++j) {
+         float act;
+-        if (a.act_mode == 0) {
++        if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {
++            act = tf_mm3::swigluoai(gv[j] * HAD_SCALE * __half2float(a.svh_g[(size_t)e * a.n + n + j]),
++                                    uv[j] * HAD_SCALE * __half2float(a.svh_u[(size_t)e * a.n + n + j]), a.alpha, a.limit,
++                                    a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++        } else if (a.act_mode == 0) {
+             float gg = bf16r(gv[j] * HAD_SCALE * __half2float(a.svh_g[(size_t)e * a.n + n + j]));
+             float uu = bf16r(uv[j] * HAD_SCALE * __half2float(a.svh_u[(size_t)e * a.n + n + j]));
+             if (a.limit > 0) { gg = upTo(gg, a.limit); uu = within(uu, a.limit); }
+@@ -384,6 +390,7 @@ struct PlanStage {
+     void* out;
+     int k, n, p, sk, slots, stride, skip, epi, act_mode;
+     float limit;
++    float alpha, up_bias; // act_mode 2 and 3 (swigluoai); ignored by 0 and 1
+ };
+ 
+ extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
+@@ -424,11 +431,15 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
+             float v = g[q] * tf_exl3::HAD_SCALE * __half2float(a.sv0[(size_t)e * a.n + n + q]);
+             if (a.epi == 2) {
+                 float up = u[q] * tf_exl3::HAD_SCALE * __half2float(a.sv1[(size_t)e * a.n + n + q]);
++                if (a.act_mode >= tf_mm3::ACT_SWIGLUOAI) {
++                    v = tf_mm3::swigluoai(v, up, a.alpha, a.limit, a.up_bias, a.act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++                } else {
+                 if (a.act_mode == 0) { v = tf_exl3::bf16r(v); up = tf_exl3::bf16r(up); }
+                 if (a.limit > 0) { v = tf_exl3::upTo(v, a.limit); up = tf_exl3::within(up, a.limit); }
+                 v = v / (1.f + expf(-v));
+                 if (a.act_mode == 0) v = tf_exl3::bf16r(v);
+                 v *= up;
++                }
+             }
+             const size_t at = (size_t)p * a.n + n + q;
+             if (a.epi == 0) reinterpret_cast<float*>(a.out)[at] = v;
+@@ -458,12 +469,12 @@ extern "C" __global__ void tf_exl3_prompt_rotate(const __nv_bfloat16* __restrict
+ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu(const half* __restrict__ Xg, const half* __restrict__ Xu,
+         const uint64_t* __restrict__ Tg, const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+         const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+-        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode) {
++        half* __restrict__ xd, int K, int N, int xdiv, float limit, int act_mode, float alpha, float up_bias) {
+ 
+     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];   // one buffer for either instantiation
+     __shared__ int rows_sh[TPM];
+-    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, smem_raw, rows_sh);
+-    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, smem_raw, rows_sh);
++    if (xdiv > 1) tgateup<TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, xdiv, limit, act_mode, alpha, up_bias, smem_raw, rows_sh);
++    else tgateup<2 * TPM>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, act_mode, alpha, up_bias, smem_raw, rows_sh);
+ }
+ 
+ // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
+diff --git a/zig/kernels/cuda/exl3_prompt.cuh b/zig/kernels/cuda/exl3_prompt.cuh
+index 067c3aa..5666e78 100644
+--- a/zig/kernels/cuda/exl3_prompt.cuh
++++ b/zig/kernels/cuda/exl3_prompt.cuh
+@@ -144,7 +144,7 @@ template <int XR>
+ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
+         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
+         const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
+-        int K, int N, int xdiv, float limit, int act_mode, unsigned char* smem_raw, int* rows_sh) {
++        int K, int N, int xdiv, float limit, int act_mode, float alpha, float up_bias, unsigned char* smem_raw, int* rows_sh) {
+     const int cb = blockIdx.x, item = blockIdx.y;
+     if (item >= counts[0]) return;
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+@@ -177,12 +177,17 @@ __device__ __forceinline__ void tgateup(const half* __restrict__ Xg, const half*
+             for (int j = 0; j < 4; ++j) {
+                 float gg = gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]);
+                 float uu = uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]);
++                float act;
++                if (act_mode >= tf_mm3::ACT_SWIGLUOAI) {
++                    act = tf_mm3::swigluoai(gg, uu, alpha, limit, up_bias, act_mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++                } else {
+                 if (act_mode == 0) { gg = bf16r(gg); uu = bf16r(uu); }
+                 if (limit > 0) { gg = upTo(gg, limit); uu = within(uu, limit); }
+-                float act = gg / (1.f + expf(-gg));
++                act = gg / (1.f + expf(-gg));
+                 if (act_mode == 0) act = bf16r(act);
+                 act *= uu;
+                 if (act_mode == 0) act = bf16r(act);
++                }
+                 v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
+             }
+             fwht128(v, lane);
+diff --git a/zig/kernels/cuda/minimax_m3_act.cu b/zig/kernels/cuda/minimax_m3_act.cu
+new file mode 100644
+index 0000000..41cf0dd
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_act.cu
+@@ -0,0 +1,94 @@
++// MiniMax-M3.1-Flash's swigluoai as a pointwise kernel for the dense layers 0-2 and the shared expert, whose gate and up
++// are plain EXL3 dense linears (no fused epilogue). Float64 reference: core/minimax_ref.zig `swigluoai`.
++// out[r, i] = bf16(swigluoai(gate[r * g_ld + i], up[r * u_ld + i])), one thread a value, a row's bits depend on that row.
++// `mode` is minimax_m3_act.cuh's act_mode (2 or 3); alpha, limit and up_bias are launch arguments, not constants.
++
++#include <cuda_bf16.h>
++#include <math.h>
++#include <stdint.h>
++
++#include "minimax_m3_act.cuh"
++
++namespace {
++constexpr int NT = 256;
++}
++
++extern "C" __global__ void __launch_bounds__(NT) tf_mm3_swigluoai_bf16(
++        const __nv_bfloat16* __restrict__ gate, long long g_ld, const __nv_bfloat16* __restrict__ up, long long u_ld,
++        __nv_bfloat16* __restrict__ out, long long o_ld, int n, float alpha, float limit, float up_bias, int mode) {
++    const int64_t r = blockIdx.x;
++    const int i = blockIdx.y * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    const float v = tf_mm3::swigluoai(__bfloat162float(gate[r * g_ld + i]), __bfloat162float(up[r * u_ld + i]), alpha, limit,
++                                      up_bias, mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++    out[r * o_ld + i] = __float2bfloat16_rn(v);
++}
++
++// fp32 gate and up (a dense linear with an fp32 output), bf16 out: the next linear's input.
++extern "C" __global__ void __launch_bounds__(NT) tf_mm3_swigluoai_f32(
++        const float* __restrict__ gate, long long g_ld, const float* __restrict__ up, long long u_ld,
++        __nv_bfloat16* __restrict__ out, long long o_ld, int n, float alpha, float limit, float up_bias, int mode) {
++    const int64_t r = blockIdx.x;
++    const int i = blockIdx.y * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    const float v = tf_mm3::swigluoai(gate[r * g_ld + i], up[r * u_ld + i], alpha, limit, up_bias,
++                                      mode == tf_mm3::ACT_SWIGLUOAI_SYM);
++    out[r * o_ld + i] = __float2bfloat16_rn(v);
++}
++
++// MiniMax's router: top `topk` of 128-ish experts by sigmoid(logit) + bias (ties: lower id), weights sigmoid(logit) of the
++// picks, divided by their sum when `normalize`, times `scale`. moe_glue.cu's tf_moe_topk_sigmoid ranks by logit + bias
++// (the bias added in logit space), which picks differently from sigmoid(logit) + bias whenever the bias is not zero;
++// this kernel ranks as the plan's section 2 step 11b says. A warp a row, up to 4 * 32 experts, topk <= 32, slots = topk.
++// NaN rule (stated): a NaN score ranks as -inf (picked last, by lower id), so a pick is always a real expert.
++// Float64 reference: core/minimax_ref.zig `routerPick`.
++extern "C" __global__ void __launch_bounds__(256) tf_mm3_route_warp(const float* __restrict__ logits,
++        const float* __restrict__ bias, int* __restrict__ pick, float* __restrict__ wts, int rows, int ne, int topk,
++        int normalize, float scale) {
++    constexpr int PER = 4;
++    const int lane = threadIdx.x & 31;
++    const int64_t r = static_cast<int64_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
++    if (r >= rows) return;
++    const float* lg = logits + r * ne;
++    float x[PER], v[PER];
++    bool taken[PER];
++#pragma unroll
++    for (int j = 0; j < PER; ++j) {
++        const int e = lane + 32 * j;
++        x[j] = e < ne ? lg[e] : 0.f;
++        float s = __fadd_rn(__fdiv_rn(1.f, __fadd_rn(1.f, expf(-x[j]))), bias != nullptr && e < ne ? bias[e] : 0.f);
++        v[j] = (e < ne && s == s) ? s : -INFINITY;
++        taken[j] = e >= ne;
++    }
++    float xk = 0.f;  // lane k's pick's logit
++    int pk = 0;      // lane k's pick
++    for (int k = 0; k < topk; ++k) {
++        float bv = -INFINITY;
++        int bi = ne;
++        bool any = false;
++#pragma unroll
++        for (int j = 0; j < PER; ++j) {
++            const int e = lane + 32 * j;
++            if (!taken[j] && (!any || v[j] > bv)) bv = v[j], bi = e, any = true;  // e rises with j: the lower id keeps a tie
++        }
++        if (!any) bv = -INFINITY, bi = 0x7FFFFFFF;
++        for (int m = 16; m > 0; m >>= 1) {
++            const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
++            const int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
++            if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
++        }
++        float xb = 0.f;
++#pragma unroll
++        for (int j = 0; j < PER; ++j)
++            if (lane + 32 * j == bi) taken[j] = true, xb = x[j];
++        xb = __shfl_sync(0xFFFFFFFFu, xb, bi & 31);
++        if (lane == k) xk = xb, pk = bi;
++    }
++    const float wk = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-xk)));
++    float sum = 0.f;
++    for (int k = 0; k < topk; ++k) sum = __fadd_rn(sum, __shfl_sync(0xFFFFFFFFu, wk, k));
++    if (lane < topk) {
++        pick[r * topk + lane] = pk;
++        wts[r * topk + lane] = __fmul_rn(normalize ? __fdiv_rn(wk, sum) : wk, scale);
++    }
++}
+diff --git a/zig/kernels/cuda/minimax_m3_act.cuh b/zig/kernels/cuda/minimax_m3_act.cuh
+new file mode 100644
+index 0000000..e677078
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_act.cuh
+@@ -0,0 +1,30 @@
++// MiniMax-M3.1-Flash's swigluoai, one definition for every fused epilogue and the pointwise kernel.
++// Written from the engine-port plan's formula (section 2), no third-party code:
++//   g = min(g, limit) (act_mode 3: clamp(g, -limit, limit)), u = clamp(u, -limit, limit),
++//   out = g * sigmoid(alpha * g) * (u + up_bias), fp32 throughout.
++// alpha 1.702, limit 7 and up_bias 1 are the plan's REFERENCE values; the gate/up assignment, the "+1" and the gate
++// clamp are UNVERIFIED against upstream, so each is a parameter (up_bias 0 drops the +1, mode 3 is the symmetric
++// clamp; w1-is-gate is the caller's choice of which projection it passes as g).
++// A NaN in g or u stays a NaN: the clamps are compares, not fminf/fmaxf (which hand back the limit).
++// limit <= 0 means no clamp, as for the silu paths.
++#pragma once
++
++namespace tf_mm3 {
++
++constexpr int ACT_SWIGLUOAI = 2;      // gate clamped above only
++constexpr int ACT_SWIGLUOAI_SYM = 3;  // gate clamped on both sides
++
++__device__ __forceinline__ float hi_clamp(float x, float l) { return x > l ? l : x; }
++__device__ __forceinline__ float both_clamp(float x, float l) { return x > l ? l : (x < -l ? -l : x); }
++
++// Exactly rounded division on purpose (act_rows.cu does the same): the same bits on every GPU.
++__device__ __forceinline__ float swigluoai(float g, float u, float alpha, float limit, float up_bias, bool sym) {
++    if (limit > 0.f) {
++        g = sym ? both_clamp(g, limit) : hi_clamp(g, limit);
++        u = both_clamp(u, limit);
++    }
++    const float sg = __fdiv_rn(g, __fadd_rn(1.f, expf(-__fmul_rn(alpha, g))));  // g * sigmoid(alpha * g)
++    return __fmul_rn(sg, __fadd_rn(u, up_bias));
++}
++
++}  // namespace tf_mm3
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index faa99bb..02c2d7c 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -168,12 +168,12 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_0", .symbol = "tf_exl3_grouped_0", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_1", .symbol = "tf_exl3_grouped_1", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 }, .{ .regs = 127, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_grouped_2", .symbol = "tf_exl3_grouped_2", .image = "exl3_experts", .threads = 128 }, .usage = .{ .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 }, .{ .regs = 128, .static = 32832, .bound = 0 } } },
+-    .{ .launch = .{ .name = "exl3_experts tf_exl3_gateup_epilogue", .symbol = "tf_exl3_gateup_epilogue", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
++    .{ .launch = .{ .name = "exl3_experts tf_exl3_gateup_epilogue", .symbol = "tf_exl3_gateup_epilogue", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 38, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_down_combine", .symbol = "tf_exl3_down_combine", .image = "exl3_experts", .threads = 1024 }, .usage = .{ .{ .regs = 32, .static = 16384, .bound = 0 }, .{ .regs = 40, .static = 16384, .bound = 0 }, .{ .regs = 40, .static = 16384, .bound = 0 }, .{ .regs = 44, .static = 16384, .bound = 0 }, .{ .regs = 44, .static = 16384, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_plan_rotate", .symbol = "tf_exl3_plan_rotate", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 33, .static = 0, .bound = 0 }, .{ .regs = 33, .static = 0, .bound = 0 }, .{ .regs = 31, .static = 0, .bound = 0 }, .{ .regs = 31, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_plan_finish", .symbol = "tf_exl3_plan_finish", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 }, .{ .regs = 40, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_rotate", .symbol = "tf_exl3_prompt_rotate", .image = "exl3_experts", .threads = 32 }, .usage = .{ .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 24, .static = 0, .bound = 0 }, .{ .regs = 20, .static = 0, .bound = 0 }, .{ .regs = 20, .static = 0, .bound = 0 } } },
+-    .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_gu", .symbol = "tf_exl3_prompt_gu", .image = "exl3_experts", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 124, .static = 43264, .bound = 256 }, .{ .regs = 124, .static = 43264, .bound = 256 } } },
++    .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_gu", .symbol = "tf_exl3_prompt_gu", .image = "exl3_experts", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 43264, .bound = 256 }, .{ .regs = 128, .static = 43264, .bound = 256 }, .{ .regs = 128, .static = 43264, .bound = 256 }, .{ .regs = 124, .static = 43264, .bound = 256 }, .{ .regs = 124, .static = 43264, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_experts tf_exl3_prompt_down", .symbol = "tf_exl3_prompt_down", .image = "exl3_experts", .threads = 256 }, .usage = .{ .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 }, .{ .regs = 126, .static = 43264, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_candidate tf_exl3_tc_0", .symbol = "tf_exl3_tc_0", .image = "exl3_candidate", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 } } },
+     .{ .launch = .{ .name = "exl3_candidate tf_exl3_tc_1", .symbol = "tf_exl3_tc_1", .image = "exl3_candidate", .threads = 256 }, .usage = .{ .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 }, .{ .regs = 128, .static = 8196, .bound = 256 } } },
+@@ -192,7 +192,7 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "experts3_prefill down", .symbol = "_ZN19tf_experts3_prefill14prefill_kernelILi1ELi3ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3_prefill", .threads = 256, .dynamic = 47104, .opt_in = true }, .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_widen", .symbol = "tf_experts3_widen", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_planes", .symbol = "tf_experts3_planes", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 } } },
+-} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda;
++} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("registry_minimax.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda;
+ 
+ /// The nvcc release `cuda`'s usage records come from: the compiler that builds the release fatbins.
+ pub const cuda_release: limits.Nvcc = .{ .major = 13, .minor = 0 };
+diff --git a/zig/src/core/contract/registry_minimax.zig b/zig/src/core/contract/registry_minimax.zig
+new file mode 100644
+index 0000000..b466327
+--- /dev/null
++++ b/zig/src/core/contract/registry_minimax.zig
+@@ -0,0 +1,9 @@
++//! MiniMax-M3.1-Flash's CUDA launch records (minimax_m3_act.cu): swigluoai for the dense layers and the shared expert, and
++//! the sigmoid-plus-bias router. Registers per nvcc 13.0 compile for sm_80, 86, 89, 120, 121 (cuobjdump --dump-resource-usage).
++pub fn records(comptime Record: type) [3]Record {
++    return .{
++        .{ .launch = .{ .name = "minimax_m3_act tf_mm3_swigluoai_bf16", .symbol = "tf_mm3_swigluoai_bf16", .image = "minimax_m3_act", .threads = 256 }, .usage = .{ .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 20, .static = 0, .bound = 256 }, .{ .regs = 20, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } } },
++        .{ .launch = .{ .name = "minimax_m3_act tf_mm3_swigluoai_f32", .symbol = "tf_mm3_swigluoai_f32", .image = "minimax_m3_act", .threads = 256 }, .usage = .{ .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 20, .static = 0, .bound = 256 }, .{ .regs = 20, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 }, .{ .regs = 18, .static = 0, .bound = 256 } } },
++        .{ .launch = .{ .name = "minimax_m3_act tf_mm3_route_warp", .symbol = "tf_mm3_route_warp", .image = "minimax_m3_act", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 }, .{ .regs = 33, .static = 0, .bound = 256 } } },
++    };
++}
+diff --git a/zig/src/cuda/exl3_block_exl3.zig b/zig/src/cuda/exl3_block_exl3.zig
+index bd1ee6f..b616459 100644
+--- a/zig/src/cuda/exl3_block_exl3.zig
++++ b/zig/src/cuda/exl3_block_exl3.zig
+@@ -296,10 +296,12 @@ pub const Epi = extern struct {
+     E: c_int = 0,
+     limit: f32 = 0,
+     act_mode: c_int = 0,
++    alpha: f32 = 0, // act_mode 2, 3: swigluoai
++    up_bias: f32 = 0,
+ };
+ 
+ comptime {
+-    std.debug.assert(@sizeOf(Epi) == 88 and @offsetOf(Epi, "E") == 72);
++    std.debug.assert(@sizeOf(Epi) == 96 and @offsetOf(Epi, "E") == 72 and @offsetOf(Epi, "alpha") == 84);
+ }
+ 
+ /// The ticket words a fused launch counts on (gate/up: expert x member tile x 128 columns; down: row x 128 columns).
+@@ -319,10 +321,23 @@ pub fn x3ldEpiCheck(g: Grouped, kind: EpiKind, pd: u32) Error!struct { pd: usize
+     return .{ .pd = pi, .range = c.range };
+ }
+ 
++/// The gate/up activation of the x3gm launches (gmGateup, gm2Gateup, gm3Gateup): silu by default (mode 0), or MiniMax's
++/// swigluoai (mode 2: gate clamped above, 3: both sides; `limit` is the launch's limit argument).
++pub const Act = struct {
++    mode: c_int = 0,
++    alpha: f32 = 0,
++    up_bias: f32 = 0,
++
++    pub fn swigluoai(alpha: f32, up_bias: f32, symmetric_gate_clamp: bool) Act {
++        return .{ .mode = if (symmetric_gate_clamp) 3 else 2, .alpha = alpha, .up_bias = up_bias };
++    }
++};
++
+ pub const Ops = struct {
+     f: *const Functions,
+     s: cuda.Stream,
+     sms: usize,
++    act: Act = .{},
+ 
+     /// x3ld (expert_loads.grouped): Z of every (mat, split, live member row, column), upstream's bits.
+     pub fn x3ld(o: Ops, g: Grouped, nt: u32, pd: u32, probe: u32, pdl: bool) !void {
+@@ -398,6 +413,8 @@ pub const Ops = struct {
+ 
+     /// exl3x_gateup_epilogue_cuda: splits summed, rotated, * svh, SwiGLU (act_mode 0 bf16 roundings, 1 fp32), Xd.
+     pub fn gateupEpilogue(o: Ops, z: u64, pick: u64, svh_g: u64, svh_u: u64, suh_d: u64, xd: u64, rows: usize, P: usize, N: usize, SK: usize, slots: usize, E: usize, limit: f32, act_mode: c_int) !void {
++        // This entry point is DeepSeek's mangled kernel: it has no swigluoai arm (x3ld_epi's and the x3gm launches' do).
++        if (act_mode != 0 and act_mode != 1) return error.Unsupported;
+         var a: cuda.Args = .{};
+         for ([_]u64{ z, pick, svh_g, svh_u, suh_d, xd }) |v| a.add(v);
+         for ([_]usize{ P, N, SK, E }) |v| a.add(int(v));
+diff --git a/zig/src/cuda/exl3_block_x3gm.zig b/zig/src/cuda/exl3_block_x3gm.zig
+index 1091264..be0f26b 100644
+--- a/zig/src/cuda/exl3_block_x3gm.zig
++++ b/zig/src/cuda/exl3_block_x3gm.zig
+@@ -214,10 +214,13 @@ pub const GmArgs = extern struct {
+     K: c_int = 0,
+     N: c_int = 0,
+     limit: f32 = 0,
++    act_mode: c_int = 0, // 0: silu; 2, 3: swigluoai (gate/up launches only)
++    alpha: f32 = 0,
++    up_bias: f32 = 0,
+ };
+ 
+ comptime {
+-    std.debug.assert(@sizeOf(GmArgs) == 160 and @offsetOf(GmArgs, "k2e") == 48 and @offsetOf(GmArgs, "K") == 144 and @offsetOf(GmArgs, "limit") == 152);
++    std.debug.assert(@sizeOf(GmArgs) == 168 and @offsetOf(GmArgs, "k2e") == 48 and @offsetOf(GmArgs, "K") == 144 and @offsetOf(GmArgs, "limit") == 152 and @offsetOf(GmArgs, "act_mode") == 156 and @offsetOf(GmArgs, "alpha") == 160);
+ }
+ 
+ /// x3gm's per-launch checks (launch<>): K in whole stages, N in 128-column Hadamard blocks.
+@@ -243,7 +246,7 @@ pub fn gmGateup(o: Ops, xg: u64, xu: u64, tg: u64, tu: u64, order: u64, pe: u64,
+     const ki = gmK2Index(k2) orelse return error.Unsupported;
+     if (cfg >= gu_tiles.len) return error.Unsupported;
+     try gmCheck(.gu, cfg, K, N);
+-    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
++    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit, .act_mode = o.act.mode, .alpha = o.act.alpha, .up_bias = o.act.up_bias };
+     if (tables) {
+         a.tp0 = tg;
+         a.tp1 = tu;
+@@ -275,7 +278,7 @@ pub fn gm2Gateup(o: Ops, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64, order: u6
+     const gu2 = cfg == gu2_cfg and !shx;
+     const ci = std.mem.indexOfScalar(usize, &v2_gu, cfg) orelse if (gu2) 0 else return error.Unsupported;
+     try gmCheck(.gu, cfg, K, N);
+-    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
++    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit, .act_mode = o.act.mode, .alpha = o.act.alpha, .up_bias = o.act.up_bias };
+     if (tables) {
+         a.tp0 = tg;
+         a.tp1 = tu;
+@@ -306,7 +309,7 @@ pub fn gm3Gateup(o: Ops, v: usize, xg: u64, xu: u64, tg: u64, tu: u64, k2e: u64,
+     const vv = v3_variants[v];
+     if (vv.mats != 2 or vv.xm != @as(u32, if (shx) 1 else 2)) return error.Unsupported;
+     if ((K / 16) % vv.t[2] != 0 or N % 128 != 0) return error.Shape;
+-    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit };
++    var a: GmArgs = .{ .x0 = xg, .x1 = xu, .k2e = k2e, .order = order, .pe = pe, .poff = poff, .pcnt = pcnt, .npass = npass, .ticket = ticket, .sv0 = svh_g, .sv1 = svh_u, .sd = suh_d, .xd = xd, .K = int(K), .N = int(N), .limit = limit, .act_mode = o.act.mode, .alpha = o.act.alpha, .up_bias = o.act.up_bias };
+     if (tables) {
+         a.tp0 = tg;
+         a.tp1 = tu;
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 4984b1a..32dafe1 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -37,7 +37,9 @@ pub const Layer = struct {
+     shared_input: bool = false, // the loader verified identical gate/up input scales across every expert
+     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
+     limit: f32 = 0, // the SwiGLU clamp (0: none)
+-    act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
++    act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32, 2/3: MiniMax swigluoai (3: both-sided gate clamp)
++    alpha: f32 = 1.702, // act_mode 2, 3: sigmoid(alpha * gate); ignored by 0 and 1
++    up_bias: f32 = 1.0, // act_mode 2, 3: the up side is (up + up_bias); 0 drops the "+1" (UNVERIFIED switch)
+ };
+ 
+ /// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
+@@ -232,6 +234,8 @@ pub const Experts = struct {
+         ep.add(i32d(l.experts));
+         ep.add(l.limit);
+         ep.add(l.act_mode);
++        ep.add(l.alpha);
++        ep.add(l.up_bias);
+         try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(p), .y = @intCast(w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
+ 
+         var dn: launch_.Args = .{};
+diff --git a/zig/src/cuda/exl3_grouped.zig b/zig/src/cuda/exl3_grouped.zig
+index 4bb3683..8a94f7c 100644
+--- a/zig/src/cuda/exl3_grouped.zig
++++ b/zig/src/cuda/exl3_grouped.zig
+@@ -31,6 +31,8 @@ const Stage = extern struct {
+     epi: i32,
+     act_mode: i32,
+     limit: f32,
++    alpha: f32,
++    up_bias: f32,
+ };
+ 
+ pub const UpContract = enum { bf16, combined_fp32 };
+@@ -81,7 +83,7 @@ pub const Grouped = struct {
+             .up => 2,
+             .down_f32 => 0,
+             .down_bf16 => 3,
+-        }, .act_mode = w.act_mode, .limit = w.limit };
++        }, .act_mode = w.act_mode, .limit = w.limit, .alpha = w.alpha, .up_bias = w.up_bias };
+         var rot: launch.Args = .{};
+         rot.add(a);
+         try launch.launch(g.kernels.plan_rotate, .{ .grid = .{ .x = @intCast(items), .y = @intCast(k / 128), .z = @intCast(mats) }, .block = .{ .x = 32 } }, s, &rot);
+diff --git a/zig/src/cuda/exl3_prompt.zig b/zig/src/cuda/exl3_prompt.zig
+index 635540e..bf9a05b 100644
+--- a/zig/src/cuda/exl3_prompt.zig
++++ b/zig/src/cuda/exl3_prompt.zig
+@@ -10,7 +10,7 @@ const Stream = @import("stream.zig").Stream;
+ pub const tile = 64;
+ pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize };
+ pub fn eligible(l: ex.Layer) bool {
+-    return l.codebook == .mcg and l.uniform_k2 == 8 and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode == 0 or l.act_mode == 1);
++    return l.codebook == .mcg and l.uniform_k2 == 8 and l.gu_stride == 0 and l.dims > 0 and l.width > 0 and l.dims % 256 == 0 and l.width % 128 == 0 and (l.act_mode >= 0 and l.act_mode <= 3);
+ }
+ fn mul(a: usize, b: usize) !usize {
+     return std.math.mul(usize, a, b) catch error.Exl3Shape;
+@@ -68,7 +68,7 @@ pub const Kernels = struct {
+             try launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(pairs), .y = @intCast(l.dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &args);
+         }
+         const items = grouped.maxItems(pairs, l.experts, tile);
+-        try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
++        try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, l.alpha, l.up_bias });
+         try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots) });
+     }
+ };
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 2b7ff0f..96f9b83 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -55,6 +55,7 @@ pub const block_attention: []const u8 = if (available) &Blob("fatbin_block_atten
+ pub const window_attention: []const u8 = if (available) &Blob("fatbin_window_attention").bytes else &.{};
+ pub const moe_glue: []const u8 = if (available) &Blob("fatbin_moe_glue").bytes else &.{};
+ pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
++pub const minimax_m3_act: []const u8 = if (available) &Blob("fatbin_minimax_m3_act").bytes else &.{};
+ pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
+ pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
+ pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
+diff --git a/zig/src/cuda/minimax_m3_act.zig b/zig/src/cuda/minimax_m3_act.zig
+new file mode 100644
+index 0000000..29a3ac4
+--- /dev/null
++++ b/zig/src/cuda/minimax_m3_act.zig
+@@ -0,0 +1,134 @@
++//! minimax_m3_act.cu: MiniMax-M3.1-Flash's swigluoai as a pointwise kernel, for the dense layers 0-2 and the shared
++//! expert (plain EXL3 linears with no fused epilogue). Float64 reference: core/minimax_ref.zig `swigluoai`.
++//! alpha, limit, up_bias and the gate clamp are launch arguments: the unverified switches are not compiled in.
++const std = @import("std");
++const kernels = @import("kernels.zig");
++const module = @import("module.zig");
++const launch_ = @import("launch.zig");
++const stream_ = @import("stream.zig");
++
++const Driver = @import("driver.zig").Driver;
++const Module = module.Module;
++const Function = module.Function;
++const Stream = stream_.Stream;
++
++const threads = 256;
++
++/// act_mode values shared with the fused epilogues (exl3_experts.Layer.act_mode, exl3_block_exl3.Act.mode).
++pub const mode_upper_clamp: i32 = 2;
++pub const mode_symmetric_clamp: i32 = 3;
++
++/// swigluoai(g, u) = clamp(g) * sigmoid(alpha * clamp(g)) * (clamp(u) + up_bias); `limit` <= 0 turns the clamps off.
++pub const Params = struct {
++    alpha: f32 = 1.702,
++    limit: f32 = 7.0,
++    up_bias: f32 = 1.0,
++    symmetric_gate_clamp: bool = false,
++
++    pub fn mode(p: Params) i32 {
++        return if (p.symmetric_gate_clamp) mode_symmetric_clamp else mode_upper_clamp;
++    }
++};
++
++pub const Input = enum { bf16, f32 };
++
++/// The launch's checks, apart from the device: n and every stride positive, rows within the grid.
++pub fn check(rows: usize, n: usize, g_ld: usize, u_ld: usize, o_ld: usize) error{RowShape}!void {
++    if (n == 0 or g_ld < n or u_ld < n or o_ld < n) return error.RowShape;
++    if (rows > std.math.maxInt(i32) or n > std.math.maxInt(i32)) return error.RowShape;
++    if ((n + threads - 1) / threads > 65535) return error.RowShape;
++}
++
++pub const MiniMaxAct = struct {
++    mod: Module,
++    bf16_fn: Function,
++    f32_fn: Function,
++    route_fn: Function,
++
++    pub fn load(d: *const Driver) !MiniMaxAct {
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var mod = try Module.load(d, kernels.minimax_m3_act);
++        errdefer mod.unload();
++        return .{ .mod = mod, .bf16_fn = try mod.function("tf_mm3_swigluoai_bf16"), .f32_fn = try mod.function("tf_mm3_swigluoai_f32"), .route_fn = try mod.function("tf_mm3_route_warp") };
++    }
++
++    pub fn unload(g: *MiniMaxAct) void {
++        g.mod.unload();
++    }
++
++    /// out[r, :n] = bf16(swigluoai(gate[r, :n], up[r, :n])); rows at element strides g_ld, u_ld, o_ld; `in` the gate/up type.
++    pub fn swigluoai(g: *const MiniMaxAct, s: Stream, in: Input, gate: u64, g_ld: usize, up: u64, u_ld: usize, out: u64, o_ld: usize, rows: usize, n: usize, p: Params) !void {
++        try check(rows, n, g_ld, u_ld, o_ld);
++        if (rows == 0) return;
++        const eb: usize = if (in == .bf16) 2 else 4;
++        if (gate % eb != 0 or up % eb != 0 or out % 2 != 0) return error.RowShape;
++        var a: launch_.Args = .{};
++        a.add(gate);
++        a.add(@as(i64, @intCast(g_ld)));
++        a.add(up);
++        a.add(@as(i64, @intCast(u_ld)));
++        a.add(out);
++        a.add(@as(i64, @intCast(o_ld)));
++        a.add(@as(i32, @intCast(n)));
++        a.add(p.alpha);
++        a.add(p.limit);
++        a.add(p.up_bias);
++        a.add(p.mode());
++        const f = if (in == .bf16) g.bf16_fn else g.f32_fn;
++        try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((n + threads - 1) / threads), .z = 1 }, .block = .{ .x = threads } }, s, &a);
++    }
++
++    /// fp32 logits [rows, experts] and fp32 bias (or null) into int32 picks and fp32 weights, both [rows, topk]: top `topk` by
++    /// sigmoid(logit) + bias, weights sigmoid(logit) [/ their sum] * scale. Not moe_glue's ranking (logit + bias).
++    pub fn route(g: *const MiniMaxAct, s: Stream, logits: u64, bias: ?u64, r: Route, pick: u64, wts: u64, rows: usize) !void {
++        try routeCheck(r, rows);
++        if (rows == 0) return;
++        var a: launch_.Args = .{};
++        a.add(logits);
++        a.add(bias orelse 0);
++        a.add(pick);
++        a.add(wts);
++        a.add(@as(i32, @intCast(rows)));
++        a.add(@as(i32, @intCast(r.experts)));
++        a.add(@as(i32, @intCast(r.topk)));
++        a.add(@as(i32, @intFromBool(r.normalize)));
++        a.add(r.scale);
++        try launch_.launch(g.route_fn, .{ .grid = .{ .x = @intCast((rows + 7) / 8), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
++    }
++};
++
++/// The router's launch limits (a warp a row, 4 values a lane).
++pub const route_most_experts = 128;
++pub const route_most_topk = 32;
++
++pub const Route = struct {
++    experts: usize = 128,
++    topk: usize = 4,
++    normalize: bool = true,
++    scale: f32 = 2.0,
++};
++
++pub fn routeCheck(r: Route, rows: usize) error{RouteOutOfRange}!void {
++    if (r.experts == 0 or r.experts > route_most_experts or r.topk == 0 or r.topk > route_most_topk or r.topk > r.experts) return error.RouteOutOfRange;
++    if (rows > std.math.maxInt(i32) - 7) return error.RouteOutOfRange;
++}
++
++test "route checks" {
++    try routeCheck(.{}, 8);
++    try std.testing.expectError(error.RouteOutOfRange, routeCheck(.{ .experts = 129 }, 1));
++    try std.testing.expectError(error.RouteOutOfRange, routeCheck(.{ .topk = 0 }, 1));
++    try std.testing.expectError(error.RouteOutOfRange, routeCheck(.{ .experts = 4, .topk = 5 }, 1));
++}
++
++test "launch checks refuse empty widths, short strides and oversized grids" {
++    try check(4, 3072, 3072, 6144, 3072);
++    try std.testing.expectError(error.RowShape, check(4, 0, 1, 1, 1));
++    try std.testing.expectError(error.RowShape, check(4, 3072, 3071, 3072, 3072));
++    try std.testing.expectError(error.RowShape, check(4, 3072, 3072, 3072, 3071));
++    try std.testing.expectError(error.RowShape, check(4, 256 * 65536, 256 * 65536, 256 * 65536, 256 * 65536));
++}
++
++test "params map to the act_mode the epilogues share" {
++    try std.testing.expectEqual(@as(i32, 2), (Params{}).mode());
++    try std.testing.expectEqual(@as(i32, 3), (Params{ .symmetric_gate_clamp = true }).mode());
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index f80060d..edac1a8 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -44,6 +44,7 @@ pub const route_rows = @import("route_rows.zig");
+ pub const vit = @import("vit.zig");
+ pub const tree_round = @import("tree_round.zig");
+ pub const act_rows = @import("act_rows.zig");
++pub const minimax_m3_act = @import("minimax_m3_act.zig");
+ pub const gdn_prep = @import("gdn_prep.zig");
+ pub const qk_rows = @import("qk_rows.zig");
+ pub const experts = @import("experts.zig");
+@@ -86,6 +87,7 @@ test {
+     _ = @import("vit.zig");
+     _ = @import("tree_round.zig");
+     _ = @import("act_rows.zig");
++    _ = @import("minimax_m3_act.zig");
+     _ = @import("gdn_prep.zig");
+     _ = @import("qk_rows.zig");
+     _ = @import("exl3_candidate.zig");
+diff --git a/zig/src/families/minimax_m3/ffn.zig b/zig/src/families/minimax_m3/ffn.zig
+new file mode 100644
+index 0000000..852235d
+--- /dev/null
++++ b/zig/src/families/minimax_m3/ffn.zig
+@@ -0,0 +1,192 @@
++//! MiniMax-M3.1-Flash's FFN wiring (engine-port-plan.md T4): which kernel parameters the unverified T0 switches become,
++//! the router's launch plan, and the layer descriptor for the fused swigluoai epilogues. Host-testable; no GPU work here.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++const mr = core.minimax_ref;
++const act = cuda.minimax_m3_act;
++
++pub const Switches = mr.Switches;
++pub const Layer = cuda.exl3_experts.Layer;
++
++/// The checkpoint's swigluoai constants (REFERENCE, plan section 2); the switches below are UNVERIFIED.
++pub const alpha: f32 = 1.702;
++pub const limit: f32 = 7.0;
++pub const routed_scale: f32 = 2.0;
++pub const experts: usize = 128;
++pub const topk: usize = 4;
++
++/// The kernel parameters for a set of switches: the gate clamp's sides and the "+1" are arguments, never constants.
++pub fn actParams(sw: Switches) act.Params {
++    return .{
++        .alpha = alpha,
++        .limit = limit,
++        .up_bias = if (sw.up_plus_one) 1.0 else 0.0,
++        .symmetric_gate_clamp = sw.gate_clamp == .symmetric,
++    };
++}
++
++/// Set a routed-experts layer to swigluoai. The loader builds `gate` from w1 and `up` from w3; when the switch says w1 is
++/// the linear side instead (`w1_is_gate` false), the two descriptors swap so the kernels' "gate" is w3.
++pub fn configureLayer(l: *Layer, sw: Switches) void {
++    const p = actParams(sw);
++    l.act_mode = p.mode();
++    l.alpha = p.alpha;
++    l.up_bias = p.up_bias;
++    l.limit = p.limit;
++    if (!sw.w1_is_gate) {
++        std.mem.swap(u64, &l.gate, &l.up);
++        std.mem.swap(u64, &l.gate_k2, &l.up_k2);
++        std.mem.swap(u64, &l.suh_g, &l.suh_u);
++        std.mem.swap(u64, &l.svh_g, &l.svh_u);
++    }
++}
++
++/// For a dense layer or the shared expert, the (gate, up) of the pointwise kernel given w1/w3 or gate_proj/up_proj outputs.
++pub fn pickGateUp(sw: Switches, w1: u64, w3: u64) struct { gate: u64, up: u64 } {
++    return if (sw.w1_is_gate) .{ .gate = w1, .up = w3 } else .{ .gate = w3, .up = w1 };
++}
++
++/// What a router launch needs, from the switches: the kernel's own normalize/scale, and the scale to apply after routed +
++/// shared are added (1 unless the switch says the factor multiplies both).
++pub const RoutePlan = struct {
++    route: act.Route,
++    post_scale: f32,
++};
++
++pub fn routePlan(sw: Switches) error{Unsupported}!RoutePlan {
++    // Both kernels weigh by sigmoid(logit) alone; sigmoid(logit) + bias as the weight is not implemented.
++    if (sw.router_weights_use_bias) return error.Unsupported;
++    const total = mr.totalScale(sw, routed_scale);
++    return .{
++        .route = .{
++            .experts = experts,
++            .topk = topk,
++            .normalize = sw.router_norm != .scale_only,
++            .scale = if (sw.router_norm == .normalize_only or sw.scale_on == .routed_plus_shared) 1.0 else routed_scale,
++        },
++        .post_scale = @floatCast(total),
++    };
++}
++
++/// The same plan as moe_glue.zig's Route, for tf_moe_topk_sigmoid (normalize 1, scale 2.0 by default). That kernel ranks by
++/// logit + bias, so it matches the model only where the correction bias is zero (see `moeGlueRanksLikeTheModel`); the
++/// engine uses `act.MiniMaxAct.route` (tf_mm3_route_warp), which ranks by sigmoid(logit) + bias.
++pub fn moeGlueRoute(p: RoutePlan) cuda.moe_glue.Route {
++    return .{ .experts = p.route.experts, .topk = p.route.topk, .shared = false, .normalize = p.route.normalize, .scale = p.route.scale };
++}
++
++/// moe_glue.cu's pick for one row (float64 emulation of its ranking: logit + bias, lower id on ties), for the host test.
++fn moeGluePick(logits: []const f64, bias: []const f64, ids: []usize) void {
++    for (ids, 0..) |*id, k| {
++        var best: usize = 0;
++        var found = false;
++        for (logits, bias, 0..) |l, b, i| {
++            if (std.mem.indexOfScalar(usize, ids[0..k], i) != null) continue;
++            if (!found or l + b > logits[best] + bias[best]) best = i;
++            found = true;
++        }
++        id.* = best;
++    }
++}
++
++/// Float32 mirror of minimax_m3_act.cuh's swigluoai (same operations, same order), so the formula is checked on the host.
++fn swigluoaiF32(g_in: f32, u_in: f32, a: f32, lim: f32, bias: f32, sym: bool) f32 {
++    var g = g_in;
++    var u = u_in;
++    if (lim > 0) {
++        g = if (g > lim) lim else if (sym and g < -lim) -lim else g;
++        u = if (u > lim) lim else if (u < -lim) -lim else u;
++    }
++    const sg = g / (1.0 + @exp(-(a * g)));
++    return sg * (u + bias);
++}
++
++test "switches become kernel arguments, not constants" {
++    const d = actParams(.{});
++    try std.testing.expectEqual(@as(i32, 2), d.mode());
++    try std.testing.expectEqual(@as(f32, 1.0), d.up_bias);
++    try std.testing.expectEqual(@as(f32, 1.702), d.alpha);
++    try std.testing.expectEqual(@as(f32, 7.0), d.limit);
++    const s = actParams(.{ .gate_clamp = .symmetric, .up_plus_one = false });
++    try std.testing.expectEqual(@as(i32, 3), s.mode());
++    try std.testing.expectEqual(@as(f32, 0.0), s.up_bias);
++}
++
++test "configureLayer sets swigluoai and swaps gate and up when w1 is not the gate" {
++    var l: Layer = .{ .gate = 1, .up = 2, .down = 3, .gate_k2 = 11, .up_k2 = 12, .down_k2 = 13, .suh_g = 21, .suh_u = 22, .svh_g = 31, .svh_u = 32, .suh_d = 41, .svh_d = 42, .experts = 128, .dims = 6144, .width = 1536, .codebook = .mul1 };
++    try std.testing.expectEqual(@as(i32, 0), l.act_mode); // the silu default is untouched until configured
++    configureLayer(&l, .{});
++    try std.testing.expectEqual(@as(i32, 2), l.act_mode);
++    try std.testing.expectEqual(@as(u64, 1), l.gate);
++    try std.testing.expectEqual(@as(f32, 7.0), l.limit);
++    configureLayer(&l, .{ .w1_is_gate = false, .up_plus_one = false });
++    try std.testing.expectEqual(@as(u64, 2), l.gate);
++    try std.testing.expectEqual(@as(u64, 1), l.up);
++    try std.testing.expectEqual(@as(u64, 12), l.gate_k2);
++    try std.testing.expectEqual(@as(u64, 32), l.svh_g);
++    try std.testing.expectEqual(@as(u64, 21), l.suh_u);
++    try std.testing.expectEqual(@as(f32, 0.0), l.up_bias);
++    const pg = pickGateUp(.{ .w1_is_gate = false }, 7, 9);
++    try std.testing.expectEqual(@as(u64, 9), pg.gate);
++}
++
++test "the route plan is normalize 1, scale 2.0 by default and follows the switches" {
++    const p = try routePlan(.{});
++    try std.testing.expect(p.route.normalize);
++    try std.testing.expectEqual(@as(f32, 2.0), p.route.scale);
++    try std.testing.expectEqual(@as(f32, 1.0), p.post_scale);
++    const g = moeGlueRoute(p);
++    try std.testing.expectEqual(@as(usize, 128), g.experts);
++    try std.testing.expectEqual(@as(usize, 4), g.topk);
++    try std.testing.expect(!g.shared);
++    const both = try routePlan(.{ .scale_on = .routed_plus_shared });
++    try std.testing.expectEqual(@as(f32, 1.0), both.route.scale);
++    try std.testing.expectEqual(@as(f32, 2.0), both.post_scale);
++    const only = try routePlan(.{ .router_norm = .scale_only });
++    try std.testing.expect(!only.route.normalize);
++    try std.testing.expectEqual(@as(f32, 2.0), only.route.scale);
++    try std.testing.expectError(error.Unsupported, routePlan(.{ .router_weights_use_bias = true }));
++    try act.routeCheck(p.route, 8);
++}
++
++test "moe_glue's logit + bias ranking differs from sigmoid(logit) + bias once the bias is not zero" {
++    const logits = [_]f64{ 2.0, 3.0, -1.0, 0.0 };
++    var scratch: [4]f64 = undefined;
++    var ids: [1]usize = undefined;
++    var w: [1]f64 = undefined;
++    var model: [1]usize = undefined;
++    // no bias: the same pick
++    const zero = [_]f64{ 0, 0, 0, 0 };
++    mr.routerPick(&logits, &zero, 2.0, .{}, &scratch, &model, &w);
++    moeGluePick(&logits, &zero, &ids);
++    try std.testing.expectEqual(model[0], ids[0]);
++    // bias 0.1 on expert 0: sigmoid(2) + 0.1 = 0.981 beats sigmoid(3) = 0.953, but 2.1 < 3
++    const bias = [_]f64{ 0.1, 0, 0, 0 };
++    mr.routerPick(&logits, &bias, 2.0, .{}, &scratch, &model, &w);
++    moeGluePick(&logits, &bias, &ids);
++    try std.testing.expectEqual(@as(usize, 0), model[0]);
++    try std.testing.expectEqual(@as(usize, 1), ids[0]);
++}
++
++test "the kernel's swigluoai formula in fp32 tracks the float64 reference, NaN and infinities included" {
++    const sw: Switches = .{};
++    const gs = [_]f32{ -40, -12.5, -3, -0.25, 0, 0.5, 2, 6.99, 7, 7.5, 30, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) };
++    const us = [_]f32{ -100, -7.5, -7, -1, 0, 0.3, 1, 6.5, 7, 9, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) };
++    for (gs) |g| for (us) |u| {
++        const want = mr.swigluoai(g, u, alpha, limit, sw);
++        const got = swigluoaiF32(g, u, alpha, limit, 1.0, false);
++        try std.testing.expectEqual(std.math.isNan(want), std.math.isNan(got));
++        if (std.math.isNan(want)) continue;
++        try std.testing.expectEqual(std.math.isInf(want), std.math.isInf(got));
++        if (std.math.isInf(want)) continue;
++        const tol = @abs(want) * 1e-5 + 1e-6;
++        try std.testing.expect(@abs(@as(f64, got) - want) <= tol);
++    };
++    // the unverified switches: symmetric clamp and no "+1" change the value, as the reference says
++    const sym: Switches = .{ .gate_clamp = .symmetric, .up_plus_one = false };
++    try std.testing.expect(@abs(@as(f64, swigluoaiF32(-12.5, 0.3, alpha, limit, 0.0, true)) - mr.swigluoai(-12.5, 0.3, alpha, limit, sym)) < 1e-6);
++    // below -limit the sigmoid has already shrunk the gate, so the clamp's side moves the value by little but not by zero
++    try std.testing.expect(mr.swigluoai(-12.5, 0.3, alpha, limit, sym) != mr.swigluoai(-12.5, 0.3, alpha, limit, .{ .up_plus_one = false }));
++    try std.testing.expect(mr.swigluoai(-12.5, 0.3, alpha, limit, .{ .gate_clamp = .symmetric }) != mr.swigluoai(-12.5, 0.3, alpha, limit, .{}));
++}
+diff --git a/zig/tests/cuda/contract_minimax_act.zig b/zig/tests/cuda/contract_minimax_act.zig
+new file mode 100644
+index 0000000..4585a0d
+--- /dev/null
++++ b/zig/tests/cuda/contract_minimax_act.zig
+@@ -0,0 +1,175 @@
++//! minimax_m3_act.cu's swigluoai under the contract on CUDA: float64 reference core/minimax_ref.zig `swigluoai`, NaN
++//! propagating as float64 does, and two planted controls (a clamp by fminf, which drops a NaN, and a lost tail value).
++//! Written for the GB10 run; nothing here has run on a GPU yet.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++
++const c = core.contract.spec;
++const g = core.contract.gates;
++const mr = core.minimax_ref;
++const act = cuda.minimax_m3_act;
++
++pub const Which = enum { bf16, bf16_symmetric_no_bias, f32, ctl_fmin, ctl_tail };
++
++fn noSums(_: c.Shape) usize {
++    return 0;
++}
++
++/// expf (2 ulp), the add, the division and the products.
++const act_ops = 8;
++
++// Layers 0-2's dense MLP (12288) and the shared expert (3072), whole and cut in two for the two-rank split.
++const served = &[_]c.Shape{ .{ .rows = 1, .n = 3072, .k = 1 }, .{ .rows = 1, .n = 12288, .k = 1 }, .{ .rows = 17, .n = 1536, .k = 1 }, .{ .rows = 64, .n = 6144, .k = 1 } };
++const tile_n: c.Tile = .{ .size = 256, .step = 1, .min = 1 }; // one thread a value, 256 a block; the guard is the edge
++const tile_rows: c.Tile = .{ .size = 16 };
++
++pub fn spec(which: Which) c.Spec {
++    const name = switch (which) {
++        .bf16 => "cuda minimax_m3_act tf_mm3_swigluoai_bf16",
++        .bf16_symmetric_no_bias => "cuda minimax_m3_act tf_mm3_swigluoai_bf16 (symmetric gate clamp, no +1)",
++        .f32 => "cuda minimax_m3_act tf_mm3_swigluoai_f32",
++        .ctl_fmin => "control: swigluoai clamped by fminf",
++        .ctl_tail => "control: swigluoai losing a tail value",
++    };
++    return .{ .name = name, .accum = .none, .depth = noSums, .ops = act_ops, .out = .bf16, .tiles = .{ tile_rows, tile_n, .{} }, .served = served };
++}
++
++pub fn control(which: Which) ?g.Gate {
++    return switch (which) {
++        .ctl_fmin => .nonfinite,
++        .ctl_tail => .shapes,
++        else => null,
++    };
++}
++
++fn params(which: Which) act.Params {
++    return if (which == .bf16_symmetric_no_bias) .{ .symmetric_gate_clamp = true, .up_bias = 0 } else .{};
++}
++
++pub const Mm3Act = struct {
++    rig: rig_.Rig,
++    which: Which,
++    k: *const act.MiniMaxAct,
++    ctl: ?cuda.Function = null,
++    arena: std.heap.ArenaAllocator,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    gate: []f32 = &.{},
++    up: []f32 = &.{},
++    gate_ptr: u64 = 0,
++    up_ptr: u64 = 0,
++    out: u64 = 0,
++
++    pub fn deinit(self: *Mm3Act) void {
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    const vt = g.hooks(Mm3Act);
++
++    pub fn kernel(self: *Mm3Act) g.Kernel {
++        return .{ .spec = spec(self.which), .ctx = self, .vt = &vt, .control = control(self.which) };
++    }
++
++    fn isF32(self: *const Mm3Act) bool {
++        return self.which == .f32;
++    }
++
++    pub fn prepare(self: *Mm3Act, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        self.shape = shape;
++        const a = self.arena.allocator();
++        const n = shape.rows * shape.n;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.gate = try a.alloc(f32, n);
++        self.up = try a.alloc(f32, n);
++        // gates past +-7 (the clamp), a few huge ones; ups past +-7 on both sides
++        for (self.gate, self.up, 0..) |*gv, *uv, i| {
++            gv.* = (rng.float(f32) * 2 - 1) * (if (i % 17 == 3) @as(f32, 30) else 9);
++            uv.* = (rng.float(f32) * 2 - 1) * (if (i % 13 == 5) @as(f32, 20) else 8);
++        }
++        if (fill == .nonfinite) {
++            const w = shape.n;
++            const at = [_][2]usize{ .{ 0, w / 3 }, .{ 1, w / 2 }, .{ 2, w - 1 }, .{ 3, 0 }, .{ 3, w - 1 } };
++            const nan = std.math.nan(f32);
++            const inf = std.math.inf(f32);
++            // gate: NaN, +inf, -inf; up: row 3 holds +inf and -inf; one more NaN in an up
++            const put_g = [_]f32{ nan, inf, -inf, 1, 1 };
++            const put_u = [_]f32{ 1, 1, 1, inf, -inf };
++            for (at, put_g, put_u, 0..) |p, pg, pu, i| if (p[0] < shape.rows) {
++                self.gate[p[0] * w + p[1]] = pg;
++                self.up[p[0] * w + p[1]] = pu;
++                if (i == 0 and shape.rows > 4) self.up[4 * w + w / 4] = nan;
++            };
++        }
++        // the inputs are bf16 values (or fp32 in the f32 form), so the reference reads exactly what the kernel reads
++        if (!self.isF32()) {
++            for (self.gate) |*v| v.* = c.fromBf16(c.toBf16(v.*));
++            for (self.up) |*v| v.* = c.fromBf16(c.toBf16(v.*));
++            const gb = try a.alloc(u16, n);
++            const ub = try a.alloc(u16, n);
++            for (gb, self.gate) |*o, v| o.* = c.toBf16(v);
++            for (ub, self.up) |*o, v| o.* = c.toBf16(v);
++            self.gate_ptr = try self.rig.input(std.mem.sliceAsBytes(gb));
++            self.up_ptr = try self.rig.input(std.mem.sliceAsBytes(ub));
++        } else {
++            self.gate_ptr = try self.rig.input(std.mem.sliceAsBytes(self.gate));
++            self.up_ptr = try self.rig.input(std.mem.sliceAsBytes(self.up));
++        }
++        self.out = try self.rig.output(n * 2);
++        return true;
++    }
++
++    pub fn run(self: *Mm3Act) !void {
++        const s = self.rig.s;
++        const r = self.shape.rows;
++        const n = self.shape.n;
++        const p = params(self.which);
++        if (self.ctl) |f| {
++            var args: cuda.Args = .{};
++            args.add(self.gate_ptr);
++            args.add(self.up_ptr);
++            args.add(self.out);
++            args.add(@as(c_int, @intCast(n)));
++            args.add(p.alpha);
++            args.add(p.limit);
++            args.add(p.up_bias);
++            args.add(@as(c_int, if (self.which == .ctl_fmin) 0 else 1));
++            try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(r), .y = @intCast((n + 255) / 256), .z = 1 }, .block = .{ .x = 256 } }, s, &args);
++        } else {
++            try self.k.swigluoai(s, if (self.isF32()) .f32 else .bf16, self.gate_ptr, n, self.up_ptr, n, self.out, n, r, n, p);
++        }
++        try s.synchronize();
++    }
++
++    pub fn count(self: *Mm3Act) usize {
++        return self.shape.rows * self.shape.n;
++    }
++
++    /// Float64 swigluoai of the exact inputs, with the alpha the kernel is given (an fp32 value).
++    pub fn reference(self: *Mm3Act, want: []f64, mag: []f64) !void {
++        const p = params(self.which);
++        const sw: mr.Switches = .{ .gate_clamp = if (p.symmetric_gate_clamp) .symmetric else .upper_only, .up_plus_one = p.up_bias != 0 };
++        for (want, mag, self.gate, self.up) |*o, *m, gv, uv| {
++            o.* = mr.swigluoai(gv, uv, p.alpha, p.limit, sw);
++            m.* = @abs(o.*);
++        }
++    }
++};
++
++test "the controls are the two named faults, each at its gate" {
++    try std.testing.expectEqual(@as(?g.Gate, .nonfinite), control(.ctl_fmin));
++    try std.testing.expectEqual(@as(?g.Gate, .shapes), control(.ctl_tail));
++    for ([_]Which{ .bf16, .bf16_symmetric_no_bias, .f32 }) |w| try std.testing.expectEqual(@as(?g.Gate, null), control(w));
++}
++
++test "the served shapes sit inside the launch's limits and the dense widths are 128 multiples" {
++    for (served) |s| {
++        try std.testing.expectEqual(@as(usize, 0), s.n % 128);
++        try act.check(s.rows, s.n, s.n, s.n, s.n);
++    }
++}
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index b5dcebd..3c34b96 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -25,6 +25,8 @@ const scan_k = @import("contract_scan.zig");
+ const lane8_k = @import("contract_ck_lane.zig");
+ const latent_k = @import("contract_latent.zig");
+ const act_round_k = @import("contract_act_round.zig");
++const mm3_act_k = @import("contract_minimax_act.zig");
++const act_ns = cuda.minimax_m3_act;
+ 
+ const round_k = @import("contract_tree_round.zig");
+ 
+@@ -62,7 +64,7 @@ const h3_image = struct {
+ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
+     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
+-    inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
++    inline for (.{ "tree_round", "act_rows", "minimax_m3_act", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
+     std.debug.print("FAIL kernel-contract: unknown image name: {s}\n", .{name});
+     return error.UnknownContractImage;
+@@ -279,6 +281,12 @@ pub fn run(gpu: check.Gpu) !void {
+     for (act_round_k.entries, &act_rounds) |e, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .entry = e, .act = &act_rows, .ctl = if (e.keep != null) try mods[5].function("tf_ctl_act_round") else null };
+     defer for (&act_rounds) |*x| x.deinit();
+     for (&act_rounds) |*x| try kernels.append(a, x.kernel());
++    var mm3_act = try act_ns.MiniMaxAct.load(gpu.d);
++    defer mm3_act.unload();
++    var mm3_acts: [std.enums.values(mm3_act_k.Which).len]mm3_act_k.Mm3Act = undefined;
++    for (std.enums.values(mm3_act_k.Which), &mm3_acts) |w, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .which = w, .k = &mm3_act, .arena = .init(a), .ctl = if (mm3_act_k.control(w) != null) try mods[5].function("tf_ctl_mm3_act") else null };
++    defer for (&mm3_acts) |*x| x.deinit();
++    for (&mm3_acts) |*x| try kernels.append(a, x.kernel());
+     var gdn_prep = try cuda.gdn_prep.GdnPrep.load(gpu.d);
+     defer gdn_prep.unload();
+     var gdns: [9]gdn_k.Gdn = undefined;
+-- 
+2.43.0
+

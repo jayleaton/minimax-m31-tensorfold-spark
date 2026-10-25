@@ -1,0 +1,1210 @@
+From badb1f044f1db1e33dd28bb308b28baf208f725a Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:20:30 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: coalescing, multi-threaded checkpoint
+ streamer (task 0015)
+
+A TP2 rank plans 5.77 million byte runs (98% of them 4-16 KiB) for 91 GiB and the
+old streamer read each with its own O_DIRECT pread at queue depth 1, plus 22k
+one-at-a-time marker reads. The streamer now folds runs under a 1 MiB gap into
+windows of up to 16 MiB, reads them on 6 threads into a ring of buffers while the
+calling thread copies finished windows in order, packs each cut tensor into few
+puts, and verifies the codebook markers in one sorted pass before any copy.
+The old strategy stays as runSerial for the tests and the benchmark.
+
+New: stream_test.zig (byte-for-byte against runSerial), loadbench.zig and the
+mm3-loadbench build step (stats, model, pattern and raw read benchmarks).
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/minimax_load.zig                    |   9 +
+ zig/src/families/minimax_m3/load.zig          |   3 +
+ .../families/minimax_m3/load_synth_test.zig   |  14 +-
+ zig/src/families/minimax_m3/loadbench.zig     | 446 +++++++++++++++++
+ zig/src/families/minimax_m3/stream.zig        | 473 +++++++++++++++++-
+ zig/src/families/minimax_m3/stream_test.zig   |  85 ++++
+ 6 files changed, 1006 insertions(+), 24 deletions(-)
+ create mode 100644 zig/src/families/minimax_m3/loadbench.zig
+ create mode 100644 zig/src/families/minimax_m3/stream_test.zig
+
+diff --git a/zig/build/minimax_load.zig b/zig/build/minimax_load.zig
+index 9421e42..4aba538 100644
+--- a/zig/build/minimax_load.zig
++++ b/zig/build/minimax_load.zig
+@@ -12,5 +12,14 @@ pub fn step(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Modu
+     });
+     const s = b.step("test-minimax-load", "MiniMax-M3.1-Flash config, tensor names, TP cuts and EXL3 loader without a GPU");
+     s.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = family })).step);
++    const bench = b.addExecutable(.{ .name = "mm3-loadbench", .root_module = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/loadbench.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "canon", .module = canon } },
++    }) });
++    b.step("mm3-loadbench", "MiniMax-M3.1-Flash checkpoint reader diagnosis and micro-benchmark (host only; see loadbench.zig)")
++        .dependOn(&b.addInstallArtifact(bench, .{}).step);
+     return s;
+ }
+diff --git a/zig/src/families/minimax_m3/load.zig b/zig/src/families/minimax_m3/load.zig
+index 794ef21..53941c1 100644
+--- a/zig/src/families/minimax_m3/load.zig
++++ b/zig/src/families/minimax_m3/load.zig
+@@ -513,6 +513,8 @@ pub const Sink = struct {
+ 
+ pub const ShardEnd = @import("stream.zig").ShardEnd;
+ pub const Streamer = @import("stream.zig").Streamer;
++pub const StreamOptions = @import("stream.zig").Options;
++pub const StreamStats = @import("stream.zig").Stats;
+ 
+ /// bf16 norm weights as fp32 `1 + w` (Gemma RMSNorm), summed once in fp32; the caller's `out` holds the result.
+ pub fn foldGemma(out: []f32, bf16: []const u8) []f32 {
+@@ -526,6 +528,7 @@ pub fn foldGemma(out: []f32, bf16: []const u8) []f32 {
+ 
+ test {
+     _ = @import("stream.zig");
++    _ = @import("stream_test.zig");
+     _ = @import("config.zig");
+     _ = names;
+     _ = shard;
+diff --git a/zig/src/families/minimax_m3/load_synth_test.zig b/zig/src/families/minimax_m3/load_synth_test.zig
+index 48448fc..9a59a02 100644
+--- a/zig/src/families/minimax_m3/load_synth_test.zig
++++ b/zig/src/families/minimax_m3/load_synth_test.zig
+@@ -151,7 +151,7 @@ pub const Pack = struct {
+ 
+ pub const Write = struct { shards: usize = 2, index: bool = true, cut_last: usize = 0 };
+ 
+-fn shardFile(buf: *[48]u8, i: usize, of: usize) []const u8 {
++pub fn shardFile(buf: *[48]u8, i: usize, of: usize) []const u8 {
+     return std.fmt.bufPrint(buf, "model-{d:0>5}-of-{d:0>5}.safetensors", .{ i + 1, of }) catch unreachable;
+ }
+ 
+@@ -212,11 +212,11 @@ pub const Dir = struct {
+ // ---- what a good checkpoint streams ----
+ 
+ /// Records every put and fills a host buffer per slot, so the test can look at what a device would hold.
+-const Host = struct {
++pub const Host = struct {
+     bufs: [][]u8,
+     written: []u64,
+ 
+-    fn init(plan: *const load.Plan) !Host {
++    pub fn init(plan: *const load.Plan) !Host {
+         const bufs = try gpa.alloc([]u8, plan.slots.len);
+         const written = try gpa.alloc(u64, plan.slots.len);
+         @memset(written, 0);
+@@ -224,7 +224,7 @@ const Host = struct {
+         return .{ .bufs = bufs, .written = written };
+     }
+ 
+-    fn deinit(h: *Host) void {
++    pub fn deinit(h: *Host) void {
+         for (h.bufs) |b| gpa.free(b);
+         gpa.free(h.bufs);
+         gpa.free(h.written);
+@@ -237,12 +237,12 @@ const Host = struct {
+         h.written[slot] += bytes.len;
+     }
+ 
+-    fn sink(h: *Host) load.Sink {
++    pub fn sink(h: *Host) load.Sink {
+         return .{ .ctx = h, .put = put };
+     }
+ };
+ 
+-fn rankPlan(cat: *load.Catalog, c: *const Config, rank: usize, world: usize) !load.Plan {
++pub fn rankPlan(cat: *load.Catalog, c: *const Config, rank: usize, world: usize) !load.Plan {
+     return load.Plan.build(gpa, cat, c, try shard.Share.of(c, rank, world), .{});
+ }
+ 
+@@ -262,7 +262,7 @@ fn slice(h: *const Host, slot: u32, off: u64, len: usize) []const u8 {
+     return h.bufs[slot][off..][0..len];
+ }
+ 
+-fn expectStreamed(c: *const Config, pack: *Pack, plan: *const load.Plan, host: *const Host) !void {
++pub fn expectStreamed(c: *const Config, pack: *Pack, plan: *const load.Plan, host: *const Host) !void {
+     for (host.written, plan.slots) |w, s| try std.testing.expectEqual(s.bytes, w);
+     var b: names.Buf = undefined;
+     var b2: names.Buf = undefined;
+diff --git a/zig/src/families/minimax_m3/loadbench.zig b/zig/src/families/minimax_m3/loadbench.zig
+new file mode 100644
+index 0000000..77745d4
+--- /dev/null
++++ b/zig/src/families/minimax_m3/loadbench.zig
+@@ -0,0 +1,446 @@
++//! mm3-loadbench: the MiniMax-M3.1-Flash checkpoint reader's diagnosis and micro-benchmark (host only, no GPU).
++const std = @import("std");
++const core = @import("core");
++const dio = core.direct_io;
++const load = @import("load.zig");
++const config = @import("config.zig");
++const shard = @import("shard.zig");
++const names = @import("names.zig");
++
++const usage =
++    \\
++    \\  mm3-loadbench stats   <model dir> <rank> <world>              run lengths of a rank's plan, reads old and new
++    \\  mm3-loadbench model   <model dir> <rank> <world> [options]    stream a slice of the real plan, old and new strategy
++    \\  mm3-loadbench pattern <file> <run> <stride> <wanted MiB> [options]   strided runs of one file, old and new strategy
++    \\  mm3-loadbench raw     <file> <block KiB> <threads> <MiB>      sequential direct reads: the device's ceiling
++    \\
++    \\options: --layers N --first L (model: the plan is cut to N layers from layer L, no embedding or head), --only old|new,
++    \\         --threads N --chunk MiB --gap KiB (the new strategy), --limit-gib G (default 8: the most one test may read).
++    \\Every read is O_DIRECT, so the page cache does not grow; all buffers together stay within 512 MiB; the tool stops when
++    \\MemAvailable is under 9 GiB, before and while it reads.
++;
++
++const gpa = std.heap.smp_allocator;
++const min_avail_kib: u64 = 9 << 20;
++const max_buffer_bytes: u64 = 512 << 20;
++const mib = 1024.0 * 1024.0;
++
++var io_: std.Io = undefined;
++
++fn out(comptime fmt: []const u8, args: anytype) void {
++    std.debug.print(fmt, args);
++}
++
++fn availKiB() !u64 {
++    // /proc files report size 0, so read until the end by hand
++    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
++    if (fd < 0) return error.BadMeminfo;
++    defer _ = std.c.close(fd);
++    var text: [8192]u8 = undefined;
++    const n = std.c.read(fd, &text, text.len);
++    if (n <= 0) return error.BadMeminfo;
++    var lines = std.mem.tokenizeScalar(u8, text[0..@intCast(n)], '\n');
++    while (lines.next()) |l| {
++        if (!std.mem.startsWith(u8, l, "MemAvailable:")) continue;
++        var f = std.mem.tokenizeAny(u8, l["MemAvailable:".len..], " \tkB");
++        return try std.fmt.parseInt(u64, f.next() orelse return error.BadMeminfo, 10);
++    }
++    return error.BadMeminfo;
++}
++
++fn guard() !void {
++    const kib = try availKiB();
++    if (kib < min_avail_kib) {
++        out("MemAvailable {d} MiB is under 9 GiB: stopping\n", .{kib >> 10});
++        return error.LowMemory;
++    }
++}
++
++fn now() i96 {
++    return std.Io.Clock.awake.now(io_).toNanoseconds();
++}
++
++/// Counts what it is given, touches a few bytes of it, and watches MemAvailable.
++const Null = struct {
++    bytes: u64 = 0,
++    puts: u64 = 0,
++    sum: u64 = 0,
++    since: u64 = 0,
++    min_avail: u64 = std.math.maxInt(u64),
++    fault: ?anyerror = null,
++
++    fn put(ctx: *anyopaque, _: u32, _: u64, bytes: []const u8) anyerror!void {
++        const n: *Null = @ptrCast(@alignCast(ctx));
++        n.bytes += bytes.len;
++        n.puts += 1;
++        if (bytes.len >= 8) n.sum +%= std.mem.readInt(u64, bytes[0..8], .little) +% std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little);
++        n.since += bytes.len;
++        if (n.since >= 256 << 20) {
++            n.since = 0;
++            const kib = try availKiB();
++            n.min_avail = @min(n.min_avail, kib);
++            if (kib < min_avail_kib) return error.LowMemory;
++        }
++    }
++
++    fn sink(n: *Null) load.Sink {
++        return .{ .ctx = n, .put = put };
++    }
++};
++
++const Settings = struct {
++    layers: usize = 1,
++    first: u16 = 10,
++    only: ?enum { old, new } = null,
++    opts: load.StreamOptions = .{},
++    limit_gib: f64 = 8,
++};
++
++fn parseOptions(args: []const [:0]const u8, s: *Settings) !void {
++    var i: usize = 0;
++    while (i < args.len) : (i += 2) {
++        if (i + 1 >= args.len) return error.OptionValueRequired;
++        const k = args[i];
++        const v = args[i + 1];
++        if (std.mem.eql(u8, k, "--only")) {
++            s.only = std.meta.stringToEnum(@TypeOf(s.only.?), v) orelse return error.BadOption;
++        } else if (std.mem.eql(u8, k, "--limit-gib")) {
++            s.limit_gib = try std.fmt.parseFloat(f64, v);
++        } else {
++            const n = try std.fmt.parseInt(usize, v, 10);
++            if (std.mem.eql(u8, k, "--layers")) s.layers = n else if (std.mem.eql(u8, k, "--first")) s.first = @intCast(n) else if (std.mem.eql(u8, k, "--threads")) s.opts.threads = n else if (std.mem.eql(u8, k, "--chunk")) s.opts.chunk = n << 20 else if (std.mem.eql(u8, k, "--gap")) s.opts.gap = n << 10 else if (std.mem.eql(u8, k, "--ahead")) s.opts.ahead = n else return error.BadOption;
++        }
++    }
++}
++
++// ---- stats ----
++
++const Bucket = struct { name: []const u8, below: u64 };
++const buckets = [_]Bucket{
++    .{ .name = "<4K", .below = 4 << 10 },
++    .{ .name = "4-16K", .below = 16 << 10 },
++    .{ .name = "16-64K", .below = 64 << 10 },
++    .{ .name = "64-256K", .below = 256 << 10 },
++    .{ .name = "256K-1M", .below = 1 << 20 },
++    .{ .name = "1-8M", .below = 8 << 20 },
++    .{ .name = ">=8M", .below = std.math.maxInt(u64) },
++};
++
++fn bucketOf(len: u64) usize {
++    for (buckets, 0..) |b, i| if (len < b.below) return i;
++    unreachable;
++}
++
++const Agg = struct {
++    tensors: u64 = 0,
++    runs: u64 = 0,
++    bytes: u64 = 0,
++    hist_runs: [buckets.len]u64 = @splat(0),
++    hist_bytes: [buckets.len]u64 = @splat(0),
++    min_len: u64 = std.math.maxInt(u64),
++    max_len: u64 = 0,
++};
++
++fn kindNames() []const []const u8 {
++    comptime {
++        var all: []const []const u8 = &.{};
++        for (std.meta.fieldNames(names.Proj)) |p| for ([_][]const u8{ "trellis", "suh", "svh" }) |part| {
++            all = all ++ &[_][]const u8{p ++ "." ++ part};
++        };
++        for (std.meta.fieldNames(names.Plain)) |p| all = all ++ &[_][]const u8{"plain." ++ p};
++        return all;
++    }
++}
++
++fn stats(dir: []const u8, rank: usize, world: usize, s: Settings) !void {
++    var cat = try load.Catalog.open(gpa, io_, dir);
++    defer cat.deinit();
++    const c = try loadConfig(dir);
++    var plan = try load.Plan.build(gpa, &cat, &c, try shard.Share.of(&c, rank, world), .{});
++    defer plan.deinit();
++    const kinds = comptime kindNames();
++    const n_proj = std.meta.fieldNames(names.Proj).len;
++    const kind_of = try gpa.alloc(u16, plan.slots.len);
++    defer gpa.free(kind_of);
++    @memset(kind_of, std.math.maxInt(u16));
++    for (plan.matrices) |m| {
++        const base: u16 = @as(u16, @backingInt(m.proj)) * 3;
++        kind_of[m.trellis] = base;
++        kind_of[m.suh] = base + 1;
++        kind_of[m.svh] = base + 2;
++    }
++    for (plan.plain) |p| kind_of[p.slot] = @intCast(n_proj * 3 + @as(usize, @backingInt(p.role)));
++    const aggs = try gpa.alloc(Agg, kinds.len);
++    defer gpa.free(aggs);
++    @memset(aggs, .{});
++    var all: Agg = .{};
++    var old_reads: u64 = 0;
++    const room = dio.fits(8 << 20); // the old streamer's buffer
++    for (plan.items) |it| {
++        const a = &aggs[kind_of[it.slot]];
++        a.tensors += 1;
++        a.runs += it.span.count;
++        a.bytes += it.span.bytes();
++        if (it.span.len > 0 and it.span.count > 0) {
++            const b = bucketOf(it.span.len);
++            a.hist_runs[b] += it.span.count;
++            a.hist_bytes[b] += it.span.bytes();
++            a.min_len = @min(a.min_len, it.span.len);
++            a.max_len = @max(a.max_len, it.span.len);
++            old_reads += it.span.count * ((it.span.len + room - 1) / room);
++        }
++    }
++    for (aggs) |a| {
++        all.tensors += a.tensors;
++        all.runs += a.runs;
++        all.bytes += a.bytes;
++        for (0..buckets.len) |i| {
++            all.hist_runs[i] += a.hist_runs[i];
++            all.hist_bytes[i] += a.hist_bytes[i];
++        }
++        all.min_len = @min(all.min_len, a.min_len);
++        all.max_len = @max(all.max_len, a.max_len);
++    }
++    out("\n## rank {d} of {d}: {d} shards, {d} tensors read, {d:.2} GiB wanted\n\n", .{ rank, world, cat.files.items.len, all.tensors, @as(f64, @floatFromInt(all.bytes)) / 1024 / 1024 / 1024 });
++    out("| kind | tensors | runs | bytes MiB | min run | max run |", .{});
++    for (buckets) |b| out(" runs {s} |", .{b.name});
++    out("\n|---|---:|---:|---:|---:|---:|", .{});
++    for (buckets) |_| out("---:|", .{});
++    out("\n", .{});
++    for (kinds, aggs) |k, a| {
++        if (a.runs == 0) continue;
++        out("| {s} | {d} | {d} | {d:.1} | {d} | {d} |", .{ k, a.tensors, a.runs, @as(f64, @floatFromInt(a.bytes)) / mib, a.min_len, a.max_len });
++        for (a.hist_runs) |h| out(" {d} |", .{h});
++        out("\n", .{});
++    }
++    out("| all | {d} | {d} | {d:.1} | {d} | {d} |", .{ all.tensors, all.runs, @as(f64, @floatFromInt(all.bytes)) / mib, all.min_len, all.max_len });
++    for (all.hist_runs) |h| out(" {d} |", .{h});
++    out("\n\nbytes by run length bucket (MiB):", .{});
++    for (buckets, all.hist_bytes) |b, h| out(" {s}={d:.1}", .{ b.name, @as(f64, @floatFromInt(h)) / mib });
++    var st = try load.Streamer.initWith(gpa, &cat, s.opts);
++    defer st.deinit();
++    const m = try st.measure(&plan);
++    out("\n\nold strategy: {d} payload reads + {d} marker reads = {d} reads, {d:.1} KiB per payload read\n", .{
++        old_reads, plan.matrices.len, old_reads + plan.matrices.len, @as(f64, @floatFromInt(all.bytes)) / 1024 / @as(f64, @floatFromInt(old_reads)),
++    });
++    out("new strategy (chunk {d} MiB, gap {d} KiB): {d} payload reads of {d:.2} MiB mean + {d} marker reads; reads cover {d:.2} GiB for {d:.2} GiB wanted ({d:.2}x)\n", .{
++        s.opts.chunk >> 20,                                           s.opts.gap >> 10,
++        m.windows,                                                    @as(f64, @floatFromInt(m.read_bytes)) / mib / @as(f64, @floatFromInt(m.windows)),
++        m.marker_windows,                                             @as(f64, @floatFromInt(m.read_bytes)) / 1024 / 1024 / 1024,
++        @as(f64, @floatFromInt(m.wanted_bytes)) / 1024 / 1024 / 1024, @as(f64, @floatFromInt(m.read_bytes)) / @as(f64, @floatFromInt(m.wanted_bytes)),
++    });
++}
++
++fn loadConfig(dir: []const u8) !config.Config {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const text = try std.Io.Dir.cwd().readFileAlloc(io_, path, gpa, .limited(1 << 20));
++    defer gpa.free(text);
++    return config.parse(gpa, text);
++}
++
++// ---- running a plan both ways ----
++
++const Result = struct { seconds: f64, wanted: u64, read: u64, reads: u64, markers: f64, puts: u64, min_avail: u64, sum: u64 };
++
++fn report(name: []const u8, r: Result) void {
++    out("{s:<4} {d:8.1} MiB/s wanted  {d:8.1} MiB/s read  {d:7.2} s total ({d:.2} s markers)  {d} reads  {d:.1} KiB/read  {d} puts  min MemAvailable {d} MiB  chk {x}\n", .{
++        name,
++        @as(f64, @floatFromInt(r.wanted)) / mib / r.seconds,
++        @as(f64, @floatFromInt(r.read)) / mib / r.seconds,
++        r.seconds,
++        r.markers,
++        r.reads,
++        @as(f64, @floatFromInt(r.read)) / 1024 / @as(f64, @floatFromInt(r.reads)),
++        r.puts,
++        r.min_avail >> 10,
++        r.sum,
++    });
++}
++
++/// Streams `plan` with the strategy `new` selects; the reads are counted from the plan, not measured.
++fn stream(cat: *const load.Catalog, plan: *const load.Plan, s: Settings, new: bool) !Result {
++    var st = try load.Streamer.initWith(gpa, cat, if (new) s.opts else .{ .chunk = 8 << 20, .threads = 0, .ahead = 0 });
++    defer st.deinit();
++    if (st.bufferBytes() > max_buffer_bytes) return error.TooMuchBuffer;
++    var sink: Null = .{};
++    try guard();
++    // the marker pass alone, then the whole stream (which checks the markers again): the second is the load's time
++    const t0 = now();
++    if (new) try st.verifyMarkers(plan) else try st.verifyMarkersSerial(plan);
++    const markers = @as(f64, @floatFromInt(now() - t0)) / 1e9;
++    const t1 = now();
++    if (new) try st.run(plan, sink.sink()) else try st.runSerial(plan, sink.sink());
++    const seconds = @as(f64, @floatFromInt(now() - t1)) / 1e9;
++    var reads: u64 = 0;
++    var read: u64 = 0;
++    var wanted: u64 = 0;
++    for (plan.items) |it| wanted += it.span.bytes();
++    if (new) {
++        const m = try st.measure(plan);
++        reads = m.windows + m.marker_windows;
++        read = m.read_bytes + 4096 * m.marker_windows;
++    } else {
++        const room = dio.fits(8 << 20);
++        for (plan.items) |it| {
++            if (it.span.len == 0) continue;
++            reads += it.span.count * ((it.span.len + room - 1) / room);
++        }
++        read = wanted;
++        reads += plan.matrices.len;
++        read += 4096 * plan.matrices.len;
++    }
++    return .{ .seconds = seconds, .wanted = wanted, .read = read, .reads = reads, .markers = markers, .puts = sink.puts, .min_avail = sink.min_avail, .sum = sink.sum };
++}
++
++fn bothWays(cat: *const load.Catalog, plan: *const load.Plan, s: Settings) !void {
++    var wanted: u64 = 0;
++    for (plan.items) |it| wanted += it.span.bytes();
++    var probe = try load.Streamer.initWith(gpa, cat, s.opts);
++    const m = try probe.measure(plan);
++    probe.deinit();
++    const worst: f64 = @floatFromInt(@max(m.read_bytes, wanted));
++    out("plan: {d} items, {d} matrices, {d:.2} GiB wanted, new strategy reads {d:.2} GiB in {d} reads (+{d} marker reads)\n", .{ plan.items.len, plan.matrices.len, @as(f64, @floatFromInt(wanted)) / 1024 / mib, @as(f64, @floatFromInt(m.read_bytes)) / 1024 / mib, m.windows, m.marker_windows });
++    if (worst / 1024 / mib > s.limit_gib) {
++        out("this test would read {d:.2} GiB, over the limit of {d:.2} GiB: use fewer layers\n", .{ worst / 1024 / mib, s.limit_gib });
++        return error.OverReadLimit;
++    }
++    // old, new, old, new: a second pair shows the run to run spread
++    for ([_]bool{ false, true, false, true }) |new| {
++        if (s.only) |o| if ((o == .new) != new) continue;
++        report(if (new) "new" else "old", try stream(cat, plan, s, new));
++    }
++}
++
++/// The plan cut to `layers` layers from `first`, without the embedding and the head (one in-memory slice).
++fn slice(base: *const load.Plan, keep_first: u16, keep_n: usize) !load.Plan {
++    var p = base.*;
++    var keep: std.ArrayList(bool) = .empty;
++    defer keep.deinit(gpa);
++    try keep.appendNTimes(gpa, true, base.slots.len);
++    for (base.plain) |t| if (t.role == .embed or (t.layer < keep_first or t.layer >= keep_first + keep_n)) {
++        keep.items[t.slot] = false;
++    };
++    for (base.matrices) |m| if (m.proj == .head or m.layer < keep_first or m.layer >= keep_first + keep_n) {
++        keep.items[m.trellis] = false;
++        keep.items[m.suh] = false;
++        keep.items[m.svh] = false;
++    };
++    var items: std.ArrayList(load.Item) = .empty;
++    errdefer items.deinit(gpa);
++    for (base.items) |it| if (keep.items[it.slot]) try items.append(gpa, it);
++    var ms: std.ArrayList(load.Matrix) = .empty;
++    errdefer ms.deinit(gpa);
++    for (base.matrices) |m| if (keep.items[m.trellis]) try ms.append(gpa, m);
++    p.items = try items.toOwnedSlice(gpa);
++    p.matrices = try ms.toOwnedSlice(gpa);
++    return p;
++}
++
++fn model(dir: []const u8, rank: usize, world: usize, s: Settings) !void {
++    var cat = try load.Catalog.open(gpa, io_, dir);
++    defer cat.deinit();
++    const c = try loadConfig(dir);
++    var layers: [64]u16 = undefined;
++    for (layers[0..s.layers], 0..) |*l, i| l.* = @intCast(s.first + i);
++    var full = try load.Plan.build(gpa, &cat, &c, try shard.Share.of(&c, rank, world), .{ .layers = layers[0..s.layers] });
++    defer full.deinit();
++    const p = try slice(&full, s.first, s.layers);
++    defer gpa.free(p.items);
++    defer gpa.free(p.matrices);
++    out("model {s} rank {d}/{d}: layers {d}..{d}\n", .{ dir, rank, world, s.first, s.first + s.layers });
++    try bothWays(&cat, &p, s);
++}
++
++// ---- strided runs of one file ----
++
++fn pattern(path: [:0]const u8, run: u64, stride: u64, wanted_mib: u64, s: Settings) !void {
++    var cat = load.Catalog.init(gpa);
++    defer cat.deinit();
++    try cat.files.append(gpa, try dio.File.open(path));
++    const count = wanted_mib * (1 << 20) / run;
++    var slots = [_]load.Slot{.{ .bytes = count * run }};
++    var items = [_]load.Item{.{ .shard = 0, .base = 0, .span = .{ .offset = 0, .len = run, .stride = stride, .count = count }, .slot = 0, .dst = 0 }};
++    const c = config.flash;
++    const plan: load.Plan = .{
++        .arena = .init(gpa),
++        .share = try shard.Share.of(&c, 0, 2),
++        .slots = &slots,
++        .items = &items,
++        .matrices = &.{},
++        .plain = &.{},
++        .moe = &.{},
++        .ignored = 0,
++    };
++    out("pattern {s} (direct {}): {d} runs of {d} bytes every {d} bytes ({d} MiB wanted, spans {d:.2} GiB of the file)\n", .{ path, cat.files.items[0].direct, count, run, stride, wanted_mib, @as(f64, @floatFromInt(count * stride)) / 1024 / mib });
++    try bothWays(&cat, &plan, s);
++}
++
++// ---- the device's ceiling ----
++
++const Raw = struct {
++    file: dio.File,
++    block: usize,
++    blocks: u64,
++    next: std.atomic.Value(u64) = .init(0),
++    failed: std.atomic.Value(bool) = .init(false),
++
++    fn worker(r: *Raw) void {
++        const buf = gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), r.block) catch {
++            r.failed.store(true, .release);
++            return;
++        };
++        defer gpa.free(buf);
++        while (true) {
++            const i = r.next.fetchAdd(1, .monotonic);
++            if (i >= r.blocks or r.failed.load(.acquire)) return;
++            _ = r.file.read(buf, i * r.block, r.block) catch {
++                r.failed.store(true, .release);
++                return;
++            };
++        }
++    }
++};
++
++fn raw(path: [:0]const u8, block_kib: usize, threads: usize, total_mib: usize) !void {
++    if (@as(u64, block_kib) * 1024 * threads > max_buffer_bytes) return error.TooMuchBuffer;
++    try guard();
++    var r: Raw = .{ .file = try dio.File.open(path), .block = block_kib * 1024, .blocks = total_mib * (1 << 20) / (block_kib * 1024) };
++    defer r.file.close();
++    const hs = try gpa.alloc(std.Thread, threads);
++    defer gpa.free(hs);
++    const t0 = now();
++    for (hs) |*h| h.* = try std.Thread.spawn(.{}, Raw.worker, .{&r});
++    for (hs) |h| h.join();
++    const secs = @as(f64, @floatFromInt(now() - t0)) / 1e9;
++    if (r.failed.load(.acquire)) return error.ReadFailed;
++    out("raw {s} (direct {}): {d} KiB blocks x {d} threads: {d:.1} MiB/s ({d} MiB in {d:.2} s)\n", .{ path, r.file.direct, block_kib, threads, @as(f64, @floatFromInt(total_mib)) / secs, total_mib, secs });
++}
++
++pub fn main(init: std.process.Init) !void {
++    io_ = init.io;
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len < 3) {
++        out("{s}\n", .{usage});
++        return error.Usage;
++    }
++    try guard();
++    var s: Settings = .{};
++    const cmd = args[1];
++    if (std.mem.eql(u8, cmd, "stats") and args.len >= 5) {
++        try parseOptions(args[5..], &s);
++        return stats(args[2], try std.fmt.parseInt(usize, args[3], 10), try std.fmt.parseInt(usize, args[4], 10), s);
++    }
++    if (std.mem.eql(u8, cmd, "model") and args.len >= 5) {
++        try parseOptions(args[5..], &s);
++        return model(args[2], try std.fmt.parseInt(usize, args[3], 10), try std.fmt.parseInt(usize, args[4], 10), s);
++    }
++    if (std.mem.eql(u8, cmd, "pattern") and args.len >= 6) {
++        try parseOptions(args[6..], &s);
++        return pattern(args[2], try std.fmt.parseInt(u64, args[3], 10), try std.fmt.parseInt(u64, args[4], 10), try std.fmt.parseInt(u64, args[5], 10), s);
++    }
++    if (std.mem.eql(u8, cmd, "raw") and args.len >= 6) {
++        return raw(args[2], try std.fmt.parseInt(usize, args[3], 10), try std.fmt.parseInt(usize, args[4], 10), try std.fmt.parseInt(usize, args[5], 10));
++    }
++    return error.Usage;
++}
+diff --git a/zig/src/families/minimax_m3/stream.zig b/zig/src/families/minimax_m3/stream.zig
+index be59e0e..88310d5 100644
+--- a/zig/src/families/minimax_m3/stream.zig
++++ b/zig/src/families/minimax_m3/stream.zig
+@@ -1,5 +1,6 @@
+-//! The checkpoint streamer: a plan's byte runs read in file order with direct I/O through one aligned buffer.
++//! The checkpoint streamer: runs coalesced into large aligned windows, read by several threads, copied in file order.
+ const std = @import("std");
++const builtin = @import("builtin");
+ const core = @import("core");
+ const dio = core.direct_io;
+ const load = @import("load.zig");
+@@ -10,32 +11,196 @@ const Sink = load.Sink;
+ /// Told when the last run of a shard has been read: its pages can leave the page cache.
+ pub const ShardEnd = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, shard: u16) void };
+ 
+-/// Reads a plan's byte runs in file order with direct I/O through one aligned buffer.
++pub const Options = struct {
++    /// Bytes of each aligned buffer: the most one read covers (less 8 KiB of alignment slack).
++    chunk: usize = Streamer.default_chunk,
++    /// Reader threads, so reads in flight (0: every read runs on the calling thread, as `runSerial` does).
++    threads: usize = Streamer.default_threads,
++    /// Buffers beyond one per reader: windows read ahead of the copy that waits for them.
++    ahead: usize = 2,
++    /// Runs this close (bytes between them) share a read; the bytes between are read and dropped.
++    gap: usize = Streamer.default_gap,
++    /// Most bytes one sink put carries: a device copy stages its source, so a put is kept to a size that stage reuses.
++    put_max: usize = Streamer.default_put,
++
++    /// The defaults with TF_MM3_LOAD_THREADS, _CHUNK_MIB, _GAP_KIB and _PUT_MIB applied, to tune a slow mount.
++    pub fn fromEnv() Options {
++        var o: Options = .{};
++        o.threads = envInt("TF_MM3_LOAD_THREADS", o.threads, 1);
++        o.chunk = envInt("TF_MM3_LOAD_CHUNK_MIB", o.chunk >> 20, 1) << 20;
++        o.gap = envInt("TF_MM3_LOAD_GAP_KIB", o.gap >> 10, 1) << 10;
++        o.put_max = envInt("TF_MM3_LOAD_PUT_MIB", o.put_max >> 20, 1) << 20;
++        return o;
++    }
++};
++
++/// The integer in environment variable `name` when it holds one of at least `min` and under 4096, else `fallback`.
++fn envInt(name: [:0]const u8, fallback: usize, min: usize) usize {
++    const v = std.c.getenv(name) orelse return fallback;
++    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return fallback;
++    return if (n >= min and n < 4096) n else fallback;
++}
++
++/// What the last `run` read, for the benchmark and the tests.
++pub const Stats = struct {
++    windows: u64 = 0, // reads planned
++    read_bytes: u64 = 0, // bytes those reads cover, gaps included (before 4 KiB widening)
++    wanted_bytes: u64 = 0, // bytes the plan asked for
++    markers: u64 = 0, // codebook markers checked
++    marker_windows: u64 = 0, // reads they took
++};
++
++/// Reads a plan's byte runs as coalesced windows with several reads in flight.
+ pub const Streamer = struct {
+     gpa: std.mem.Allocator,
+     cat: *const Catalog,
+-    buf: dio.Buffer,
++    bufs: []dio.Buffer,
+     folded: []f32,
+     ended: ?ShardEnd = null,
++    opts: Options,
++    stats: Stats = .{},
+ 
+-    pub const default_chunk = 8 << 20;
++    pub const default_chunk = 16 << 20;
++    pub const default_threads = 6;
++    pub const default_gap = 1 << 20;
++    pub const default_put = 4 << 20;
+ 
+     pub fn init(gpa: std.mem.Allocator, cat: *const Catalog, chunk: usize) !Streamer {
+-        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), chunk);
+-        errdefer gpa.free(buf);
+-        return .{ .gpa = gpa, .cat = cat, .buf = buf, .folded = try gpa.alloc(f32, dio.fits(chunk) / 2) };
++        var o = Options.fromEnv();
++        if (chunk != default_chunk) o.chunk = chunk;
++        return initWith(gpa, cat, o);
++    }
++
++    pub fn initWith(gpa: std.mem.Allocator, cat: *const Catalog, opts: Options) !Streamer {
++        if (opts.chunk < 4 * dio.alignment or opts.chunk % dio.alignment != 0 or opts.put_max == 0) return error.BadChunk;
++        const n = opts.threads + opts.ahead + @intFromBool(opts.threads == 0);
++        const bufs = try gpa.alloc(dio.Buffer, n);
++        errdefer gpa.free(bufs);
++        var made: usize = 0;
++        errdefer for (bufs[0..made]) |b| gpa.free(b);
++        while (made < n) : (made += 1) bufs[made] = try gpa.alignedAlloc(u8, .fromByteUnits(dio.alignment), opts.chunk);
++        const folded = try gpa.alloc(f32, dio.fits(opts.chunk) / 2);
++        return .{ .gpa = gpa, .cat = cat, .bufs = bufs, .folded = folded, .opts = opts };
+     }
+ 
+     pub fn deinit(s: *Streamer) void {
+-        s.gpa.free(s.buf);
++        for (s.bufs) |b| s.gpa.free(b);
++        s.gpa.free(s.bufs);
+         s.gpa.free(s.folded);
+         s.* = undefined;
+     }
+ 
+-    /// Every EXL3 marker holds the mul1 multiplier: a codebook the kernels do not decode is refused before any copy.
++    /// Bytes of buffers held: the loader's whole read-side memory.
++    pub fn bufferBytes(s: *const Streamer) usize {
++        return s.bufs.len * s.opts.chunk;
++    }
++
++    /// Every EXL3 marker holds mul1, else the stream is refused before any copy; each is read once, in file order.
+     pub fn verifyMarkers(s: *Streamer, plan: *const Plan) !void {
++        const marks = try sortedMarks(s.gpa, plan);
++        defer s.gpa.free(marks);
++        var ctx: MarkCtx = .{ .plan = plan };
++        const wins = try schedule(Marks, s.gpa, .{ .marks = marks }, dio.fits(s.opts.chunk), s.opts.gap);
++        defer s.gpa.free(wins);
++        s.stats.markers = marks.len;
++        s.stats.marker_windows = wins.len;
++        try s.pipeline(Marks, wins, &ctx, MarkCtx.consume);
++    }
++
++    /// The reads `run` would make for `plan`, counted without reading anything.
++    pub fn measure(s: *const Streamer, plan: *const Plan) !Stats {
++        const room = dio.fits(s.opts.chunk);
++        var out: Stats = .{ .markers = plan.matrices.len };
++        const marks = try sortedMarks(s.gpa, plan);
++        defer s.gpa.free(marks);
++        const mw = try schedule(Marks, s.gpa, .{ .marks = marks }, room, s.opts.gap);
++        defer s.gpa.free(mw);
++        out.marker_windows = mw.len;
++        const wins = try schedule(Runs, s.gpa, .{ .plan = plan }, room, s.opts.gap);
++        defer s.gpa.free(wins);
++        out.windows = wins.len;
++        for (wins) |w| out.read_bytes += w.end - w.lo;
++        for (plan.items) |it| out.wanted_bytes += it.span.bytes();
++        return out;
++    }
++
++    pub fn run(s: *Streamer, plan: *const Plan, sink: Sink) !void {
++        try s.verifyMarkers(plan);
++        const room = dio.fits(s.opts.chunk);
++        const wins = try schedule(Runs, s.gpa, .{ .plan = plan }, room, s.opts.gap);
++        defer s.gpa.free(wins);
++        s.stats.windows = wins.len;
++        s.stats.read_bytes = 0;
++        s.stats.wanted_bytes = 0;
++        for (wins) |w| s.stats.read_bytes += w.end - w.lo;
++        var ctx: PlanCtx = .{ .s = s, .sink = sink };
++        try s.pipeline(Runs, wins, &ctx, PlanCtx.consume);
++        if (ctx.shard_open) |o| s.shardEnded(o);
++        s.stats.wanted_bytes = ctx.wanted;
++    }
++
++    fn shardEnded(s: *Streamer, shard: u16) void {
++        if (s.ended) |e| e.call(e.ctx, shard);
++    }
++
++    // ---- the pipeline: windows read by threads, consumed in order by the caller ----
++
++    fn Consume(comptime I: type) type {
++        return *const fn (ctx: *anyopaque, index: usize, w: Window(I), data: []u8) anyerror!void;
++    }
++
++    fn pipeline(s: *Streamer, comptime I: type, wins: []const Window(I), ctx: *anyopaque, consume: Consume(I)) !void {
++        if (wins.len == 0) return;
++        const want = @min(s.opts.threads, wins.len);
++        if (want == 0) return s.inline_(I, wins, ctx, consume);
++        const state = try s.gpa.alloc(std.atomic.Value(u32), wins.len);
++        defer s.gpa.free(state);
++        for (state) |*x| x.* = .init(0);
++        const fail = try s.gpa.alloc(u16, wins.len);
++        defer s.gpa.free(fail);
++        const got = try s.gpa.alloc([]u8, wins.len);
++        defer s.gpa.free(got);
++        const reads = try s.gpa.alloc(Read, wins.len);
++        defer s.gpa.free(reads);
++        for (reads, wins) |*r, w| r.* = .{ .shard = w.shard, .lo = w.lo, .len = @intCast(w.end - w.lo) };
++        var sh: Shared = .{ .s = s, .reads = reads, .state = state, .fail = fail, .got = got };
++        const threads = try s.gpa.alloc(std.Thread, want);
++        defer s.gpa.free(threads);
++        var spawned: usize = 0;
++        while (spawned < want) : (spawned += 1) {
++            threads[spawned] = std.Thread.spawn(.{}, Shared.worker, .{&sh}) catch break;
++        }
++        defer {
++            sh.abort.store(true, .release);
++            sh.bell.ring();
++            for (threads[0..spawned]) |t| t.join();
++        }
++        // no thread could start: the calling thread reads every window itself
++        if (spawned == 0) return s.inline_(I, wins, ctx, consume);
++        for (wins, 0..) |w, i| {
++            while (true) {
++                const seen = sh.bell.now();
++                if (state[i].load(.acquire) != 0) break;
++                sh.bell.wait(seen);
++            }
++            if (state[i].load(.acquire) == 2) return @errorFromInt(fail[i]);
++            try consume(ctx, i, w, got[i]);
++            sh.released.store(i + 1, .release);
++            sh.bell.ring();
++        }
++    }
++
++    fn inline_(s: *Streamer, comptime I: type, wins: []const Window(I), ctx: *anyopaque, consume: Consume(I)) !void {
++        for (wins, 0..) |w, i| {
++            const data = try s.cat.files.items[w.shard].read(s.bufs[0], w.lo, @intCast(w.end - w.lo));
++            try consume(ctx, i, w, data);
++        }
++    }
++
++    /// The old strategy, kept as the test reference and the benchmark baseline: one read per run, one at a time.
++    pub fn verifyMarkersSerial(s: *Streamer, plan: *const Plan) !void {
+         for (plan.matrices) |m| {
+-            const got = try s.cat.files.items[m.marker_shard].read(s.buf, m.marker_at, 4);
++            const got = try s.cat.files.items[m.marker_shard].read(s.bufs[0], m.marker_at, 4);
+             if (std.mem.readInt(u32, got[0..4], .little) != load.mul1_multiplier) {
+                 std.log.warn("layer {d} {t} expert {d}: codebook marker is not mul1", .{ m.layer, m.proj, m.expert });
+                 return error.BadCodebookMarker;
+@@ -43,9 +208,10 @@ pub const Streamer = struct {
+         }
+     }
+ 
+-    pub fn run(s: *Streamer, plan: *const Plan, sink: Sink) !void {
+-        try s.verifyMarkers(plan);
+-        const room = dio.fits(s.buf.len);
++    pub fn runSerial(s: *Streamer, plan: *const Plan, sink: Sink) !void {
++        try s.verifyMarkersSerial(plan);
++        const buf = s.bufs[0];
++        const room = dio.fits(buf.len);
+         var shard_open: ?u16 = null;
+         for (plan.items) |it| {
+             if (shard_open) |o| if (o != it.shard) s.shardEnded(o);
+@@ -55,7 +221,7 @@ pub const Streamer = struct {
+             if (it.fold) {
+                 // a norm weight: one read, bf16 to fp32 1 + w
+                 if (it.span.len > room or it.span.count != 1 or it.dst != 0) return error.BadPlan;
+-                const got = try file.read(s.buf, it.first(), @intCast(it.span.len));
++                const got = try file.read(buf, it.first(), @intCast(it.span.len));
+                 const out = load.foldGemma(s.folded, got);
+                 try sink.put(sink.ctx, it.slot, 0, std.mem.sliceAsBytes(out));
+                 continue;
+@@ -68,7 +234,7 @@ pub const Streamer = struct {
+                 while (left > 0) {
+                     const n: usize = @intCast(@min(left, room));
+                     if (dst + n > limit) return error.BadPlan;
+-                    try sink.put(sink.ctx, it.slot, dst, try file.read(s.buf, at, n));
++                    try sink.put(sink.ctx, it.slot, dst, try file.read(buf, at, n));
+                     at += n;
+                     dst += n;
+                     left -= n;
+@@ -77,8 +243,281 @@ pub const Streamer = struct {
+         }
+         if (shard_open) |o| s.shardEnded(o);
+     }
++};
+ 
+-    fn shardEnded(s: *Streamer, shard: u16) void {
+-        if (s.ended) |e| e.call(e.ctx, shard);
++/// A thread's wake-up: any change rings it, a waiter re-checks its condition (a futex where the OS has one).
++const Bell = struct {
++    seq: std.atomic.Value(u32) = .init(0),
++
++    fn now(b: *Bell) u32 {
++        return b.seq.load(.acquire);
++    }
++
++    fn ring(b: *Bell) void {
++        _ = b.seq.fetchAdd(1, .release);
++        if (builtin.os.tag == .linux) _ = std.os.linux.futex_3arg(&b.seq.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
++    }
++
++    /// Returns once the bell has rung since `seen` (or at once, spuriously).
++    fn wait(b: *Bell, seen: u32) void {
++        if (builtin.os.tag == .linux) {
++            _ = std.os.linux.futex_4arg(&b.seq.raw, .{ .cmd = .WAIT, .private = true }, seen, null);
++        } else if (b.seq.load(.acquire) == seen) std.Thread.yield() catch {};
++    }
++};
++
++/// One read: `len` bytes at absolute offset `lo` of a shard.
++const Read = struct { shard: u16, lo: u64, len: usize };
++
++const Shared = struct {
++    s: *Streamer,
++    reads: []const Read,
++    state: []std.atomic.Value(u32), // per window: 0 pending, 1 read, 2 failed
++    fail: []u16,
++    got: [][]u8,
++    next: std.atomic.Value(usize) = .init(0),
++    released: std.atomic.Value(usize) = .init(0), // windows copied: their buffers are free
++    abort: std.atomic.Value(bool) = .init(false),
++    bell: Bell = .{},
++
++    /// Claims windows in order; window i reads into buffer i % n once the copy of window i - n is done with it.
++    fn worker(sh: *Shared) void {
++        const nbuf = sh.s.bufs.len;
++        while (true) {
++            const i = sh.next.fetchAdd(1, .monotonic);
++            if (i >= sh.reads.len) return;
++            while (true) {
++                const seen = sh.bell.now();
++                if (sh.abort.load(.acquire)) return;
++                if (i < sh.released.load(.acquire) + nbuf) break;
++                sh.bell.wait(seen);
++            }
++            const r = sh.reads[i];
++            if (sh.s.cat.files.items[r.shard].read(sh.s.bufs[i % nbuf], r.lo, r.len)) |data| {
++                sh.got[i] = data;
++                sh.state[i].store(1, .release);
++            } else |e| {
++                sh.fail[i] = @intFromError(e);
++                sh.state[i].store(2, .release);
++            }
++            sh.bell.ring();
++        }
++    }
++};
++
++// ---- the schedule: runs in file order folded into windows ----
++
++/// A piece of one run still to read: `len` bytes at absolute offset `at`, bound for `dst` of `slot`.
++const Piece = struct { shard: u16, at: u64, len: u64, slot: u32, dst: u64, fold: bool };
++
++/// One read: the runs from `start` up to `stop` fall in [lo, end) of a shard, and none crosses `hard`.
++fn Window(comptime I: type) type {
++    return struct { shard: u16, lo: u64, end: u64, hard: u64, start: I, stop: I };
++}
++
++/// A plan's runs in the plan's (shard, offset) order, a run being cut where a window ends.
++const Runs = struct {
++    plan: *const Plan,
++    item: usize = 0,
++    run: u64 = 0,
++    used: u64 = 0, // bytes of the current run already taken
++
++    fn head(r: *Runs) ?Piece {
++        while (r.item < r.plan.items.len) {
++            const it = r.plan.items[r.item];
++            if (r.run < it.span.count and it.span.len > 0) return .{
++                .shard = it.shard,
++                .at = it.base + it.span.at(r.run) + r.used,
++                .len = it.span.len - r.used,
++                .slot = it.slot,
++                .dst = it.dst + r.run * it.span.len + r.used,
++                .fold = it.fold,
++            };
++            r.item += 1;
++            r.run = 0;
++            r.used = 0;
++        }
++        return null;
++    }
++
++    fn skip(r: *Runs, n: u64) void {
++        r.used += n;
++        if (r.used >= r.plan.items[r.item].span.len) {
++            r.run += 1;
++            r.used = 0;
++        }
++    }
++
++    /// Whether `a` and `b` are at the same place; each is first moved past runs with nothing in them.
++    fn same(a: *Runs, b: Runs) bool {
++        var other = b;
++        _ = a.head();
++        _ = other.head();
++        return a.item == other.item and a.run == other.run and a.used == other.used;
++    }
++
++    /// The part of `p` a window takes must stay in its slot; a norm weight is one whole run (folded as a unit).
++    fn admit(r: *const Runs, p: Piece, n: u64, room: u64) !void {
++        if (p.dst + n > r.plan.slots[p.slot].bytes) return error.BadPlan;
++        if (p.fold) {
++            const it = r.plan.items[r.item];
++            if (it.span.len > room or it.span.count != 1 or it.dst != 0) return error.BadPlan;
++        }
++    }
++};
++
++const Mark = struct { shard: u16, at: u64, matrix: u32 };
++
++/// Every matrix' marker by (shard, offset).
++fn sortedMarks(gpa: std.mem.Allocator, plan: *const Plan) ![]Mark {
++    const marks = try gpa.alloc(Mark, plan.matrices.len);
++    errdefer gpa.free(marks);
++    for (marks, plan.matrices, 0..) |*mk, m, i| mk.* = .{ .shard = m.marker_shard, .at = m.marker_at, .matrix = @intCast(i) };
++    std.mem.sort(Mark, marks, {}, struct {
++        fn less(_: void, a: Mark, b: Mark) bool {
++            return if (a.shard != b.shard) a.shard < b.shard else a.at < b.at;
++        }
++    }.less);
++    return marks;
++}
++
++/// The codebook markers, sorted by (shard, offset), four bytes each.
++const Marks = struct {
++    marks: []const Mark,
++    i: usize = 0,
++
++    fn head(r: *Marks) ?Piece {
++        if (r.i >= r.marks.len) return null;
++        const m = r.marks[r.i];
++        return .{ .shard = m.shard, .at = m.at, .len = 4, .slot = 0, .dst = 0, .fold = false };
++    }
++
++    fn skip(r: *Marks, _: u64) void {
++        r.i += 1;
++    }
++
++    fn same(a: *Marks, b: Marks) bool {
++        return a.i == b.i;
++    }
++
++    fn admit(_: *const Marks, _: Piece, _: u64, _: u64) !void {}
++};
++
++/// Folds the runs from `start` into windows of at most `room` bytes, one read each, joining runs under `gap` apart.
++fn schedule(comptime I: type, gpa: std.mem.Allocator, start: I, room: u64, gap: u64) ![]Window(I) {
++    const W = Window(I);
++    var list: std.ArrayList(W) = .empty;
++    errdefer list.deinit(gpa);
++    var it = start;
++    var open = false;
++    var w: W = undefined;
++    while (it.head()) |h| {
++        if (open and (h.shard != w.shard or h.at < w.end or h.at >= w.hard or h.at - w.end > gap)) {
++            w.stop = it;
++            try list.append(gpa, w);
++            open = false;
++        }
++        if (!open) {
++            w = .{ .shard = h.shard, .lo = h.at, .end = h.at, .hard = h.at + room, .start = it, .stop = undefined };
++            open = true;
++        }
++        const n = @min(h.len, w.hard - h.at);
++        if (h.fold and n < h.len) {
++            // a folded run is never split: it opens a window of its own
++            if (w.end == w.lo) return error.BadPlan;
++            w.stop = it;
++            try list.append(gpa, w);
++            open = false;
++            continue;
++        }
++        try it.admit(h, n, room);
++        w.end = h.at + n;
++        it.skip(n);
++    }
++    if (open) {
++        w.stop = it;
++        try list.append(gpa, w);
++    }
++    return list.toOwnedSlice(gpa);
++}
++
++/// The plan's side of the pipeline: copies a window's runs to the sink, packed per destination.
++const PlanCtx = struct {
++    s: *Streamer,
++    sink: Sink,
++    shard_open: ?u16 = null,
++    wanted: u64 = 0,
++    since_drop: u64 = 0,
++
++    /// Bytes of a file read between page-cache drops, for a file system that refused the direct read.
++    const drop_every = 512 << 20;
++
++    fn consume(ctx: *anyopaque, _: usize, w: Window(Runs), data: []u8) anyerror!void {
++        const c: *PlanCtx = @ptrCast(@alignCast(ctx));
++        if (c.shard_open) |o| if (o != w.shard) {
++            c.s.shardEnded(o);
++            c.since_drop = 0;
++        };
++        c.shard_open = w.shard;
++        const file = c.s.cat.files.items[w.shard];
++        var it = w.start;
++        var packed_to: usize = 0; // wanted bytes are packed to the front of `data` as they are met
++        var group: ?Group = null;
++        while (!it.same(w.stop)) {
++            const h = it.head().?;
++            const n: usize = @intCast(@min(h.len, w.hard - h.at));
++            const src: usize = @intCast(h.at - w.lo);
++            if (h.fold) {
++                try c.flush(&group, data, packed_to);
++                const out = load.foldGemma(c.s.folded, data[src..][0..n]);
++                try c.sink.put(c.sink.ctx, h.slot, h.dst, std.mem.sliceAsBytes(out));
++            } else {
++                if (group) |g| if (g.slot != h.slot or g.dst + (packed_to - g.from) != h.dst) try c.flush(&group, data, packed_to);
++                if (group == null) group = .{ .slot = h.slot, .dst = h.dst, .from = packed_to };
++                if (packed_to != src) @memmove(data[packed_to..][0..n], data[src..][0..n]);
++                packed_to += n;
++            }
++            c.wanted += n;
++            it.skip(n);
++        }
++        try c.flush(&group, data, packed_to);
++        c.since_drop += data.len;
++        if (c.since_drop >= drop_every) {
++            file.dropCache();
++            c.since_drop = 0;
++        }
++    }
++
++    const Group = struct { slot: u32, dst: u64, from: usize };
++
++    fn flush(c: *PlanCtx, group: *?Group, data: []u8, packed_to: usize) !void {
++        const g = group.* orelse return;
++        group.* = null;
++        var at: usize = 0;
++        const all = data[g.from..packed_to];
++        while (at < all.len) {
++            const n = @min(all.len - at, c.s.opts.put_max);
++            try c.sink.put(c.sink.ctx, g.slot, g.dst + at, all[at..][0..n]);
++            at += n;
++        }
++    }
++};
++
++/// The marker side: each marker of a window is the mul1 multiplier or the stream stops.
++const MarkCtx = struct {
++    plan: *const Plan,
++
++    fn consume(ctx: *anyopaque, _: usize, w: Window(Marks), data: []u8) anyerror!void {
++        const c: *MarkCtx = @ptrCast(@alignCast(ctx));
++        var it = w.start;
++        while (!it.same(w.stop)) : (it.skip(4)) {
++            const m = it.marks[it.i];
++            const at: usize = @intCast(m.at - w.lo);
++            if (std.mem.readInt(u32, data[at..][0..4], .little) != load.mul1_multiplier) {
++                const x = c.plan.matrices[m.matrix];
++                std.log.warn("layer {d} {t} expert {d}: codebook marker is not mul1", .{ x.layer, x.proj, x.expert });
++                return error.BadCodebookMarker;
++            }
++        }
+     }
+ };
+diff --git a/zig/src/families/minimax_m3/stream_test.zig b/zig/src/families/minimax_m3/stream_test.zig
+new file mode 100644
+index 0000000..4176c48
+--- /dev/null
++++ b/zig/src/families/minimax_m3/stream_test.zig
+@@ -0,0 +1,85 @@
++//! The coalescing streamer against the one-run-at-a-time streamer on the synthetic mini checkpoint, no GPU.
++const std = @import("std");
++const load = @import("load.zig");
++const synth = @import("load_synth_test.zig");
++
++const gpa = std.testing.allocator;
++
++test "the coalescing streamer puts the bytes of the one-run-at-a-time streamer, whatever the readers, buffers and gap" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var pack = synth.Pack.init();
++    defer pack.deinit();
++    try pack.all(&c);
++    const Case = struct { shards: usize, world: usize, o: load.StreamOptions };
++    const cases = [_]Case{
++        .{ .shards = 2, .world = 1, .o = .{} },
++        .{ .shards = 2, .world = 2, .o = .{} },
++        .{ .shards = 3, .world = 2, .o = .{ .chunk = 16 * 1024, .threads = 3, .gap = 0 } },
++        .{ .shards = 3, .world = 2, .o = .{ .chunk = 16 * 1024, .threads = 1, .ahead = 0, .gap = 4096 } },
++        .{ .shards = 5, .world = 2, .o = .{ .chunk = 32 * 1024, .threads = 0, .gap = 1 << 20 } },
++        .{ .shards = 1, .world = 2, .o = .{ .chunk = 20 * 1024, .threads = 8, .ahead = 1, .gap = 100, .put_max = 5000 } },
++    };
++    for (cases) |case| {
++        var dir = try synth.Dir.init(io);
++        defer dir.deinit();
++        try synth.write(io, dir.tmp.dir, &pack, .{ .shards = case.shards });
++        var cat = try load.Catalog.open(gpa, io, dir.path);
++        defer cat.deinit();
++        for (0..case.world) |rank| {
++            var plan = try synth.rankPlan(&cat, &c, rank, case.world);
++            defer plan.deinit();
++            var old = try synth.Host.init(&plan);
++            defer old.deinit();
++            var reference = try load.Streamer.init(gpa, &cat, 64 * 1024);
++            defer reference.deinit();
++            try reference.runSerial(&plan, old.sink());
++            var new = try synth.Host.init(&plan);
++            defer new.deinit();
++            var streamer = try load.Streamer.initWith(gpa, &cat, case.o);
++            defer streamer.deinit();
++            try streamer.run(&plan, new.sink());
++            for (old.bufs, new.bufs, old.written, new.written) |a, b, wa, wb| {
++                try std.testing.expectEqualSlices(u8, a, b);
++                try std.testing.expectEqual(wa, wb);
++            }
++            try synth.expectStreamed(&c, &pack, &plan, &new);
++            var runs: u64 = 0;
++            var wanted: u64 = 0;
++            for (plan.items) |it| {
++                runs += it.span.count;
++                wanted += it.span.bytes();
++            }
++            try std.testing.expectEqual(wanted, streamer.stats.wanted_bytes);
++            try std.testing.expect(streamer.stats.read_bytes >= wanted);
++            try std.testing.expectEqual(plan.matrices.len, streamer.stats.markers);
++            // coalescing is the point: with a gap the many short runs of a cut share reads
++            if (case.o.gap >= 4096 and case.world == 2) try std.testing.expect(streamer.stats.windows < runs);
++        }
++    }
++}
++
++test "a read that fails stops the coalescing streamer with that error and no put follows it" {
++    const io = std.testing.io;
++    const c = synth.mini();
++    var pack = synth.Pack.init();
++    defer pack.deinit();
++    try pack.all(&c);
++    var dir = try synth.Dir.init(io);
++    defer dir.deinit();
++    try synth.write(io, dir.tmp.dir, &pack, .{});
++    var cat = try load.Catalog.open(gpa, io, dir.path);
++    defer cat.deinit();
++    var plan = try synth.rankPlan(&cat, &c, 1, 2);
++    defer plan.deinit();
++    var host = try synth.Host.init(&plan);
++    defer host.deinit();
++    // the shards are emptied under the open descriptors after their headers were read: every read hits the end of file
++    for (0..2) |i| {
++        var fb: [48]u8 = undefined;
++        try dir.tmp.dir.writeFile(io, .{ .sub_path = synth.shardFile(&fb, i, 2), .data = "" });
++    }
++    var streamer = try load.Streamer.initWith(gpa, &cat, .{ .chunk = 16 * 1024, .threads = 3 });
++    defer streamer.deinit();
++    if (streamer.run(&plan, host.sink())) |_| return error.TestUnexpectedResult else |_| {}
++}
+-- 
+2.43.0
+

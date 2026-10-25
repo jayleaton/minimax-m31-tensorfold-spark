@@ -1,0 +1,84 @@
+From b8f2c905dbcf3c342c68effc4ffe3c1de197f9e2 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:58:52 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: fix the fp8 attn contract tests
+ (e4m3-exact gate-4 stress, NaN plants on the last rows)
+
+The first GPU run failed two fp8 tf_mm3_attn variants: the gate-1 plants sat on keys every
+row reads and a bad value poisons its whole row, so all outputs were non-finite; gate 4's
+integer stress values do not fit e4m3 rows. The plants now sit on the last rows' own keys,
+and the stress values are e4m3 table values mirrored over the keys with a +-448 in every row
+(scale 1) and integer 9..16 residue pairs, so fp32 sums stay exact. No checks loosened and
+no KNOWN finding left: spark1 and spark2 give 19 of 19 kernels passing gates 1-4.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/tests/cuda/contract_minimax_sparse.zig | 30 +++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/zig/tests/cuda/contract_minimax_sparse.zig b/zig/tests/cuda/contract_minimax_sparse.zig
+index 3e27bb0..2f1ed4b 100644
+--- a/zig/tests/cuda/contract_minimax_sparse.zig
++++ b/zig/tests/cuda/contract_minimax_sparse.zig
+@@ -189,8 +189,20 @@ pub fn attnSpec(f: Cfg) c.Spec {
+         .tiles = .{ .{}, .{}, .{ .size = geom.block, .min = 1 } },
+         .served = &.{ .{ .rows = 16, .n = 32, .k = 3000 }, .{ .rows = 4, .n = 32, .k = 2048 }, .{ .rows = 2, .n = 32, .k = 129 }, .{ .rows = 8, .n = 32, .k = 128 } },
+         .sums = .{ .why = attn.why },
+-        // gate 4's integer stress values (up to 16320) do not fit e4m3 rows; gates 1-3 hold the fp8 reader to float64
+-        .known = if (f.kv8) .{ .gate = .sums, .finding = "gate 4 has no fp8 input: its integer stress values do not fit e4m3 rows" } else null,
++    };
++}
++
++/// attn.mirrored with e4m3-exact values and a +-448 in every row (scale 1); the 1 residue pairs are integers 9..16.
++fn mirrored8(rng: std.Random, out: []f32, e: usize) void {
++    const h = out.len / 2;
++    for (0..h) |i| {
++        const v: f32 = if (i < 8) @floatFromInt(9 + rng.uintLessThan(u32, 8)) else @floatCast(mr.e4m3Value(@intCast(0x10 + rng.uintLessThan(u32, 0x6f))));
++        out[i] = v;
++        out[h + i] = (if (i < 8) @as(f32, 1) else 0) - v;
++    }
++    if (out.len % 2 == 1) out[out.len - 1] = 0;
++    if (e >= 8) for (out, 0..) |*y, i| {
++        if (i % 120 == e - 8) y.* = if (i % 2 == 0) 448 else -448;
+     };
+ }
+ 
+@@ -238,7 +250,6 @@ pub const Attn = struct {
+     }
+ 
+     pub fn prepare(self: *Attn, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+-        if (self.f.kv8 and fill == .stress) return false; // the known gate-4 finding above
+         if (shape.n != kvh * geom.group or shape.rows == 0 or shape.k == 0 or shape.k + shape.rows > 8192) return false;
+         self.rig.reset();
+         const a = self.rig.gpu.gpa;
+@@ -368,6 +379,17 @@ pub const Attn = struct {
+         const inf = c.toBf16(std.math.inf(f32));
+         const ninf = c.toBf16(-std.math.inf(f32));
+         self.q.items[3] = nan;
++        if (self.f.kv8) {
++            // a bad value poisons its whole row: plant at the last rows' own keys
++            const l = n - 1;
++            const kv = self.key(l, 0, self.keysOf(l) - 1);
++            self.cell(@intCast(self.table.items[kv.b]), 1, 0, kv.t, 7).* = inf;
++            if (n > 2) {
++                const kk = self.key(l - 1, 1, self.keysOf(l - 1) - 1);
++                self.cell(@intCast(self.table.items[kk.b]), 0, 1, kk.t, 9).* = nan;
++            }
++            return;
++        }
+         const k0 = self.key(0, 0, self.keysOf(0) - 1);
+         self.cell(@intCast(self.table.items[k0.b]), 1, 0, k0.t, 7).* = inf;
+         if (n > 1) {
+@@ -401,7 +423,7 @@ pub const Attn = struct {
+         const col = try a.alloc(f32, nk);
+         defer a.free(col);
+         for (0..kvh) |h| for (0..geom.d) |e| {
+-            attn.mirrored(rng, col);
++            if (self.f.kv8) mirrored8(rng, col, e) else attn.mirrored(rng, col);
+             for (col, 0..) |y, i| {
+                 const k = self.key(0, h, i);
+                 self.cell(@intCast(self.table.items[k.b]), 1, h, k.t, e).* = c.toBf16(y);
+-- 
+2.43.0
+

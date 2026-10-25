@@ -1,0 +1,18 @@
+# The temperature / memory guard front (scripts/guard/daemon.py) on the rank 0 node: listens on the public port and
+# forwards to the engine on its loopback port. Ported from the DeepSeek-V4.1 recipe (PR #48). Install as a user unit
+# (docs/OPERATIONS.md); WorkingDirectory is this checkout.
+[Unit]
+Description=TensorFold temperature and memory guard
+After=tf-guard-sampler.service
+Wants=tf-guard-sampler.service
+
+[Service]
+WorkingDirectory=%h/minimax-m31-tensorfold-spark
+ExecStart=/usr/bin/env python3 scripts/guard/daemon.py --config %h/.config/tf-guard/guard.json
+Restart=on-failure
+RestartSec=5
+# exit 78: invalid config or durable state; do not loop on it
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,2065 @@
+From 89560c6f7dbdeca83199c62dc5a9c4ec1a3d56f4 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:32:16 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: fp8 KV cache (--kv-cache fp8) for K and V
+ pages
+
+K and V become e4m3 rows with one fp32 scale per token and kv head (rule of
+kv_fp8.cuh: scale amax / 448 floored at 2^-126, saturating nearest-even codes,
+a row with a NaN or infinity stores a NaN scale); the index keys stay bf16.
+47,040 B a token a rank instead of 76,800; 128-token page 6,021,120 B instead
+of 9,830,400.
+
+tf_mm3_rows (flags bit 64), tf_mm3_attn and tf_mm3_index (trailing kv8
+parameter) take the mode as a launch parameter; the bf16 paths are unchanged
+and the default. Options.kv8 lets the host's refusal pass the flag; Dims,
+PageMap, Paged, the budget and the layout follow; Settings.kv8 is in the ranks'
+fingerprint. minimax_ref.zig gets the float64 quantizer and attention over fp8
+K/V; test-minimax-kv8 holds host twins with planted mutants; mm3-contract gains
+fp8 writer and attention variants (not run on a GPU).
+
+No GPU run. The effect of fp8 K/V on the model's answers is not measured.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/minimax_family.zig                  |  25 +
+ zig/kernels/cuda/minimax_m3_attn.cu           |  87 ++-
+ zig/kernels/cuda/minimax_m3_index.cu          |   5 +-
+ zig/kernels/cuda/minimax_m3_rows.cu           |  21 +-
+ zig/kernels/cuda/minimax_m3_rows.cuh          |  30 ++
+ zig/kernels/cuda/minimax_m3_sparse.cuh        |  15 +
+ zig/src/core/contract/minimax_m3_records.zig  |   6 +-
+ .../core/contract/minimax_m3_rows_records.zig |   2 +-
+ zig/src/core/minimax_ref.zig                  |  89 +++
+ zig/src/cuda/minimax_m3_geom.zig              |  28 +-
+ zig/src/cuda/minimax_m3_rows.zig              |   7 +-
+ zig/src/cuda/minimax_m3_rows_geom.zig         |   3 +
+ zig/src/cuda/minimax_m3_sparse.zig            |   4 +
+ zig/src/families/minimax_m3/engine_dev.zig    |   2 +-
+ zig/src/families/minimax_m3/forward.zig       |   3 +-
+ zig/src/families/minimax_m3/forward_ops.zig   |   4 +-
+ zig/src/families/minimax_m3/kv8_test.zig      | 125 +++++
+ zig/src/families/minimax_m3/native.zig        |  10 +-
+ zig/src/families/minimax_m3/pool.zig          |  34 +-
+ zig/src/families/minimax_m3/ranks.zig         |  11 +-
+ zig/src/native/cuda.zig                       |   1 +
+ zig/src/native/cuda_kv_pool.zig               |   2 +-
+ zig/src/native/cuda_minimax_kv8_test.zig      |  19 +
+ zig/tests/cuda/contract_minimax_rows.zig      |  82 ++-
+ zig/tests/cuda/contract_minimax_sparse.zig    |  80 ++-
+ zig/tests/minimax_kv8_tests.zig               | 506 ++++++++++++++++++
+ zig/tests/minimax_kv8_twin.zig                | 143 +++++
+ 27 files changed, 1282 insertions(+), 62 deletions(-)
+ create mode 100644 zig/src/families/minimax_m3/kv8_test.zig
+ create mode 100644 zig/src/native/cuda_minimax_kv8_test.zig
+ create mode 100644 zig/tests/minimax_kv8_tests.zig
+ create mode 100644 zig/tests/minimax_kv8_twin.zig
+
+diff --git a/zig/build/minimax_family.zig b/zig/build/minimax_family.zig
+index 60dde07..5e4e227 100644
+--- a/zig/build/minimax_family.zig
++++ b/zig/build/minimax_family.zig
+@@ -42,6 +42,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod
+     @import("minimax_host.zig").steps(b, host, api, tokenizer, template, server_add, umbrella);
+     forward(b, host, cuda, core, lanes, api, umbrella);
+     @import("minimax_proj_host.zig").step(b, host, core, cuda, umbrella);
++    kv8(b, host, core, lanes, api, umbrella);
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug)) }));
+     b.step("test-minimax-engine-host", "MiniMax-M3.1-Flash interface, weights descriptors, page state and native host half without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
+@@ -58,3 +59,27 @@ fn forward(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod,
+     b.step("test-minimax-forward", "MiniMax-M3.1-Flash forward launch plan, op order, widths and prompt chunks without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
+ }
++
++/// The fp8 KV cache's host tests (docs/fp8-kv.md): codes, layout, quantizer and attention twins, mutants, family side.
++fn kv8(b: *std.Build, host: std.Build.ResolvedTarget, core: Mod, lanes: Mod, api: Mod, umbrella: *std.Build.Step) void {
++    const geom = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/minimax_m3_geom.zig"), .target = host, .optimize = .ReleaseSafe });
++    const rows_geom = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/minimax_m3_rows_geom.zig"), .target = host, .optimize = .ReleaseSafe });
++    const ref = b.createModule(.{
++        .root_source_file = b.path("zig/tests/minimax_kv8_tests.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "mm3_geom", .module = geom }, .{ .name = "mm3_rows_geom", .module = rows_geom } },
++    });
++    const canon = canonModule(b, host, .debug);
++    const family = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/kv8_test.zig"),
++        .target = host,
++        .optimize = .debug,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "canon", .module = canon }, .{ .name = "lanes", .module = lanes }, .{ .name = "engine_api", .module = api } },
++    });
++    const s = b.step("test-minimax-kv8", "MiniMax-M3.1-Flash fp8 KV cache (e4m3 rows, page layout, budget, quantizer and attention twins) without a GPU");
++    s.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = ref })).step);
++    s.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = family })).step);
++    umbrella.dependOn(s);
++}
+diff --git a/zig/kernels/cuda/minimax_m3_attn.cu b/zig/kernels/cuda/minimax_m3_attn.cu
+index f7b1851..45f6290 100644
+--- a/zig/kernels/cuda/minimax_m3_attn.cu
++++ b/zig/kernels/cuda/minimax_m3_attn.cu
+@@ -5,6 +5,10 @@
+ // rows of a call, or on whether the call is a decode window or a prompt chunk (pos null: pos0 + r).
+ // Keys past the row's position are never read (an unwritten page may hold NaN) and a -1 entry ends the list.
+ // Scores: sequential fp32 dot over d = 0..127, then times `scale`; softmax weights expf(s - m) in fp32; P.V in key order.
++
++// kv8 != 0 (launch parameter; 0: the unchanged bf16 pool): e4m3 K/V rows with an fp32 scale each (docs/fp8-kv.md).
++#include <cuda_fp8.h>
++
+ #include "minimax_m3_sparse.cuh"
+ 
+ using namespace tf_mm3;
+@@ -21,6 +25,12 @@ __device__ __forceinline__ float nmax(float a, float b) {
+     return a > b ? a : b;
+ }
+ 
++/// Two e4m3 codes (low 16 bits of w, or the high 16 with `second`) as floats; exact, NaN codes stay NaN.
++__device__ __forceinline__ float2 codes2(uint32_t w, bool second) {
++    const __nv_fp8x2_storage_t c = (__nv_fp8x2_storage_t)(second ? (w >> 16) : (w & 0xffffu));
++    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(c, __NV_E4M3)));
++}
++
+ __device__ __forceinline__ uint32_t pack2(float a, float b) {
+     __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+     return *reinterpret_cast<uint32_t*>(&v);
+@@ -39,7 +49,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_mm3_attn(
+     long long page_bytes, long long layer_off,
+     int kvh,
+     bf16* __restrict__ out,            // [rows, kvh * 16, 128]
+-    float scale) {
++    float scale,
++    int kv8) {
+     const int r = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
+     const int h = t >> 4, c = t & 15; // query head of the group, 8-dim slice of its output
+     const int p = row_pos(pos, pos0, r);
+@@ -51,6 +62,10 @@ extern "C" __global__ void __launch_bounds__(256) tf_mm3_attn(
+     __shared__ __align__(16) bf16 sk[TILE * KSTRIDE];
+     __shared__ __align__(16) bf16 sv[TILE * D];
+     __shared__ float sp[GROUP * TILE];
++    // fp8 tiles reuse sk and sv: K codes 32 rows of 33 words, then the 32 key scales and 32 value scales
++    uint32_t* sk8 = reinterpret_cast<uint32_t*>(sk);
++    float* sks = reinterpret_cast<float*>(sk) + TILE * 33;
++    float* svs = sks + TILE;
+ 
+     {
+         const uint4 w = __ldg(reinterpret_cast<const uint4*>(q + head * D) + c);
+@@ -69,10 +84,31 @@ extern "C" __global__ void __launch_bounds__(256) tf_mm3_attn(
+         const char* base = page_layer(pool, page_bytes, layer_off, __ldg(tab + b));
+         const bf16* kb = reinterpret_cast<const bf16*>(base) + kv_elem(kvh, 0, g, 0);
+         const bf16* vb = reinterpret_cast<const bf16*>(base) + kv_elem(kvh, 1, g, 0);
++        const unsigned char* kb8 = reinterpret_cast<const unsigned char*>(base) + kv8_byte(kvh, 0, g, 0);
++        const unsigned char* vb8 = reinterpret_cast<const unsigned char*>(base) + kv8_byte(kvh, 1, g, 0);
++        const float* ksc = reinterpret_cast<const float*>(base + scale8_byte(kvh, 0, g, 0));
++        const float* vsc = reinterpret_cast<const float*>(base + scale8_byte(kvh, 1, g, 0));
+         for (int k0 = 0; k0 < BLOCK; k0 += TILE) {
+             const int nvalid = min(TILE, p + 1 - (b * BLOCK + k0));
+             if (nvalid <= 0) break;
+             __syncthreads();
++            if (kv8) {
++                {
++                    const int row = t >> 3, vec = t & 7;  // 256 threads: 32 rows x 8 sixteen-byte pieces, K then V
++                    uint4 kw = make_uint4(0, 0, 0, 0), vw = kw;
++                    if (row < nvalid) {
++                        kw = __ldg(reinterpret_cast<const uint4*>(kb8 + (long long)(k0 + row) * D) + vec);
++                        vw = __ldg(reinterpret_cast<const uint4*>(vb8 + (long long)(k0 + row) * D) + vec);
++                    }
++                    uint32_t* kd = sk8 + row * 33 + vec * 4;
++                    kd[0] = kw.x; kd[1] = kw.y; kd[2] = kw.z; kd[3] = kw.w;
++                    *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(sv) + row * D + vec * 16) = vw;
++                }
++                if (t < TILE) {
++                    sks[t] = t < nvalid ? __ldg(ksc + k0 + t) : 0.f;
++                    svs[t] = t < nvalid ? __ldg(vsc + k0 + t) : 0.f;
++                }
++            } else
+             for (int i = t; i < TILE * 16; i += 256) {
+                 const int row = i >> 4, vec = i & 15;
+                 uint4 kw = make_uint4(0, 0, 0, 0), vw = kw;
+@@ -88,15 +124,30 @@ extern "C" __global__ void __launch_bounds__(256) tf_mm3_attn(
+                 const int j = c + 16 * u;
+                 if (j >= nvalid) continue;
+                 const float* qh = sq + h * D;
+-                const uint32_t* kr = reinterpret_cast<const uint32_t*>(sk + j * KSTRIDE);
+-                float a = 0.f;
++                if (kv8) {
++                    const uint32_t* kr = sk8 + j * 33;
++                    float a = 0.f;
+ #pragma unroll 8
+-                for (int e = 0; e < D / 2; ++e) {
+-                    const uint32_t w = kr[e];
+-                    a = __fadd_rn(a, __fmul_rn(qh[2 * e], lo(w)));
+-                    a = __fadd_rn(a, __fmul_rn(qh[2 * e + 1], hi(w)));
++                    for (int e = 0; e < D / 4; ++e) {
++                        const uint32_t w = kr[e];
++                        const float2 c01 = codes2(w, false), c23 = codes2(w, true);
++                        a = __fadd_rn(a, __fmul_rn(qh[4 * e], c01.x));
++                        a = __fadd_rn(a, __fmul_rn(qh[4 * e + 1], c01.y));
++                        a = __fadd_rn(a, __fmul_rn(qh[4 * e + 2], c23.x));
++                        a = __fadd_rn(a, __fmul_rn(qh[4 * e + 3], c23.y));
++                    }
++                    sp[h * TILE + j] = __fmul_rn(__fmul_rn(a, sks[j]), scale);
++                } else {
++                    const uint32_t* kr = reinterpret_cast<const uint32_t*>(sk + j * KSTRIDE);
++                    float a = 0.f;
++#pragma unroll 8
++                    for (int e = 0; e < D / 2; ++e) {
++                        const uint32_t w = kr[e];
++                        a = __fadd_rn(a, __fmul_rn(qh[2 * e], lo(w)));
++                        a = __fadd_rn(a, __fmul_rn(qh[2 * e + 1], hi(w)));
++                    }
++                    sp[h * TILE + j] = __fmul_rn(a, scale);
+                 }
+-                sp[h * TILE + j] = __fmul_rn(a, scale);
+             }
+             __syncthreads();
+             float mt = sp[h * TILE];
+@@ -109,11 +160,21 @@ extern "C" __global__ void __launch_bounds__(256) tf_mm3_attn(
+             for (int j = 0; j < nvalid; ++j) {
+                 const float pj = expf(__fsub_rn(sp[h * TILE + j], mn));
+                 l = __fadd_rn(l, pj);
+-                const uint4 vw = *reinterpret_cast<const uint4*>(sv + j * D + c * 8);
+-                o[0] = __fadd_rn(o[0], __fmul_rn(pj, lo(vw.x))); o[1] = __fadd_rn(o[1], __fmul_rn(pj, hi(vw.x)));
+-                o[2] = __fadd_rn(o[2], __fmul_rn(pj, lo(vw.y))); o[3] = __fadd_rn(o[3], __fmul_rn(pj, hi(vw.y)));
+-                o[4] = __fadd_rn(o[4], __fmul_rn(pj, lo(vw.z))); o[5] = __fadd_rn(o[5], __fmul_rn(pj, hi(vw.z)));
+-                o[6] = __fadd_rn(o[6], __fmul_rn(pj, lo(vw.w))); o[7] = __fadd_rn(o[7], __fmul_rn(pj, hi(vw.w)));
++                if (kv8) {
++                    const uint2 vw = *reinterpret_cast<const uint2*>(reinterpret_cast<const unsigned char*>(sv) + j * D + c * 8);
++                    const float ps = __fmul_rn(pj, svs[j]);
++                    const float2 v0 = codes2(vw.x, false), v1 = codes2(vw.x, true), v2 = codes2(vw.y, false), v3 = codes2(vw.y, true);
++                    o[0] = __fadd_rn(o[0], __fmul_rn(ps, v0.x)); o[1] = __fadd_rn(o[1], __fmul_rn(ps, v0.y));
++                    o[2] = __fadd_rn(o[2], __fmul_rn(ps, v1.x)); o[3] = __fadd_rn(o[3], __fmul_rn(ps, v1.y));
++                    o[4] = __fadd_rn(o[4], __fmul_rn(ps, v2.x)); o[5] = __fadd_rn(o[5], __fmul_rn(ps, v2.y));
++                    o[6] = __fadd_rn(o[6], __fmul_rn(ps, v3.x)); o[7] = __fadd_rn(o[7], __fmul_rn(ps, v3.y));
++                } else {
++                    const uint4 vw = *reinterpret_cast<const uint4*>(sv + j * D + c * 8);
++                    o[0] = __fadd_rn(o[0], __fmul_rn(pj, lo(vw.x))); o[1] = __fadd_rn(o[1], __fmul_rn(pj, hi(vw.x)));
++                    o[2] = __fadd_rn(o[2], __fmul_rn(pj, lo(vw.y))); o[3] = __fadd_rn(o[3], __fmul_rn(pj, hi(vw.y)));
++                    o[4] = __fadd_rn(o[4], __fmul_rn(pj, lo(vw.z))); o[5] = __fadd_rn(o[5], __fmul_rn(pj, hi(vw.z)));
++                    o[6] = __fadd_rn(o[6], __fmul_rn(pj, lo(vw.w))); o[7] = __fadd_rn(o[7], __fmul_rn(pj, hi(vw.w)));
++                }
+             }
+             m = mn;
+         }
+diff --git a/zig/kernels/cuda/minimax_m3_index.cu b/zig/kernels/cuda/minimax_m3_index.cu
+index 21496a3..3843dfc 100644
+--- a/zig/kernels/cuda/minimax_m3_index.cu
++++ b/zig/kernels/cuda/minimax_m3_index.cu
+@@ -18,13 +18,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_mm3_index(
+     int kvh,
+     float* __restrict__ bmax,          // [rows, kvh, bm_stride]
+     int bm_stride,
+-    float scale) {
++    float scale,
++    int kv8) {                         // 1: the pool is the fp8 layout (only where IK sits differs)
+     const int b = blockIdx.x, g = blockIdx.y, r = blockIdx.z;
+     const int p = row_pos(pos, pos0, r);
+     if (b > p / BLOCK) return;
+     const int page = __ldg(tables + row_table(row_tab, r) + b);
+     const char* base = page_layer(pool, page_bytes, layer_off, page);
+-    const bf16* ik = reinterpret_cast<const bf16*>(base) + ik_elem(kvh, 0);
++    const bf16* ik = reinterpret_cast<const bf16*>(base + ik_byte(kvh, kv8));
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const uint2 qw = __ldg(reinterpret_cast<const uint2*>(iq + ((long long)r * kvh + g) * D) + lane);
+     const float q0 = lo(qw.x), q1 = hi(qw.x), q2 = lo(qw.y), q3 = hi(qw.y);
+diff --git a/zig/kernels/cuda/minimax_m3_rows.cu b/zig/kernels/cuda/minimax_m3_rows.cu
+index 6d0d899..60906ce 100644
+--- a/zig/kernels/cuda/minimax_m3_rows.cu
++++ b/zig/kernels/cuda/minimax_m3_rows.cu
+@@ -13,6 +13,8 @@
+ // That order never looks at the row count, the tile or the neighbours: a row's logits are the same bits at any width.
+ 
+ // NaN rule: none stated, arithmetic propagates NaN and infinities as the float64 reference does.
++
++// flags & ROWS_KV8 (off: the bf16 pool as before): k and v as quant_row8's e4m3 rows (docs/fp8-kv.md).
+ #include "minimax_m3_rows.cuh"
+ 
+ using namespace tf_mm3;
+@@ -79,6 +81,7 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) tf_mm3_rows(
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int t = p % BLOCK;
+     const bool gptj = (flags & ROWS_GPTJ) != 0;
++    const bool kv8 = (flags & ROWS_KV8) != 0;
+     const int total = nq + niq + 2 * kvh + (has_ik ? 1 : 0);
+     char* layer = page >= 0 ? pool + (long long)page * page_bytes + layer_off : nullptr;
+     for (int s = warp; s < total; s += ROWS_WARPS) {
+@@ -98,8 +101,12 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) tf_mm3_rows(
+         default: src = ik_in + r * ik_ld; w = ik_w; norm = flags & ROWS_NORM_INDEX; rope = flags & ROWS_INDEX_ROPE; fp16 = flags & ROWS_INDEX_FP16; break;
+         }
+         const uint2 raw = __ldg(reinterpret_cast<const uint2*>(src) + lane);
+-        if (kind == 3) {  // v is stored as it came
+-            if (layer != nullptr) reinterpret_cast<uint2*>(layer + kv_elem(kvh, 1, h, t) * 2)[lane] = raw;
++        if (kind == 3) {  // v is stored as it came (fp8: as its bf16 value's e4m3 row)
++            if (layer != nullptr) {
++                if (kv8) quant_row8(widen4(raw), reinterpret_cast<unsigned char*>(layer + kv8_byte(kvh, 1, h, t)),
++                                    reinterpret_cast<float*>(layer + scale8_byte(kvh, 1, h, t)), lane);
++                else reinterpret_cast<uint2*>(layer + kv_elem(kvh, 1, h, t) * 2)[lane] = raw;
++            }
+             continue;
+         }
+         float4 x = fp16 ? widen4_half(raw) : widen4(raw);
+@@ -137,8 +144,14 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) tf_mm3_rows(
+         } else if (kind == 1) {
+             reinterpret_cast<uint2*>(iq_out + r * iq_out_ld + h * D)[lane] = packed;
+         } else if (layer != nullptr) {
+-            const long long e = kind == 2 ? kv_elem(kvh, 0, h, t) : ik_elem(kvh, t);
+-            reinterpret_cast<uint2*>(layer + e * 2)[lane] = packed;
++            if (kind == 2 && kv8) {
++                quant_row8(make_float4(rn_bf16(o[0]), rn_bf16(o[1]), rn_bf16(o[2]), rn_bf16(o[3])),
++                           reinterpret_cast<unsigned char*>(layer + kv8_byte(kvh, 0, h, t)),
++                           reinterpret_cast<float*>(layer + scale8_byte(kvh, 0, h, t)), lane);
++            } else {
++                const long long byte = kind == 2 ? kv_elem(kvh, 0, h, t) * 2 : ik_byte(kvh, kv8) + (long long)t * D * 2;
++                reinterpret_cast<uint2*>(layer + byte)[lane] = packed;
++            }
+         }
+     }
+ }
+diff --git a/zig/kernels/cuda/minimax_m3_rows.cuh b/zig/kernels/cuda/minimax_m3_rows.cuh
+index 42ff5a6..303b328 100644
+--- a/zig/kernels/cuda/minimax_m3_rows.cuh
++++ b/zig/kernels/cuda/minimax_m3_rows.cuh
+@@ -4,6 +4,8 @@
+ #include "minimax_m3_sparse.cuh"
+ 
+ #include <cuda_fp16.h>
++#include <cuda_fp8.h>
++#include <float.h>
+ 
+ namespace tf_mm3 {
+ 
+@@ -14,6 +16,7 @@ constexpr int ROWS_INDEX_ROPE = 4;   // rotate the index query and key (Switches
+ constexpr int ROWS_INDEX_FP16 = 8;   // the index projections' outputs are fp16 (else bf16)
+ constexpr int ROWS_ROUND_NORM = 16;  // round the norm output to bf16 before the rotation (Switches.bf16_norm_out)
+ constexpr int ROWS_GPTJ = 32;        // rotate (2i, 2i + 1) pairs (Switches.rope_layout gptj_interleaved); else (i, i + rot/2)
++constexpr int ROWS_KV8 = 64;         // the pool is the fp8 layout: k and v as e4m3 rows with an fp32 scale each (docs/fp8-kv.md)
+ 
+ // Bits kernels may set in the optional status word.
+ constexpr int ROWS_STATUS_NO_PAGE = 1;    // a row's block table entry was negative: its K/V/IK were not written
+@@ -44,4 +47,31 @@ __device__ __forceinline__ uint2 pack4(float a, float b, float c, float d) {
+     return make_uint2(x, y);
+ }
+ 
++// A 128-value row (4 a lane, whole warp) as e4m3 codes and the fp32 scale amax / 448; a NaN or inf row: NaN scale.
++__device__ __forceinline__ void quant_row8(float4 x, unsigned char* codes, float* scale, int lane) {
++    const bool bad = !(fabsf(x.x) <= FLT_MAX) || !(fabsf(x.y) <= FLT_MAX) || !(fabsf(x.z) <= FLT_MAX) || !(fabsf(x.w) <= FLT_MAX);
++    const bool any_bad = __any_sync(0xffffffffu, bad);
++    float amax = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++    float inv = 1.f, sc = 1.f;
++    if (amax > 0.f) {
++        inv = __fdiv_rn(448.f, amax);
++        sc = __fdiv_rn(amax, 448.f);
++        if (sc < 0x1p-126f) {
++            sc = 0x1p-126f;
++            inv = __fdiv_rn(1.f, sc);
++        }
++    }
++    unsigned w = 0;
++    if (!any_bad) {
++        w = (unsigned)__nv_cvt_float_to_fp8(__fmul_rn(x.x, inv), __NV_SATFINITE, __NV_E4M3) |
++            ((unsigned)__nv_cvt_float_to_fp8(__fmul_rn(x.y, inv), __NV_SATFINITE, __NV_E4M3) << 8) |
++            ((unsigned)__nv_cvt_float_to_fp8(__fmul_rn(x.z, inv), __NV_SATFINITE, __NV_E4M3) << 16) |
++            ((unsigned)__nv_cvt_float_to_fp8(__fmul_rn(x.w, inv), __NV_SATFINITE, __NV_E4M3) << 24);
++    }
++    reinterpret_cast<unsigned*>(codes)[lane] = w;
++    if (lane == 0) *scale = any_bad ? __int_as_float(0x7fc00000) : sc;
++}
++
+ } // namespace tf_mm3
+diff --git a/zig/kernels/cuda/minimax_m3_sparse.cuh b/zig/kernels/cuda/minimax_m3_sparse.cuh
+index 2462163..2c5e575 100644
+--- a/zig/kernels/cuda/minimax_m3_sparse.cuh
++++ b/zig/kernels/cuda/minimax_m3_sparse.cuh
+@@ -36,6 +36,21 @@ __device__ __forceinline__ long long kv_elem(int kvh, int which, int h, int t) {
+ /// Element offset of index-key token t.
+ __device__ __forceinline__ long long ik_elem(int kvh, int t) { return 2LL * kvh * K_ELEMS + (long long)t * D; }
+ 
++/// fp8 layout (kv8) of a layer: K8 [kvh][128][128] | V8 | IK bf16 [128][128] | K scales f32 [kvh][128] | V scales.
++
++/// fp8 layout, bytes inside a layer region: the e4m3 row of K (which 0) or V (which 1), head h, token t.
++__device__ __forceinline__ long long kv8_byte(int kvh, int which, int h, int t) {
++    return ((long long)which * kvh + h) * K_ELEMS + (long long)t * D;
++}
++
++/// Byte offset inside a layer region of the index keys (K and V take 2 bytes a value, fp8's 1; IK is bf16 in both).
++__device__ __forceinline__ long long ik_byte(int kvh, int kv8) { return 2LL * kvh * K_ELEMS * (kv8 ? 1 : 2); }
++
++/// fp8 layout: byte offset inside a layer region of the fp32 scale of the row kv8_byte names (after the 32 KiB of IK).
++__device__ __forceinline__ long long scale8_byte(int kvh, int which, int h, int t) {
++    return 2LL * kvh * K_ELEMS + K_ELEMS * 2 + (((long long)which * kvh + h) * BLOCK + t) * 4;
++}
++
+ __device__ __forceinline__ const char* page_layer(const char* pool, long long page_bytes, long long layer_off, int page) {
+     return pool + (long long)page * page_bytes + layer_off;
+ }
+diff --git a/zig/src/core/contract/minimax_m3_records.zig b/zig/src/core/contract/minimax_m3_records.zig
+index 32d77a1..640a25f 100644
+--- a/zig/src/core/contract/minimax_m3_records.zig
++++ b/zig/src/core/contract/minimax_m3_records.zig
+@@ -1,6 +1,6 @@
+ //! MiniMax-M3.1-Flash sparse attention CUDA launch records (registry.cuda): nvcc 13.0.88 `cuobjdump --dump-resource-usage` of
+ //! each kernel built with the cuda_kernels.zig flags for sm_80, 86, 89, 120 and 121 (sm_120/121 static shared = reported - 1 KiB).
+-//! The kernels take no dynamic shared memory. Values come from a compile, not a GPU run.
++//! The kernels take no dynamic shared memory. Values come from a compile, not a GPU run; index and attn include kv8.
+ const L = @import("limits.zig");
+ 
+ fn u(regs: u32, static: u32, bound: u32) L.Usage {
+@@ -9,8 +9,8 @@ fn u(regs: u32, static: u32, bound: u32) L.Usage {
+ 
+ pub fn records(comptime Record: type) [3]Record {
+     return .{
+-        .{ .launch = .{ .name = "minimax_m3 tf_mm3_index", .symbol = "tf_mm3_index", .image = "minimax_m3_index", .threads = 128 }, .usage = .{ u(31, 16, 128), u(32, 16, 128), u(32, 16, 128), u(40, 16, 128), u(40, 16, 128) } },
++        .{ .launch = .{ .name = "minimax_m3 tf_mm3_index", .symbol = "tf_mm3_index", .image = "minimax_m3_index", .threads = 128 }, .usage = .{ u(32, 16, 128), u(38, 16, 128), u(38, 16, 128), u(40, 16, 128), u(40, 16, 128) } },
+         .{ .launch = .{ .name = "minimax_m3 tf_mm3_select", .symbol = "tf_mm3_select", .image = "minimax_m3_select", .threads = 256 }, .usage = .{ u(30, 136, 256), u(26, 136, 256), u(26, 136, 256), u(32, 136, 256), u(33, 136, 256) } },
+-        .{ .launch = .{ .name = "minimax_m3 tf_mm3_attn", .symbol = "tf_mm3_attn", .image = "minimax_m3_attn", .threads = 256 }, .usage = .{ u(48, 27136, 256), u(79, 27136, 256), u(79, 27136, 256), u(75, 27136, 256), u(75, 27136, 256) } },
++        .{ .launch = .{ .name = "minimax_m3 tf_mm3_attn", .symbol = "tf_mm3_attn", .image = "minimax_m3_attn", .threads = 256 }, .usage = .{ u(58, 27136, 256), u(77, 27136, 256), u(77, 27136, 256), u(76, 27136, 256), u(76, 27136, 256) } },
+     };
+ }
+diff --git a/zig/src/core/contract/minimax_m3_rows_records.zig b/zig/src/core/contract/minimax_m3_rows_records.zig
+index fc1e339..90bf373 100644
+--- a/zig/src/core/contract/minimax_m3_rows_records.zig
++++ b/zig/src/core/contract/minimax_m3_rows_records.zig
+@@ -7,7 +7,7 @@ fn u(regs: u32, static: u32, bound: u32) L.Usage {
+ 
+ pub fn records(comptime Record: type) [3]Record {
+     return .{
+-        .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_rows", .symbol = "tf_mm3_rows", .image = "minimax_m3_rows", .threads = 256 }, .usage = .{ u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256) } },
++        .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_rows", .symbol = "tf_mm3_rows", .image = "minimax_m3_rows", .threads = 256 }, .usage = .{ u(49, 4608, 256), u(52, 4608, 256), u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256) } },
+         .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_router_bf16", .symbol = "tf_mm3_router_bf16", .image = "minimax_m3_rows", .threads = 128 }, .usage = .{ u(48, 0, 128), u(48, 0, 128), u(48, 0, 128), u(48, 0, 128), u(48, 0, 128) } },
+         .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_router_f32", .symbol = "tf_mm3_router_f32", .image = "minimax_m3_rows", .threads = 128 }, .usage = .{ u(56, 0, 128), u(56, 0, 128), u(56, 0, 128), u(51, 0, 128), u(51, 0, 128) } },
+     };
+diff --git a/zig/src/core/minimax_ref.zig b/zig/src/core/minimax_ref.zig
+index cd2d1da..00f322b 100644
+--- a/zig/src/core/minimax_ref.zig
++++ b/zig/src/core/minimax_ref.zig
+@@ -195,3 +195,92 @@ pub fn routerPick(logits: []const f64, bias: []const f64, scale: f64, sw: Switch
+ pub fn totalScale(sw: Switches, scale: f64) f64 {
+     return if (sw.scale_on == .routed_plus_shared and sw.router_norm != .normalize_only) scale else 1;
+ }
++
++// fp8 KV cache (docs/fp8-kv.md): a 128-value row of K or V is e4m3 codes and one fp32 scale amax / 448 (floor 2^-126).
++
++// A NaN or infinity in a row gives scale NaN and zero codes; the fp32 form multiplies by the fp32 inverse, as the GPU.
++
++pub const kv8_max: f64 = 448;
++pub const kv8_min_scale: f64 = 0x1p-126;
++
++/// The value of e4m3 code `b` (0x7f and 0xff are NaN).
++pub fn e4m3Value(b: u8) f64 {
++    if (b & 0x7f == 0x7f) return std.math.nan(f64);
++    const e: i32 = (b >> 3) & 0xf;
++    const m: f64 = @floatFromInt(b & 7);
++    const mag = if (e == 0) m / 8.0 * 0x1p-6 else (1 + m / 8.0) * std.math.pow(f64, 2, @floatFromInt(e - 7));
++    return if (b & 0x80 != 0) -mag else mag;
++}
++
++/// The nearest e4m3 code of x, ties to the even code, saturating at +-448 (cvt.rn.satfinite); NaN is 0x7f.
++pub fn e4m3Code(x: f64) u8 {
++    if (std.math.isNan(x)) return 0x7f;
++    const sign: u8 = if (std.math.signbit(x)) 0x80 else 0;
++    const a = @abs(x);
++    if (a >= 464) return sign | 0x7e;
++    var i: u8 = 0;
++    while (i < 0x7e and e4m3Value(i + 1) <= a) i += 1;
++    if (i == 0x7e) return sign | i;
++    const lo = e4m3Value(i);
++    const hi = e4m3Value(i + 1);
++    const mid = (lo + hi) / 2;
++    const up = a > mid or (a == mid and i % 2 == 1);
++    return sign | (if (up) i + 1 else i);
++}
++
++/// Float64 reference quantization of a row: codes and the scale (a non-finite value gives scale NaN, zero codes).
++pub fn quantRow(x: []const f64, codes: []u8) f64 {
++    var amax: f64 = 0;
++    var bad = false;
++    for (x) |v| {
++        if (!std.math.isFinite(v)) bad = true else amax = @max(amax, @abs(v));
++    }
++    if (bad) {
++        @memset(codes, 0);
++        return std.math.nan(f64);
++    }
++    const scale = if (amax > 0) @max(amax / kv8_max, kv8_min_scale) else 1;
++    for (codes, x) |*c, v| c.* = e4m3Code(v / scale);
++    return scale;
++}
++
++/// code * scale for each code; a NaN scale gives NaN throughout.
++pub fn dequantRow(codes: []const u8, scale: f64, out: []f64) void {
++    for (out, codes) |*o, c| o.* = e4m3Value(c) * scale;
++}
++
++/// The kernel's fp32 form of `quantRow`: inv = 448 / amax and y = x * inv in fp32, then exact e4m3 rounding.
++pub fn quantRowF32(x: []const f32, codes: []u8) f32 {
++    var amax: f32 = 0;
++    var bad = false;
++    for (x) |v| {
++        if (!std.math.isFinite(v)) bad = true else amax = @max(amax, @abs(v));
++    }
++    if (bad) {
++        @memset(codes, 0);
++        return std.math.nan(f32);
++    }
++    var inv: f32 = 1;
++    var scale: f32 = 1;
++    if (amax > 0) {
++        inv = 448.0 / amax;
++        scale = amax / 448.0;
++        if (scale < 0x1p-126) {
++            scale = 0x1p-126;
++            inv = 1.0 / scale;
++        }
++    }
++    for (codes, x) |*c, v| c.* = e4m3Code(@as(f64, v * inv));
++    return scale;
++}
++
++/// attendBlocks over an fp8 cache: each key and value row is quantized, dequantized in float64 first (kq, vq scratch).
++pub fn attendBlocksKv8(q: []const f64, k: []const f64, v: []const f64, ids: []const usize, pos: usize, block: usize, d: usize, rep: usize, keys: []usize, kq: []f64, vq: []f64, out: []f64) void {
++    var codes: [512]u8 = undefined;
++    const rows = @min(k.len / d, pos + 1);
++    for (0..rows) |j| {
++        dequantRow(codes[0..d], quantRow(k[j * d ..][0..d], codes[0..d]), kq[j * d ..][0..d]);
++        dequantRow(codes[0..d], quantRow(v[j * d ..][0..d], codes[0..d]), vq[j * d ..][0..d]);
++    }
++    attendBlocks(q, kq, vq, ids, pos, block, d, rep, keys, out);
++}
+diff --git a/zig/src/cuda/minimax_m3_geom.zig b/zig/src/cuda/minimax_m3_geom.zig
+index 5122d24..4a3e425 100644
+--- a/zig/src/cuda/minimax_m3_geom.zig
++++ b/zig/src/cuda/minimax_m3_geom.zig
+@@ -16,13 +16,20 @@ pub const attn_static_shared = (group * d + group * 32) * 4 + (32 * 136 + 32 * d
+ /// Scores a block at 1 key a warp step: the index kernel's reduction tree (32 lanes, offsets 16..1) is fixed.
+ pub const max_grid_z = 65535;
+ 
+-/// One rank's cache: `kvh` local kv heads (2 of 4 on a two-rank split) and the layers it holds.
++/// Bytes of one fp32 scale a K or V row holds in the fp8 layout.
++pub const scale_bytes = 4;
++/// Largest finite e4m3 value: a row's scale is its largest magnitude over this.
++pub const e4m3_max = 448;
++
++/// One rank's cache: `kvh` local kv heads and its layers; `kv8` is the e4m3 layout of docs/fp8-kv.md (scales after IK).
+ pub const Pool = struct {
+     kvh: usize,
+     layers: usize,
++    kv8: bool = false,
+ 
+-    /// Bytes one page holds for one layer: K and V for each local head, plus the shared index keys.
++    /// Bytes one page holds for one layer: K and V for each local head, plus the shared index keys (and fp8's scales).
+     pub fn layerBytes(p: Pool) usize {
++        if (p.kv8) return block * (2 * p.kvh * d + d * bf16_bytes + 2 * p.kvh * scale_bytes);
+         return block * (2 * p.kvh * d + d) * bf16_bytes;
+     }
+     pub fn pageBytes(p: Pool) usize {
+@@ -34,12 +41,25 @@ pub const Pool = struct {
+     pub fn layerOff(p: Pool, layer: usize) usize {
+         return layer * p.layerBytes();
+     }
++    /// Bytes a K or V value takes.
++    pub fn valueBytes(p: Pool) usize {
++        return if (p.kv8) 1 else bf16_bytes;
++    }
+     /// Byte offset from the pool base of K (which 0) or V (which 1), local head h, token t of a page, in a layer.
+     pub fn kv(p: Pool, page: usize, layer: usize, which: usize, h: usize, t: usize) usize {
+-        return page * p.pageBytes() + p.layerOff(layer) + ((which * p.kvh + h) * block + t) * d * bf16_bytes;
++        return page * p.pageBytes() + p.layerOff(layer) + ((which * p.kvh + h) * block + t) * d * p.valueBytes();
++    }
++    /// Byte offset inside a layer region of the index keys (256 bytes a token in both layouts).
++    pub fn ikInLayer(p: Pool) usize {
++        return 2 * p.kvh * block * d * p.valueBytes();
+     }
+     pub fn ik(p: Pool, page: usize, layer: usize, t: usize) usize {
+-        return page * p.pageBytes() + p.layerOff(layer) + (2 * p.kvh * block + t) * d * bf16_bytes;
++        return page * p.pageBytes() + p.layerOff(layer) + p.ikInLayer() + t * d * bf16_bytes;
++    }
++    /// Byte offset of the fp32 scale of K (which 0) or V (which 1), head h, token t (fp8 layout only).
++    pub fn scale(p: Pool, page: usize, layer: usize, which: usize, h: usize, t: usize) usize {
++        std.debug.assert(p.kv8);
++        return page * p.pageBytes() + p.layerOff(layer) + p.ikInLayer() + block * d * bf16_bytes + ((which * p.kvh + h) * block + t) * scale_bytes;
+     }
+     pub fn pagesFor(tokens: usize) usize {
+         return (tokens + block - 1) / block;
+diff --git a/zig/src/cuda/minimax_m3_rows.zig b/zig/src/cuda/minimax_m3_rows.zig
+index fcd5f0e..b7a6670 100644
+--- a/zig/src/cuda/minimax_m3_rows.zig
++++ b/zig/src/cuda/minimax_m3_rows.zig
+@@ -92,6 +92,7 @@ pub const Rows = struct {
+         const f = o.flags;
+         if ((f.norm_qk and (nm.q == 0 or nm.k == 0)) or (f.norm_index and ((h.niq > 0 and nm.iq == 0) or (h.index_key and nm.ik == 0)))) return error.Heads;
+         if (p.tables == 0 or p.pool == 0 or max_pages == 0) return error.Heads;
++        if (f.kv8 != p.kv8) return error.Heads; // the flag and the pool's layout must say the same thing
+         var a: launch_.Args = .{};
+         a.add(in.q);
+         a.add(@as(i64, @intCast(in.q_ld)));
+@@ -149,7 +150,7 @@ pub const Rows = struct {
+ };
+ 
+ /// The pool the paged kernels address: base, page and layer strides, local kv heads.
+-pub const Cache = struct { pool: u64, page_bytes: u64, layer_off: u64, kvh: u32 };
++pub const Cache = struct { pool: u64, page_bytes: u64, layer_off: u64, kvh: u32, kv8: bool = false };
+ 
+ /// Device copy of the block tables (int32 page ids, -1 padded, `max_pages` a slot) and the per-row offsets T5 reads.
+ pub const Mirror = struct {
+@@ -200,13 +201,13 @@ pub const Mirror = struct {
+ 
+     /// Several streams' rows in one call: every row reads the table at its own `row_tab` offset.
+     pub fn shared(m: *const Mirror, c: Cache) sp.Paged {
+-        return .{ .pool = c.pool, .page_bytes = c.page_bytes, .layer_off = c.layer_off, .kvh = c.kvh, .tables = m.tables.ptr, .row_tab = m.row_tab.ptr };
++        return .{ .pool = c.pool, .page_bytes = c.page_bytes, .layer_off = c.layer_off, .kvh = c.kvh, .tables = m.tables.ptr, .row_tab = m.row_tab.ptr, .kv8 = c.kv8 };
+     }
+ 
+     /// One stream's rows (a prompt chunk): the table pointer is the slot's row and `row_tab` is 0.
+     pub fn single(m: *const Mirror, c: Cache, slot: usize) !sp.Paged {
+         const r = try geom.entryBytes(m.slots, m.max_pages, slot, 0, 0);
+-        return .{ .pool = c.pool, .page_bytes = c.page_bytes, .layer_off = c.layer_off, .kvh = c.kvh, .tables = m.tables.ptr + r.off };
++        return .{ .pool = c.pool, .page_bytes = c.page_bytes, .layer_off = c.layer_off, .kvh = c.kvh, .tables = m.tables.ptr + r.off, .kv8 = c.kv8 };
+     }
+ };
+ 
+diff --git a/zig/src/cuda/minimax_m3_rows_geom.zig b/zig/src/cuda/minimax_m3_rows_geom.zig
+index 5115b47..212ad82 100644
+--- a/zig/src/cuda/minimax_m3_rows_geom.zig
++++ b/zig/src/cuda/minimax_m3_rows_geom.zig
+@@ -21,6 +21,8 @@ pub const Flags = struct {
+     index_fp16: bool = true,
+     round_norm: bool = false,
+     gptj: bool = false,
++    /// The pool is the fp8 layout: k and v are written as e4m3 rows with an fp32 scale each (docs/fp8-kv.md).
++    kv8: bool = false,
+ 
+     pub fn bits(f: Flags) i32 {
+         var b: i32 = 0;
+@@ -30,6 +32,7 @@ pub const Flags = struct {
+         if (f.index_fp16) b |= 8;
+         if (f.round_norm) b |= 16;
+         if (f.gptj) b |= 32;
++        if (f.kv8) b |= 64;
+         return b;
+     }
+ };
+diff --git a/zig/src/cuda/minimax_m3_sparse.zig b/zig/src/cuda/minimax_m3_sparse.zig
+index 6960301..241c782 100644
+--- a/zig/src/cuda/minimax_m3_sparse.zig
++++ b/zig/src/cuda/minimax_m3_sparse.zig
+@@ -23,6 +23,8 @@ pub const Paged = struct {
+     tables: u64,
+     /// int32 [rows] offsets into `tables`, or 0 when every row uses the table at its start (one stream).
+     row_tab: u64 = 0,
++    /// The pool is the fp8 layout (geom.Pool.kv8): e4m3 K/V rows with fp32 scales; false is the bf16 pool.
++    kv8: bool = false,
+ };
+ 
+ /// Rows of a call: device int32 positions [n], or 0 and `pos0` (rows pos0, pos0 + 1, ... of one stream).
+@@ -88,6 +90,7 @@ pub const Sparse = struct {
+         a.add(sc.bmax);
+         a.add(@as(i32, @intCast(sc.bm_stride)));
+         a.add(scale);
++        a.add(@as(i32, @intFromBool(p.kv8)));
+         try launch_.launch(s.index_fn, cfg(geom.indexLaunch(rows.n, p.kvh, max_pos)), st, &a);
+     }
+ 
+@@ -125,6 +128,7 @@ pub const Sparse = struct {
+         a.add(@as(i32, @intCast(p.kvh)));
+         a.add(out);
+         a.add(scale);
++        a.add(@as(i32, @intFromBool(p.kv8)));
+         try launch_.launch(s.attn_fn, cfg(geom.attnLaunch(rows.n, p.kvh)), st, &a);
+     }
+ 
+diff --git a/zig/src/families/minimax_m3/engine_dev.zig b/zig/src/families/minimax_m3/engine_dev.zig
+index ba74ab8..573fc80 100644
+--- a/zig/src/families/minimax_m3/engine_dev.zig
++++ b/zig/src/families/minimax_m3/engine_dev.zig
+@@ -328,7 +328,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *con
+     const quant: [32]u8 = hashFile(a, io, quant_path) catch ranks.hashBytes("");
+     const c = try config.parse(gpa, text);
+     const share = try shard.Share.of(&c, rank, world);
+-    const dims = try pool.Dims.of(&c, share);
++    const dims = (try pool.Dims.of(&c, share)).withKv8(o.settings.kv8);
+     var cat = try load.Catalog.open(gpa, io, checkpoint);
+     defer cat.deinit();
+     const digest = try weights_device.digest(gpa, &cat);
+diff --git a/zig/src/families/minimax_m3/forward.zig b/zig/src/families/minimax_m3/forward.zig
+index d0e9477..bbd481b 100644
+--- a/zig/src/families/minimax_m3/forward.zig
++++ b/zig/src/families/minimax_m3/forward.zig
+@@ -45,7 +45,8 @@ pub const Forward = struct {
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, st: cuda.Stream, m: *Modules, w: *const weights.Weights, g: *const Geometry, b: *Buffers, pages: Pages, link: ?Link) !Forward {
+         const c = g.cfg;
+-        const o = try rows_cfg.opts(.{}, .{ .rot = c.rotary_dim, .theta = c.rope_theta, .eps = c.eps }, .folded, .folded, true);
++        var o = try rows_cfg.opts(.{}, .{ .rot = c.rotary_dim, .theta = c.rope_theta, .eps = c.eps }, .folded, .folded, true);
++        o.flags.kv8 = pages.cache.kv8; // the writer and the readers (Paged.kv8, from the same Cache) agree on the pool's layout
+         return .{
+             .dev = .{ .d = d, .st = st, .m = m, .w = w, .g = g, .b = b, .pages = pages, .link = link, .opts = o },
+             .tab = try gpa.alloc(i32, iface.shared_rows),
+diff --git a/zig/src/families/minimax_m3/forward_ops.zig b/zig/src/families/minimax_m3/forward_ops.zig
+index 1e5cfbc..d7cb63b 100644
+--- a/zig/src/families/minimax_m3/forward_ops.zig
++++ b/zig/src/families/minimax_m3/forward_ops.zig
+@@ -27,7 +27,7 @@ pub const Impl = struct {
+         const self = try a.gpa.create(Impl);
+         errdefer a.gpa.destroy(self);
+         const layers: u32 = if (a.settings.layers > 0) a.settings.layers else a.cfg.layers;
+-        self.* = .{ .gpa = a.gpa, .g = try plan.Geometry.of(a.cfg, a.share, layers, iface.max_rows), .m = try fw.Modules.load(a.d), .b = undefined, .f = undefined, .dims = try pool.Dims.of(a.cfg, a.share) };
++        self.* = .{ .gpa = a.gpa, .g = try plan.Geometry.of(a.cfg, a.share, layers, iface.max_rows), .m = try fw.Modules.load(a.d), .b = undefined, .f = undefined, .dims = (try pool.Dims.of(a.cfg, a.share)).withKv8(a.settings.kv8) };
+         errdefer self.m.deinit();
+         self.b = try fw.Buffers.init(a.d, &self.g, iface.maxPages(a.capacity));
+         errdefer self.b.deinit();
+@@ -54,7 +54,7 @@ pub const Impl = struct {
+         var row_tab = try cuda.DeviceBuffer.alloc(a.d, iface.shared_rows * 4);
+         errdefer row_tab.free();
+         s.mirror = .{ .tables = tables, .row_tab = row_tab, .slots = view.slots, .max_pages = view.max_pages, .max_rows = iface.shared_rows };
+-        const pages: fw.Pages = .{ .cache = .{ .pool = view.arena, .page_bytes = view.page_bytes, .layer_off = 0, .kvh = s.g.kvh }, .layer_bytes = s.dims.layerToken() * pool.page_tokens, .mirror = &s.mirror.? };
++        const pages: fw.Pages = .{ .cache = .{ .pool = view.arena, .page_bytes = view.page_bytes, .layer_off = 0, .kvh = s.g.kvh, .kv8 = s.dims.kv8 }, .layer_bytes = s.dims.layerToken() * pool.page_tokens, .mirror = &s.mirror.? };
+         s.f = try fw.Forward.init(s.gpa, a.d, a.stream, &s.m, a.weights, &s.g, &s.b, pages, s.link);
+         s.made = true;
+     }
+diff --git a/zig/src/families/minimax_m3/kv8_test.zig b/zig/src/families/minimax_m3/kv8_test.zig
+new file mode 100644
+index 0000000..3163138
+--- /dev/null
++++ b/zig/src/families/minimax_m3/kv8_test.zig
+@@ -0,0 +1,125 @@
++//! The fp8 KV cache's family side on the shipped model's numbers (docs/fp8-kv.md): pages, map, budget, fingerprint.
++const std = @import("std");
++const kv = @import("core").kv_pool;
++const config = @import("config.zig");
++const shard = @import("shard.zig");
++const pool = @import("pool.zig");
++const budget = @import("budget.zig");
++const ranks = @import("ranks.zig");
++
++const expectEqual = std.testing.expectEqual;
++const expect = std.testing.expect;
++const GiB = budget.GiB;
++
++fn dims(rank: usize, kv8: bool) !pool.Dims {
++    const c = config.flash;
++    return (try pool.Dims.of(&c, try shard.Share.of(&c, rank, 2))).withKv8(kv8);
++}
++
++test "a rank caches 47,040 bytes a token with fp8 K/V and a page is 6,021,120; bf16 stays 76,800 and 9,830,400" {
++    for ([_]usize{ 0, 1 }) |r| {
++        const d = try dims(r, true);
++        try expectEqual(@as(u64, 784), d.layerToken()); // K 256 + V 256 + IK 256 + 4 scales of 4 bytes
++        try expectEqual(@as(u64, 47_040), d.tokenBytes());
++        try expectEqual(@as(u64, 6_021_120), d.pageBytes());
++        const l = d.layout(1024);
++        try expectEqual(@as(u64, 47_040), l.token_bytes);
++        try expectEqual(@as(u64, 4096), l.fixed_bytes); // the block-table row is the same
++        const b = try dims(r, false);
++        try expectEqual(@as(u64, 76_800), b.tokenBytes());
++        try expectEqual(@as(u64, 9_830_400), b.pageBytes());
++    }
++    // one rank alone caches all four kv heads
++    const c = config.flash;
++    const whole = (try pool.Dims.of(&c, try shard.Share.of(&c, 0, 1))).withKv8(true);
++    try expectEqual(@as(u64, 60 * (2 * 4 * (128 + 4) + 256)), whole.tokenBytes());
++}
++
++test "the fp8 page map tiles the page: K and V codes, IK, then the scales of every layer, no gap and no overlap" {
++    const d = try dims(0, true);
++    const m = d.map();
++    const page: usize = @intCast(d.pageBytes());
++    const seen = try std.testing.allocator.alloc(u8, page);
++    defer std.testing.allocator.free(seen);
++    @memset(seen, 0);
++    const head = @as(u64, pool.page_tokens) * d.head_dim; // one byte a value
++    const mark = struct {
++        fn at(s: []u8, off: u64, len: u64) void {
++            for (s[@intCast(off)..][0..@intCast(len)]) |*x| {
++                std.debug.assert(x.* == 0);
++                x.* = 1;
++            }
++        }
++    }.at;
++    for (0..d.layers) |layer| {
++        for (0..d.kv_heads) |h| {
++            mark(seen, m.k(@intCast(layer), @intCast(h)), head);
++            mark(seen, m.v(@intCast(layer), @intCast(h)), head);
++            mark(seen, m.kScale(@intCast(layer), @intCast(h)), pool.page_tokens * pool.scale_bytes);
++            mark(seen, m.vScale(@intCast(layer), @intCast(h)), pool.page_tokens * pool.scale_bytes);
++        }
++        mark(seen, m.ik(@intCast(layer)), @as(u64, pool.page_tokens) * d.index_dim * 2);
++    }
++    for (seen) |s| try expectEqual(@as(u8, 1), s);
++    // the order inside a layer: K heads, V heads, IK, K scales, V scales (the kernels' kv8_byte, ik_byte, scale8_byte)
++    try expectEqual(@as(u64, 0), m.k(0, 0));
++    try expectEqual(@as(u64, 2 * 16384), m.v(0, 0));
++    try expectEqual(@as(u64, 2 * 2 * 16384), m.ik(0));
++    try expectEqual(m.ik(0) + 32768, m.kScale(0, 0));
++    try expectEqual(m.k(1, 0), m.vScale(0, 1) + 512); // the next layer starts right after the last scale
++}
++
++test "the same memory holds 1.63 times the pages: the real rank budgets, 7.18 and 7.02 GiB of KV room" {
++    const bf = try dims(0, false);
++    const f8 = try dims(0, true);
++    const Row = struct { room_gib: f64, bf16_pages: usize, fp8_pages: usize };
++    const want = [_]Row{ .{ .room_gib = 7.18, .bf16_pages = 784, .fp8_pages = 1280 }, .{ .room_gib = 7.02, .bf16_pages = 766, .fp8_pages = 1251 } };
++    for (want) |w| {
++        const room: u64 = @intFromFloat(w.room_gib * @as(f64, @floatFromInt(GiB)));
++        // a layout without a stream table or cache, the pages that remain: room / page
++        const lb: kv.Layout = .{ .fixed_bytes = 0, .token_bytes = bf.tokenBytes(), .page_tokens = pool.page_tokens, .snap_bytes = pool.snap_bytes, .all_paged = true };
++        const lf: kv.Layout = .{ .fixed_bytes = 0, .token_bytes = f8.tokenBytes(), .page_tokens = pool.page_tokens, .snap_bytes = pool.snap_bytes, .all_paged = true };
++        const pb = try kv.plan(lb, .{ .room = room, .engine = 0, .lanes = 1 });
++        const pf = try kv.plan(lf, .{ .room = room, .engine = 0, .lanes = 1 });
++        try expectEqual(w.bf16_pages, pb.pages);
++        try expectEqual(w.fp8_pages, pf.pages);
++        std.debug.print("kv8 room {d:.2} GiB: bf16 {d} pages ({d} tokens), fp8 {d} pages ({d} tokens)\n", .{ w.room_gib, pb.pages, pb.pages * 128, pf.pages, pf.pages * 128 });
++    }
++    // the 784 pages the first rank was served are exactly 1280 fp8 pages of memory
++    try expectEqual(@as(u64, 784) * bf.pageBytes(), @as(u64, 1280) * f8.pageBytes());
++}
++
++test "the budget check admits a longer context with fp8 K/V in the same room, and names fp8 bytes in a refusal" {
++    const w = @import("pool_test.zig").weights_rank0;
++    const bf = try dims(0, false);
++    const f8 = try dims(0, true);
++    const in: budget.Input = .{ .available = 119 * GiB, .weights = w, .terms = try budget.tensorfold(119 * GiB, null), .lanes = 1, .window = pool.page_tokens, .max_positions = 1 << 20 };
++    const v16 = budget.check(bf, in, null).ok;
++    const v8 = budget.check(f8, in, null).ok;
++    try expect(v8.context > v16.context);
++    try expect(v8.pool_bytes <= v8.room and v16.pool_bytes <= v16.room);
++    try expect(@as(f64, @floatFromInt(v8.context)) > 1.6 * @as(f64, @floatFromInt(v16.context)) and @as(f64, @floatFromInt(v8.context)) < 1.7 * @as(f64, @floatFromInt(v16.context)));
++    std.debug.print("kv8 119 GiB host, TensorFold reserve: largest context bf16 {d}, fp8 {d}\n", .{ v16.context, v8.context });
++    // a context bf16 cannot hold fits with fp8; the refusal of a bigger one quotes 47,040 bytes a token
++    const over = budget.check(bf, in, v8.context);
++    try expect(over == .refused);
++    try expect(budget.check(f8, in, v8.context) == .ok);
++    const huge = budget.check(f8, in, 1 << 20);
++    try expect(huge == .refused);
++    try expectEqual(@as(u64, 47_040), huge.refused.token_bytes);
++}
++
++test "the ranks' fingerprint carries kv8: one rank on fp8 pages and the other on bf16 refuse each other" {
++    try expectEqual(false, (ranks.Settings{}).kv8);
++    const h = ranks.hashBytes("program");
++    const a = ranks.Fingerprint.of(.{ .rank = 0, .world = 2 }, .{ .kv8 = true }, 131072, ranks.hashBytes("c"), ranks.hashBytes("q"), h, ranks.hashBytes("w"));
++    var b = ranks.Fingerprint.of(.{ .rank = 1, .world = 2 }, .{ .kv8 = true }, 131072, ranks.hashBytes("c"), ranks.hashBytes("q"), h, ranks.hashBytes("w"));
++    var all = [_]ranks.Fingerprint{ a, b };
++    try expect(ranks.mismatch(&all) == null);
++    b = ranks.Fingerprint.of(.{ .rank = 1, .world = 2 }, .{}, 131072, ranks.hashBytes("c"), ranks.hashBytes("q"), h, ranks.hashBytes("w"));
++    all[1] = b;
++    const mm = ranks.mismatch(&all).?;
++    try expectEqual(ranks.Fingerprint.Field.kv8, mm.field);
++    try expectEqual(@as(usize, 1), mm.rank);
++    try expect(std.mem.indexOf(u8, ranks.explain(.kv8), "--kv-cache") != null);
++}
+diff --git a/zig/src/families/minimax_m3/native.zig b/zig/src/families/minimax_m3/native.zig
+index 52f376d..b1f221b 100644
+--- a/zig/src/families/minimax_m3/native.zig
++++ b/zig/src/families/minimax_m3/native.zig
+@@ -44,6 +44,7 @@ pub const Options = struct {
+     lanes_fixed: bool = false,
+     room: ?Room = null,
+     grant: u64 = 0, // the host's room before the load, net of its reserve (0: unknown, budget unchecked); decision M10
++    kv8: bool = false, // --kv-cache fp8: K and V pages as e4m3 rows with an fp32 scale each; the index keys stay bf16 (docs/fp8-kv.md)
+ };
+ 
+ /// The smallest room among the other ranks and whose it is.
+@@ -141,7 +142,7 @@ pub fn admission(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const
+     const share = try shard.Share.of(c, p.rank, p.world);
+     var plan = try load.Plan.build(gpa, &cat, c, share, .{});
+     defer plan.deinit();
+-    const dims = try pool.Dims.of(c, share);
++    const dims = (try pool.Dims.of(c, share)).withKv8(o.kv8);
+     var out: Admission = .{ .place = p, .weights = plan.slotBytes(), .verdict = null, .fingerprint_weights = try weights_device.digest(gpa, &cat) };
+     if (o.grant == 0) return out;
+     out.verdict = budget.check(dims, .{ .available = o.grant, .weights = out.weights, .terms = budget.hosted(), .lanes = o.lanes, .lanes_fixed = o.lanes_fixed, .window = window_rows, .max_positions = c.max_positions }, o.context);
+@@ -152,10 +153,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     _ = kernels; // our own kernels: a captured set is not used
+     const p = try ranks.admit(&ranks.environment);
+     var problem: []const u8 = "";
+-    const set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
++    var set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
+         std.log.err("{s}", .{problem});
+         return err;
+     };
++    set.kv8 = o.kv8; // the ranks' fingerprint carries it: a rank started without --kv-cache fp8 stops the others
+     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+     defer gpa.free(path);
+     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+@@ -168,7 +170,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+             detail_len = words.len;
+             return error.BudgetRefused;
+         },
+-        .ok => |cap| std.log.info("minimax budget: {d} tokens a stream, {d} pages, {d:.2} GiB of KV room (the host's plan has the last word)", .{ cap.context, cap.pages, @as(f64, @floatFromInt(cap.pool_bytes)) / (1 << 30) }),
++        .ok => |cap| std.log.info("minimax budget: {d} tokens a stream, {d} pages, {d:.2} GiB of KV room, {s} K/V (the host's plan has the last word)", .{ cap.context, cap.pages, @as(f64, @floatFromInt(cap.pool_bytes)) / (1 << 30), if (o.kv8) "fp8" else "bf16" }),
+     };
+     // the ranks' lines before NCCL (cuda/tp_watch.zig): a rank that fails, refuses or dies stops every rank
+     if (p.world > 1) try cuda.tp_watch.start(io, p.rank, p.world);
+@@ -181,7 +183,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+ /// `open` once the ranks' lines are up: NCCL, the engine and the link, then a follower's loop or rank 0's lanes.
+ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, c: *const config.Config, o: Options, p: ranks.Place, set: ranks.Settings) !Loaded {
+     const share = try shard.Share.of(c, p.rank, p.world);
+-    const dims = try pool.Dims.of(c, share);
++    const dims = (try pool.Dims.of(c, share)).withKv8(o.kv8);
+     const cap = capacity(o.context);
+     const own = try gpa.create(Owned);
+     errdefer gpa.destroy(own);
+diff --git a/zig/src/families/minimax_m3/pool.zig b/zig/src/families/minimax_m3/pool.zig
+index 2aa00bb..4eeb9c9 100644
+--- a/zig/src/families/minimax_m3/pool.zig
++++ b/zig/src/families/minimax_m3/pool.zig
+@@ -7,8 +7,10 @@ const shard = @import("shard.zig");
+ 
+ /// Tokens a page holds: the sparse attention's block (`sparse_attention_config` block size, checked in `Dims.of`).
+ pub const page_tokens: u32 = 128;
+-/// bf16 K, V and IK.
++/// bf16 K, V and IK; with `Dims.kv8` K and V are one byte a value (e4m3) beside an fp32 scale a row, IK stays bf16.
+ const elem: u64 = 2;
++/// An fp8 K or V row's scale (one per token and kv head, fp32).
++pub const scale_bytes: u64 = 4;
+ /// A kept prompt snapshot is a record of a position (the pages are the store's references): its nominal slot.
+ pub const snap_bytes: u64 = 64;
+ 
+@@ -20,6 +22,15 @@ pub const Dims = struct {
+     kv_heads: u32, // this rank's
+     head_dim: u32,
+     index_dim: u32,
++    /// `--kv-cache fp8`: K and V as e4m3 rows with an fp32 scale each (docs/fp8-kv.md). Index keys stay bf16.
++    kv8: bool = false,
++
++    /// The same dims with the fp8 cache on or off.
++    pub fn withKv8(d: Dims, on: bool) Dims {
++        var r = d;
++        r.kv8 = on;
++        return r;
++    }
+ 
+     /// Rank `s.rank`'s dims. Index keys are replicated: every rank scores its own index heads over the whole IK.
+     pub fn of(c: *const Config, s: shard.Share) Error!Dims {
+@@ -27,12 +38,13 @@ pub const Dims = struct {
+         return .{ .layers = c.layers, .kv_heads = @intCast(s.kv_heads.len()), .head_dim = c.head_dim, .index_dim = c.index.dim };
+     }
+ 
+-    /// Bytes a token adds in one layer: K and V of the rank's heads, then the index key.
++    /// Bytes a token adds in one layer: K and V of the rank's heads, then the index key (and fp8's two scales a head).
+     pub fn layerToken(d: Dims) u64 {
++        if (d.kv8) return 2 * @as(u64, d.kv_heads) * (d.head_dim + scale_bytes) + @as(u64, d.index_dim) * elem;
+         return (2 * @as(u64, d.kv_heads) * d.head_dim + d.index_dim) * elem;
+     }
+ 
+-    /// Bytes a token adds across every layer (76,800 for the shipped model at two ranks).
++    /// Bytes a token adds across every layer (76,800 for the shipped model at two ranks; 47,040 with fp8 K and V).
+     pub fn tokenBytes(d: Dims) u64 {
+         return d.layerToken() * d.layers;
+     }
+@@ -63,14 +75,17 @@ pub const PageMap = struct {
+     fn layerBytes(m: PageMap) u64 {
+         return m.d.layerToken() * page_tokens;
+     }
++    fn valueBytes(m: PageMap) u64 {
++        return if (m.d.kv8) 1 else elem;
++    }
+     fn headBytes(m: PageMap) u64 {
+-        return @as(u64, page_tokens) * m.d.head_dim * elem;
++        return @as(u64, page_tokens) * m.d.head_dim * m.valueBytes();
+     }
+     fn kvBytes(m: PageMap) u64 {
+         return m.d.kv_heads * m.headBytes();
+     }
+ 
+-    /// Byte offset in the page of the first key of kv head `kvh` (rank-local) at `layer`; row `t` adds `t * head_dim * 2`.
++    /// Byte offset of kv head `kvh`'s first key at `layer`; row `t` adds `t * head_dim * 2` (`* 1` with fp8).
+     pub fn k(m: PageMap, layer: u32, kvh: u32) u64 {
+         std.debug.assert(layer < m.d.layers and kvh < m.d.kv_heads);
+         return layer * m.layerBytes() + kvh * m.headBytes();
+@@ -81,6 +96,15 @@ pub const PageMap = struct {
+         return layer * m.layerBytes() + m.kvBytes() + kvh * m.headBytes();
+     }
+ 
++    /// fp8 only: the 128 fp32 scales of K head `kvh` (row t's at `t * 4`) / of V head `kvh`, after the index keys.
++    pub fn kScale(m: PageMap, layer: u32, kvh: u32) u64 {
++        std.debug.assert(m.d.kv8 and layer < m.d.layers and kvh < m.d.kv_heads);
++        return layer * m.layerBytes() + 2 * m.kvBytes() + page_tokens * m.d.index_dim * elem + @as(u64, kvh) * page_tokens * scale_bytes;
++    }
++    pub fn vScale(m: PageMap, layer: u32, kvh: u32) u64 {
++        return m.kScale(layer, kvh) + @as(u64, m.d.kv_heads) * page_tokens * scale_bytes;
++    }
++
+     /// The block's index keys at `layer`: 128 rows of `index_dim`, contiguous.
+     pub fn ik(m: PageMap, layer: u32) u64 {
+         std.debug.assert(layer < m.d.layers);
+diff --git a/zig/src/families/minimax_m3/ranks.zig b/zig/src/families/minimax_m3/ranks.zig
+index f4b9d3d..56a3db3 100644
+--- a/zig/src/families/minimax_m3/ranks.zig
++++ b/zig/src/families/minimax_m3/ranks.zig
+@@ -84,6 +84,7 @@ pub fn refusal(err: Error) []const u8 {
+ pub const Settings = struct {
+     layers: u32 = 0, // TF_MM3_LAYERS: the first this many layers only, for one-GPU checks (0: all)
+     roce_kb: u32 = 4096, // TF_ROCE_MAX_KB, the small-gather RoCE path's cap in KiB; 0 when TF_ROCE=0 keeps every gather on NCCL
++    kv8: bool = false, // --kv-cache fp8 (native.Options.kv8): K and V pages as e4m3 rows with fp32 scales; set by `open`, not read here
+ 
+     pub fn read(get: Get, problem: *[]const u8) Error!Settings {
+         var s: Settings = .{};
+@@ -116,13 +117,15 @@ pub const Fingerprint = extern struct {
+     layers: u32, // TF_MM3_LAYERS (0: all)
+     reduce: u32 = 1, // tp.zig's reduction_version: the fp32 rank-order sum
+     roce: u32, // Settings.roce_kb: the ranks open the RoCE small-gather path together or not at all
++    kv8: u32 = 0, // Settings.kv8: the ranks' pages are one layout or the other, never mixed
++    reserved: u32 = 0, // keeps `capacity` 8-aligned without padding
+     capacity: u64, // tokens a sequence holds
+     config: [32]u8, // sha256 of config.json
+     quant: [32]u8, // sha256 of quantization_config.json: codebook, version, every matrix's bits
+     program: [32]u8, // sha256 of this executable
+     weights: [32]u8, // digest of the checkpoint's metadata and shard bytes (the engine's checkpoint digest)
+ 
+-    pub const Field = enum { layout, rank, world, layers, reduce, roce, capacity, config, quant, program, weights };
++    pub const Field = enum { layout, rank, world, layers, reduce, roce, kv8, capacity, config, quant, program, weights };
+ 
+     pub fn of(p: Place, s: Settings, capacity: usize, config: [32]u8, quant: [32]u8, program: [32]u8, weights: [32]u8) Fingerprint {
+         return .{
+@@ -130,6 +133,7 @@ pub const Fingerprint = extern struct {
+             .rank = @intCast(p.rank),
+             .layers = s.layers,
+             .roce = s.roce_kb,
++            .kv8 = @intFromBool(s.kv8),
+             .capacity = capacity,
+             .config = config,
+             .quant = quant,
+@@ -147,7 +151,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
+         if (f.rank != r) return .{ .field = .rank, .rank = r };
+         if (f.world != all.len) return .{ .field = .world, .rank = r };
+-        inline for (.{ "world", "layers", "reduce", "roce", "capacity", "config", "quant", "program", "weights" }) |name| {
++        inline for (.{ "world", "layers", "reduce", "roce", "kv8", "capacity", "config", "quant", "program", "weights" }) |name| {
+             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
+                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
+         }
+@@ -163,6 +167,7 @@ pub fn explain(f: Fingerprint.Field) []const u8 {
+         .layers => "TF_MM3_LAYERS",
+         .reduce => "a different reduction order",
+         .roce => "TF_ROCE or TF_ROCE_MAX_KB",
++        .kv8 => "--kv-cache (one rank serves fp8 pages, another bf16)",
+         .capacity => "the sequence capacity (the context)",
+         .config => "config.json",
+         .quant => "quantization_config.json (codebook, version or bit widths)",
+@@ -308,5 +313,5 @@ test "agree refuses a mismatch on the rank that sees it and passes agreeing rank
+ }
+ 
+ test "the fingerprint has no padding bytes to compare by accident" {
+-    try std.testing.expectEqual(@as(usize, 4 * 6 + 8 + 128), @sizeOf(Fingerprint));
++    try std.testing.expectEqual(@as(usize, 4 * 8 + 8 + 128), @sizeOf(Fingerprint));
+ }
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 1e73362..9c2c0d6 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -476,6 +476,7 @@ test {
+     _ = @import("cuda_vision_offer.zig");
+     _ = kv_pages;
+     _ = drafted;
++    _ = @import("cuda_minimax_kv8_test.zig");
+ }
+ 
+ test "CUDA host preserves prefill_step and first-before-draft capability" {
+diff --git a/zig/src/native/cuda_kv_pool.zig b/zig/src/native/cuda_kv_pool.zig
+index 970a3ef..36d14ca 100644
+--- a/zig/src/native/cuda_kv_pool.zig
++++ b/zig/src/native/cuda_kv_pool.zig
+@@ -111,7 +111,7 @@ pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: K
+ 
+ /// The startup line's streams and cache.
+ pub fn text(comptime F: type, a: Allocator, stream_bytes: u64, l: ?kv_pool.Layout, paged: ?Plan, window: u64, k: Kept, kv8: bool) ![2][]const u8 {
+-    const shape = if (l != null and l.?.all_paged) try std.fmt.allocPrint(a, "{d} taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ paged.?.paged, paged.?.pages, l.?.page_tokens, toGib(paged.?.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else if (paged) |p| try std.fmt.allocPrint(a, "the engine's own at a {d}-token window ({d:.2} GiB, in the model's), {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ window, toGib(stream_bytes), p.paged, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else try std.fmt.allocPrint(a, "{d:.2} GiB each at a {d}-token window{s}", .{ toGib(stream_bytes), window, if (kv8) " (fp8 caches)" else "" });
++    const shape = if (l != null and l.?.all_paged) try std.fmt.allocPrint(a, "{d} taking {d} pages of {d} rows ({d:.2} GiB{s}) as they need them, {d:.0} MiB fixed each", .{ paged.?.paged, paged.?.pages, l.?.page_tokens, toGib(paged.?.pages * l.?.pageBytes()), if (kv8) ", fp8 K/V" else "", @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else if (paged) |p| try std.fmt.allocPrint(a, "the engine's own at a {d}-token window ({d:.2} GiB, in the model's), {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ window, toGib(stream_bytes), p.paged, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else try std.fmt.allocPrint(a, "{d:.2} GiB each at a {d}-token window{s}", .{ toGib(stream_bytes), window, if (kv8) " (fp8 caches)" else "" });
+     const placed = comptime @hasDecl(F, "snap_place"); // the startup line says where its prompt states went, and why
+     const cache = if (k.copied == 0) ", no prompt cache" else if (comptime owns(F)) try std.fmt.allocPrint(a, ", a prompt cache of up to {d:.1} GiB of the pool's pages and {d} snapshot records", .{ toGib(k.copied), k.snaps }) else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
+     return .{ shape, cache };
+diff --git a/zig/src/native/cuda_minimax_kv8_test.zig b/zig/src/native/cuda_minimax_kv8_test.zig
+new file mode 100644
+index 0000000..51af4b0
+--- /dev/null
++++ b/zig/src/native/cuda_minimax_kv8_test.zig
+@@ -0,0 +1,19 @@
++//! MiniMax-M3.1-Flash takes --kv-cache fp8: the refusal passes it, the host forwards it, bf16 families still refuse.
++const std = @import("std");
++const minimax = @import("minimax_cuda");
++const refusals = @import("cuda_refusal.zig");
++const options = @import("cuda_options.zig");
++
++test "MiniMax-M3.1-Flash takes --kv-cache fp8 and forwards it; a family with bf16 caches still refuses it" {
++    try std.testing.expect(@hasField(minimax.native.Options, "kv8"));
++    const open: @import("engine_api").Open = .{ .dir = "d", .model_type = minimax.native.model_type, .kv8 = true };
++    try std.testing.expect(refusals.family(minimax.native, open) == null);
++    var opts: minimax.native.Options = .{ .context = 4096, .drafts = false };
++    var why: []const u8 = "";
++    try std.testing.expect(options.set(minimax.native, open, &opts, &why));
++    try std.testing.expect(opts.kv8);
++    const Bf16Only = struct {
++        pub const Options = struct { context: usize };
++    };
++    try std.testing.expectStringStartsWith(refusals.family(Bf16Only, .{ .dir = "d", .model_type = "m", .kv8 = true }) orelse "", "--kv-cache fp8");
++}
+diff --git a/zig/tests/cuda/contract_minimax_rows.zig b/zig/tests/cuda/contract_minimax_rows.zig
+index b709435..f2932f0 100644
+--- a/zig/tests/cuda/contract_minimax_rows.zig
++++ b/zig/tests/cuda/contract_minimax_rows.zig
+@@ -127,14 +127,20 @@ pub const Logits = struct {
+ const nq = 32;
+ const niq = 2;
+ const kvh = 2;
+-const pool: cuda.minimax_m3_sparse.geom.Pool = .{ .kvh = kvh, .layers = 1 };
+ 
+-/// A decode window (positions given) or a prompt chunk (positions k, k + 1, ...).
+-pub const Cfg = struct { name: []const u8, prompt: bool };
++/// The test pool: one layer of the bf16 layout, or of the fp8 layout (K and V as e4m3 rows with an fp32 scale each).
++fn poolOf(kv8: bool) cuda.minimax_m3_sparse.geom.Pool {
++    return .{ .kvh = kvh, .layers = 1, .kv8 = kv8 };
++}
++
++/// A decode window (positions given) or a prompt chunk (positions k, k + 1, ...); `kv8` writes the fp8 pool.
++pub const Cfg = struct { name: []const u8, prompt: bool, kv8: bool = false };
+ 
+ pub const cfgs = [_]Cfg{
+     .{ .name = "cuda minimax_m3_rows tf_mm3_rows decode, 32 q + 2 index heads, 2 kv heads, paged", .prompt = false },
+     .{ .name = "cuda minimax_m3_rows tf_mm3_rows prompt chunk, 32 q + 2 index heads, 2 kv heads, paged", .prompt = true },
++    .{ .name = "cuda minimax_m3_rows tf_mm3_rows decode, fp8 K/V pages (kv8), 32 q + 2 index heads, 2 kv heads, paged", .prompt = false, .kv8 = true },
++    .{ .name = "cuda minimax_m3_rows tf_mm3_rows prompt chunk, fp8 K/V pages (kv8), 32 q + 2 index heads, 2 kv heads, paged", .prompt = true, .kv8 = true },
+ };
+ 
+ fn normDepth(_: c.Shape) usize {
+@@ -256,7 +262,7 @@ pub const Writer = struct {
+             if (n > 1) self.q[(1 * nq + 3) * 128 + 70] = c.toBf16(std.math.inf(f32));
+             if (n > 2) self.iq[(2 * niq + 1) * 128 + 9] = 0x7c00;
+         }
+-        const lay = pool.pageBytes();
++        const lay = poolOf(self.f.kv8).pageBytes();
+         self.dev[0] = try self.rig.input(std.mem.sliceAsBytes(self.q));
+         self.dev[1] = try self.rig.input(std.mem.sliceAsBytes(self.kk));
+         self.dev[2] = try self.rig.input(std.mem.sliceAsBytes(self.vv));
+@@ -273,14 +279,14 @@ pub const Writer = struct {
+         return true;
+     }
+ 
+-    fn opts(_: *const Writer) rk.Opts {
+-        return .{};
++    fn opts(self: *const Writer) rk.Opts {
++        return .{ .flags = .{ .kv8 = self.f.kv8 } };
+     }
+ 
+     pub fn run(self: *Writer) !void {
+         const n = self.shape.rows;
+         const rows: cuda.minimax_m3_sparse.Rows = if (self.f.prompt) .{ .n = n, .pos0 = self.pos[0] } else .{ .n = n, .pos = self.dev[7] };
+-        const p: cuda.minimax_m3_sparse.Paged = .{ .pool = self.dev[10], .page_bytes = pool.pageBytes(), .layer_off = 0, .kvh = kvh, .tables = self.dev[6], .row_tab = self.dev[12] };
++        const p: cuda.minimax_m3_sparse.Paged = .{ .pool = self.dev[10], .page_bytes = poolOf(self.f.kv8).pageBytes(), .layer_off = 0, .kvh = kvh, .tables = self.dev[6], .row_tab = self.dev[12], .kv8 = self.f.kv8 };
+         const status = self.dev[11];
+         const in: rk.Inputs = .{ .q = self.dev[0], .q_ld = nq * 128, .k = self.dev[1], .k_ld = kvh * 128, .v = self.dev[2], .v_ld = kvh * 128, .iq = self.dev[3], .iq_ld = niq * 128, .ik = self.dev[4], .ik_ld = 128 };
+         const nm: rk.Norms = .{ .q = self.dev[5], .k = self.dev[5] + 512, .iq = self.dev[5] + 1024, .ik = self.dev[5] + 1536 };
+@@ -358,6 +364,8 @@ pub const Writer = struct {
+         if (!try self.rig.intact()) return "the writer changed a buffer guard";
+         const st = try self.rig.bytes(self.dev[11], 4);
+         if (std.mem.readInt(u32, st[0..4], .little) != 0) return "the writer reported a missing page";
++        if (self.f.kv8) return self.checkKv8();
++        const pool = poolOf(false);
+         const bytes = try self.rig.bytes(self.dev[10], self.pages * pool.pageBytes());
+         const cells = try self.arena.allocator().alloc(u16, bytes.len / 2);
+         @memcpy(std.mem.sliceAsBytes(cells), bytes);
+@@ -383,6 +391,66 @@ pub const Writer = struct {
+         return null;
+     }
+ 
++    /// The fp8 pool: v exactly as the host rule gives it, k within e4m3's half step of the float64 norm and rope.
++    fn checkKv8(self: *Writer) !?[]const u8 {
++        const pool = poolOf(true);
++        const bytes = try self.rig.bytes(self.dev[10], self.pages * pool.pageBytes());
++        var touched = try self.arena.allocator().alloc(bool, bytes.len);
++        @memset(touched, false);
++        for (0..self.shape.rows) |r| {
++            const p: usize = @intCast(self.pos[r]);
++            const page: usize = @intCast(self.table[(if (self.f.prompt) 0 else r * self.blocks) + p / geom.block]);
++            const t = p % geom.block;
++            for (0..kvh) |h| {
++                const k0 = pool.kv(page, 0, 0, h, t);
++                const v0 = pool.kv(page, 0, 1, h, t);
++                const ks0 = pool.scale(page, 0, 0, h, t);
++                const vs0 = pool.scale(page, 0, 1, h, t);
++                @memset(touched[k0..][0..128], true);
++                @memset(touched[v0..][0..128], true);
++                @memset(touched[ks0..][0..4], true);
++                @memset(touched[vs0..][0..4], true);
++                var v32: [128]f32 = undefined;
++                for (&v32, self.vv[(r * kvh + h) * 128 ..][0..128]) |*o, s| o.* = c.fromBf16(s);
++                var want: [128]u8 = undefined;
++                const want_scale = mr.quantRowF32(&v32, &want);
++                if (!std.mem.eql(u8, bytes[v0..][0..128], &want)) return "v was not stored as the e4m3 row of its bf16 value";
++                if (std.mem.readInt(u32, bytes[vs0..][0..4], .little) != @as(u32, @bitCast(want_scale))) return "v's scale is not amax / 448";
++                const ks: f32 = @bitCast(std.mem.readInt(u32, bytes[ks0..][0..4], .little));
++                if (!self.keyNear(bytes[k0..][0..128], ks, self.kk[(r * kvh + h) * 128 ..][0..128], p)) return "k differs from the float64 norm and rotation beyond e4m3's half step";
++            }
++            const ik0 = pool.ik(page, 0, t);
++            @memset(touched[ik0..][0..256], true);
++            var cells: [128]u16 = undefined;
++            @memcpy(std.mem.sliceAsBytes(&cells), bytes[ik0..][0..256]);
++            if (!self.rowNear(&cells, self.ik[r * 128 ..][0..128], true, 3, p)) return "the index key differs from the float64 norm and rotation";
++        }
++        for (bytes, touched) |v, t| if (!t and v != 0) return "the writer wrote outside the rows' token slots";
++        return null;
++    }
++
++    /// A stored key row (codes and scale) against the float64 norm and rotation of `src`.
++    fn keyNear(self: *const Writer, codes: []const u8, scale: f32, src: []const u16, p: usize) bool {
++        var x: [128]f64 = undefined;
++        var w: [128]f64 = undefined;
++        for (&x, &w, src, self.w[1][0..]) |*o, *ww, s, wv| {
++            o.* = c.fromBf16(s);
++            ww.* = wv;
++        }
++        var y: [128]f64 = undefined;
++        mr.gemmaNorm(&x, &w, 1e-6, false, &y);
++        mr.rope(&y, 64, p, 1e7, .neox_half);
++        var amax: f64 = 0;
++        for (y) |v| amax = @max(amax, @abs(v));
++        if (!std.math.isFinite(scale) or !(@abs(@as(f64, scale) - amax / 448) <= amax / 448 * 0x1p-6 + 1e-30)) return false;
++        for (codes, y) |code, want| {
++            const v = mr.e4m3Value(code) * @as(f64, scale);
++            // half an e4m3 step (2^-4 relative, 2^-10 scales below), the bf16 rounding and the norm's error
++            if (!(@abs(v - want) <= @abs(want) * (0x1p-4 + 0x1p-7) + @as(f64, scale) * 0x1p-9 + 1e-4)) return false;
++        }
++        return true;
++    }
++
+     fn rowNear(self: *const Writer, got: []const u16, src: []const u16, fp: bool, wi: usize, p: usize) bool {
+         var x: [128]f64 = undefined;
+         var w: [128]f64 = undefined;
+diff --git a/zig/tests/cuda/contract_minimax_sparse.zig b/zig/tests/cuda/contract_minimax_sparse.zig
+index a07e1af..2f1ed4b 100644
+--- a/zig/tests/cuda/contract_minimax_sparse.zig
++++ b/zig/tests/cuda/contract_minimax_sparse.zig
+@@ -20,7 +20,10 @@ const geom = sp.geom;
+ const kvh = 2;
+ const layers = 2;
+ const layer = 1;
++/// The bf16 pool: the host's shadow of every cell, and the device pool unless the config is fp8.
+ const pool: geom.Pool = .{ .kvh = kvh, .layers = layers };
++/// The fp8 pool the device reads when `Cfg.kv8` (docs/fp8-kv.md): e4m3 K/V rows with an fp32 scale each.
++const pool8: geom.Pool = .{ .kvh = kvh, .layers = layers, .kv8 = true };
+ 
+ fn zero(_: c.Shape) usize {
+     return 0;
+@@ -161,11 +164,13 @@ pub const Select = struct {
+ };
+ 
+ /// A decode window (positions given) or a prompt chunk (positions k, k + 1, ...).
+-pub const Cfg = struct { name: []const u8, prompt: bool };
++pub const Cfg = struct { name: []const u8, prompt: bool, kv8: bool = false };
+ 
+ pub const cfgs = [_]Cfg{
+     .{ .name = "cuda minimax_m3 tf_mm3_attn decode, 32 q heads over 2 kv heads, paged", .prompt = false },
+     .{ .name = "cuda minimax_m3 tf_mm3_attn prompt chunk, 32 q heads over 2 kv heads, paged", .prompt = true },
++    .{ .name = "cuda minimax_m3 tf_mm3_attn decode, fp8 K/V pages (kv8), 32 q heads over 2 kv heads, paged", .prompt = false, .kv8 = true },
++    .{ .name = "cuda minimax_m3 tf_mm3_attn prompt chunk, fp8 K/V pages (kv8), 32 q heads over 2 kv heads, paged", .prompt = true, .kv8 = true },
+ };
+ 
+ fn keyChain(s: c.Shape) usize {
+@@ -177,7 +182,8 @@ pub fn attnSpec(f: Cfg) c.Spec {
+         .name = f.name,
+         .accum = .f32,
+         .depth = keyChain,
+-        .ops = 1,
++        // the fp8 reader scales the dot and the weight: two more fp32 roundings in a score and one in a weight
++        .ops = if (f.kv8) 3 else 1,
+         .out = .bf16,
+         // rows, the 32 query heads, and the positions' bound (the last row's position + 1): edges at a block boundary
+         .tiles = .{ .{}, .{}, .{ .size = geom.block, .min = 1 } },
+@@ -186,6 +192,20 @@ pub fn attnSpec(f: Cfg) c.Spec {
+     };
+ }
+ 
++/// attn.mirrored with e4m3-exact values and a +-448 in every row (scale 1); the 1 residue pairs are integers 9..16.
++fn mirrored8(rng: std.Random, out: []f32, e: usize) void {
++    const h = out.len / 2;
++    for (0..h) |i| {
++        const v: f32 = if (i < 8) @floatFromInt(9 + rng.uintLessThan(u32, 8)) else @floatCast(mr.e4m3Value(@intCast(0x10 + rng.uintLessThan(u32, 0x6f))));
++        out[i] = v;
++        out[h + i] = (if (i < 8) @as(f32, 1) else 0) - v;
++    }
++    if (out.len % 2 == 1) out[out.len - 1] = 0;
++    if (e >= 8) for (out, 0..) |*y, i| {
++        if (i % 120 == e - 8) y.* = if (i % 2 == 0) 448 else -448;
++    };
++}
++
+ pub const Attn = struct {
+     rig: rig_.Rig,
+     f: Cfg,
+@@ -197,6 +217,9 @@ pub const Attn = struct {
+     table: std.ArrayList(i32) = .empty,
+     q: std.ArrayList(u16) = .empty,
+     cache: std.ArrayList(u16) = .empty,
++    /// fp8 only: the pool bytes the device reads, and the float64 value each bf16 cell of `cache` decodes to.
++    img: std.ArrayList(u8) = .empty,
++    dec: std.ArrayList(f64) = .empty,
+     dev: [5]u64 = @splat(0),
+     out: u64 = 0,
+     blocks_max: usize = 0,
+@@ -204,7 +227,7 @@ pub const Attn = struct {
+     pub fn deinit(self: *Attn) void {
+         const a = self.rig.gpu.gpa;
+         if (self.r) |*r| r.deinit();
+-        inline for (.{ "pos", "sel", "table", "q", "cache" }) |n| @field(self, n).deinit(a);
++        inline for (.{ "pos", "sel", "table", "q", "cache", "img", "dec" }) |n| @field(self, n).deinit(a);
+         self.rig.deinit();
+     }
+ 
+@@ -294,12 +317,36 @@ pub const Attn = struct {
+             .nonfinite => self.plant(),
+             .stress => try self.stress(rng),
+         }
+-        const poolb = std.mem.sliceAsBytes(self.cache.items);
++        if (self.f.kv8) try self.quantize(nb);
++        const poolb = if (self.f.kv8) self.img.items else std.mem.sliceAsBytes(self.cache.items);
+         for ([_][]const u8{ std.mem.sliceAsBytes(self.q.items), std.mem.sliceAsBytes(self.sel.items), std.mem.sliceAsBytes(self.pos.items), std.mem.sliceAsBytes(self.table.items), poolb }, &self.dev) |bytes, *p| p.* = try self.rig.input(bytes);
+         self.out = try self.rig.output(n * shape.n * geom.d * 2);
+         return true;
+     }
+ 
++    /// The fp8 pool image from the bf16 cells by the host rule, every other byte NaN; `dec` is what cells read back as.
++    fn quantize(self: *Attn, nb: usize) !void {
++        const a = self.rig.gpu.gpa;
++        try self.img.resize(a, self.cache.items.len * 2 / pool.pageBytes() * pool8.pageBytes());
++        @memset(self.img.items, 0xff);
++        try self.dec.resize(a, self.cache.items.len);
++        @memset(self.dec.items, std.math.nan(f64));
++        var top: usize = 0;
++        for (self.pos.items) |p| top = @max(top, @as(usize, @intCast(p)));
++        for (0..nb) |b| for (0..geom.block) |t| {
++            const page: usize = @intCast(self.table.items[b]);
++            if (b * geom.block + t > top) continue;
++            for (0..2) |w| for (0..kvh) |h| {
++                var x: [geom.d]f32 = undefined;
++                for (&x, 0..) |*o, e| o.* = c.fromBf16(self.cell(page, w, h, t, e).*);
++                const at = pool8.kv(page, layer, w, h, t);
++                const sc = mr.quantRowF32(&x, self.img.items[at..][0..geom.d]);
++                std.mem.writeInt(u32, self.img.items[pool8.scale(page, layer, w, h, t)..][0..4], @bitCast(sc), .little);
++                for (0..geom.d) |e| self.dec.items[(pool.kv(page, layer, w, h, t) >> 1) + e] = mr.e4m3Value(self.img.items[at + e]) * @as(f64, sc);
++            };
++        };
++    }
++
+     /// Row r's key list for kv head h: the tokens of its selected blocks up to its position, as (block, token).
+     fn key(self: *const Attn, r: usize, h: usize, i: usize) struct { b: usize, t: usize } {
+         const ids = self.sel.items[(r * kvh + h) * geom.topk ..][0..geom.topk];
+@@ -332,6 +379,17 @@ pub const Attn = struct {
+         const inf = c.toBf16(std.math.inf(f32));
+         const ninf = c.toBf16(-std.math.inf(f32));
+         self.q.items[3] = nan;
++        if (self.f.kv8) {
++            // a bad value poisons its whole row: plant at the last rows' own keys
++            const l = n - 1;
++            const kv = self.key(l, 0, self.keysOf(l) - 1);
++            self.cell(@intCast(self.table.items[kv.b]), 1, 0, kv.t, 7).* = inf;
++            if (n > 2) {
++                const kk = self.key(l - 1, 1, self.keysOf(l - 1) - 1);
++                self.cell(@intCast(self.table.items[kk.b]), 0, 1, kk.t, 9).* = nan;
++            }
++            return;
++        }
+         const k0 = self.key(0, 0, self.keysOf(0) - 1);
+         self.cell(@intCast(self.table.items[k0.b]), 1, 0, k0.t, 7).* = inf;
+         if (n > 1) {
+@@ -365,7 +423,7 @@ pub const Attn = struct {
+         const col = try a.alloc(f32, nk);
+         defer a.free(col);
+         for (0..kvh) |h| for (0..geom.d) |e| {
+-            attn.mirrored(rng, col);
++            if (self.f.kv8) mirrored8(rng, col, e) else attn.mirrored(rng, col);
+             for (col, 0..) |y, i| {
+                 const k = self.key(0, h, i);
+                 self.cell(@intCast(self.table.items[k.b]), 1, h, k.t, e).* = c.toBf16(y);
+@@ -375,7 +433,8 @@ pub const Attn = struct {
+     }
+ 
+     fn paged(self: *const Attn) sp.Paged {
+-        return .{ .pool = self.dev[4], .page_bytes = pool.pageBytes(), .layer_off = pool.layerOff(layer), .kvh = kvh, .tables = self.dev[3] };
++        const dev = if (self.f.kv8) pool8 else pool;
++        return .{ .pool = self.dev[4], .page_bytes = dev.pageBytes(), .layer_off = dev.layerOff(layer), .kvh = kvh, .tables = self.dev[3], .kv8 = self.f.kv8 };
+     }
+ 
+     pub fn run(self: *Attn) !void {
+@@ -402,8 +461,13 @@ pub const Attn = struct {
+             const k = self.key(r, h, j);
+             const page: usize = @intCast(self.table.items[k.b]);
+             for (0..geom.d) |e| {
+-                hd.k[j * geom.d + e] = c.fromBf16(self.cell(page, 0, h, k.t, e).*);
+-                hd.v[j * geom.d + e] = c.fromBf16(self.cell(page, 1, h, k.t, e).*);
++                if (self.f.kv8) {
++                    hd.k[j * geom.d + e] = self.dec.items[(pool.kv(page, layer, 0, h, k.t) >> 1) + e];
++                    hd.v[j * geom.d + e] = self.dec.items[(pool.kv(page, layer, 1, h, k.t) >> 1) + e];
++                } else {
++                    hd.k[j * geom.d + e] = c.fromBf16(self.cell(page, 0, h, k.t, e).*);
++                    hd.v[j * geom.d + e] = c.fromBf16(self.cell(page, 1, h, k.t, e).*);
++                }
+             }
+         }
+         hd.n = nk;
+diff --git a/zig/tests/minimax_kv8_tests.zig b/zig/tests/minimax_kv8_tests.zig
+new file mode 100644
+index 0000000..6e21187
+--- /dev/null
++++ b/zig/tests/minimax_kv8_tests.zig
+@@ -0,0 +1,506 @@
++//! MiniMax-M3.1-Flash fp8 KV cache (docs/fp8-kv.md), host only: codes, layout, quantizer and attention twins; no GPU.
++const std = @import("std");
++const core = @import("core");
++const geom = @import("mm3_geom");
++const rows_geom = @import("mm3_rows_geom");
++const twin = @import("minimax_kv8_twin.zig");
++
++const mr = core.minimax_ref;
++const bf = core.bf16_round;
++const fp8 = core.quant.fp8;
++const testing = std.testing;
++
++const scale64 = 0.08838834764831845; // 128^-0.5
++const scale32: f32 = @floatCast(scale64);
++
++fn must(ok: bool, src: std.builtin.SourceLocation) !void {
++    if (!ok) {
++        std.debug.print("control check failed at line {d}\n", .{src.line});
++        return error.TestUnexpectedResult;
++    }
++}
++
++fn bf16v(rng: std.Random, n: usize, sd: f32) ![]f32 {
++    const v = try testing.allocator.alloc(f32, n);
++    for (v) |*x| x.* = bf.round32(rng.floatNorm(f32) * sd);
++    return v;
++}
++
++fn widen(x: []const f32) ![]f64 {
++    const o = try testing.allocator.alloc(f64, x.len);
++    for (o, x) |*d, s| d.* = s;
++    return o;
++}
++
++test "e4m3 codes: every code round-trips, ties go to the even code, 448 saturates, NaN is 0x7f" {
++    for (0..256) |i| {
++        const c: u8 = @intCast(i);
++        if (c & 0x7f == 0x7f) {
++            try testing.expect(std.math.isNan(mr.e4m3Value(c)));
++            continue;
++        }
++        try testing.expectEqual(c, mr.e4m3Code(mr.e4m3Value(c)));
++        try testing.expectEqual(fp8.e4m3(c), mr.e4m3Value(c)); // the weights' decoder agrees
++    }
++    try testing.expectEqual(@as(f64, 448), mr.e4m3Value(0x7e));
++    try testing.expectEqual(@as(u8, 0x38), mr.e4m3Code(1.0625)); // between 1 and 1.125: the even code
++    try testing.expectEqual(@as(u8, 0x3a), mr.e4m3Code(1.1875)); // between 1.125 and 1.25: the even code
++    try testing.expectEqual(@as(u8, 0xb8), mr.e4m3Code(-1.0625));
++    try testing.expectEqual(@as(u8, 0x01), mr.e4m3Code(0x1p-9)); // the smallest subnormal
++    try testing.expectEqual(@as(u8, 0x00), mr.e4m3Code(0x1p-10)); // half of it: a tie, to zero
++    try testing.expectEqual(@as(u8, 0x02), mr.e4m3Code(3 * 0x1p-10)); // 1.5 subnormals: to 2
++    try testing.expectEqual(@as(u8, 0x80), mr.e4m3Code(-0.0));
++    for ([_]f64{ 448, 449, 463.9, 464, 1e9, std.math.inf(f64) }) |x| {
++        try testing.expectEqual(@as(u8, 0x7e), mr.e4m3Code(x));
++        try testing.expectEqual(@as(u8, 0xfe), mr.e4m3Code(-x));
++    }
++    try testing.expectEqual(@as(u8, 0x7f), mr.e4m3Code(std.math.nan(f64)));
++    // against the weights' quantizer on random values (ties have measure zero)
++    var prng = std.Random.DefaultPrng.init(1);
++    const rng = prng.random();
++    for (0..20000) |_| {
++        const x = rng.floatNorm(f64) * std.math.pow(f64, 2, rng.float(f64) * 20 - 12);
++        if (@abs(x) > 440) continue;
++        try testing.expectEqual(fp8.toE4m3(x), mr.e4m3Value(mr.e4m3Code(x)));
++    }
++}
++
++test "page bytes: 47,040 a token a rank with fp8 K/V (76,800 with bf16), 100,352 a layer, 6,021,120 a page" {
++    const rank: geom.Pool = .{ .kvh = 2, .layers = 60, .kv8 = true };
++    try testing.expectEqual(@as(usize, 100_352), rank.layerBytes());
++    try testing.expectEqual(@as(usize, 784), rank.layerBytes() / 128); // K 256 + V 256 + IK 256 + 4 scales of 4 bytes
++    try testing.expectEqual(@as(usize, 47_040), rank.tokenBytes());
++    try testing.expectEqual(@as(usize, 6_021_120), rank.pageBytes());
++    const bf16: geom.Pool = .{ .kvh = 2, .layers = 60 };
++    try testing.expectEqual(@as(usize, 76_800), bf16.tokenBytes()); // the default is unchanged
++    try testing.expect(rank.tokenBytes() * 1000 / bf16.tokenBytes() == 612); // 0.6125 of bf16
++    // before the scales it is 46,080 = 60 * (512 + 256), the "about 46 KB" of the plan
++    try testing.expectEqual(@as(usize, 46_080), rank.tokenBytes() - 60 * 2 * 2 * 4);
++    const full: geom.Pool = .{ .kvh = 4, .layers = 1, .kv8 = true };
++    try testing.expectEqual(@as(usize, 4 * 132 * 2 + 256), full.tokenBytes());
++    // the same memory holds 1.63 times the tokens (whole pages)
++    try testing.expectEqual(@as(usize, 983 * 128), bf16.tokensFitting(9 << 30));
++    try testing.expectEqual(@as(usize, 1604 * 128), rank.tokensFitting(9 << 30)); // 205,312
++}
++
++fn mark(seen: []u8, byte: usize, len: usize) void {
++    for (seen[byte..][0..len]) |*s| {
++        std.debug.assert(s.* == 0);
++        s.* = 1;
++    }
++}
++
++test "fp8 paged addressing: K, V rows, scales and IK of every (page, layer, head, token) tile the pool with no gap and no overlap" {
++    const p: geom.Pool = .{ .kvh = 2, .layers = 3, .kv8 = true };
++    const pages = 3;
++    const seen = try testing.allocator.alloc(u8, pages * p.pageBytes());
++    defer testing.allocator.free(seen);
++    @memset(seen, 0);
++    for (0..pages) |pg| for (0..p.layers) |ly| for (0..128) |t| {
++        for (0..2) |w| for (0..p.kvh) |h| {
++            mark(seen, p.kv(pg, ly, w, h, t), 128);
++            mark(seen, p.scale(pg, ly, w, h, t), 4);
++        };
++        mark(seen, p.ik(pg, ly, t), 256);
++    };
++    for (seen) |s| try testing.expectEqual(@as(u8, 1), s);
++    // the scale of row t sits 4 bytes after row t - 1's; scales start after the IK plane
++    try testing.expectEqual(p.scale(0, 0, 0, 0, 0) + 4, p.scale(0, 0, 0, 0, 1));
++    try testing.expectEqual(p.ik(0, 0, 127) + 256, p.scale(0, 0, 0, 0, 0));
++    try testing.expectEqual(p.layerBytes(), p.scale(0, 0, 1, 1, 127) + 4);
++    // K and V rows are 128-byte aligned in every layer (the kernels load 16 bytes at a time)
++    for (0..p.layers) |ly| try testing.expectEqual(@as(usize, 0), p.kv(1, ly, 1, 1, 5) % 16);
++    // IK and the bf16 layout agree on where the index keys are read: 2 * kvh * 128 * 128 values in
++    try testing.expectEqual(@as(usize, 2 * 2 * 128 * 128), p.ikInLayer());
++    const b: geom.Pool = .{ .kvh = 2, .layers = 3 };
++    try testing.expectEqual(2 * p.ikInLayer(), b.ikInLayer());
++}
++
++test "the launch flag: kv8 is bit 64 of the rows kernel's flags, off by default" {
++    try testing.expectEqual(@as(i32, 1 | 2 | 4 | 8), (rows_geom.Flags{}).bits());
++    try testing.expectEqual(@as(i32, 1 | 2 | 4 | 8 | 64), (rows_geom.Flags{ .kv8 = true }).bits());
++}
++
++fn randomRow(rng: std.Random, sd: f32, out: *[128]f32) void {
++    for (out) |*x| x.* = bf.round32(rng.floatNorm(f32) * sd);
++}
++
++test "the fp32 twin follows the float64 reference: scales within an ulp, codes within one step, error within half a step" {
++    var prng = std.Random.DefaultPrng.init(2);
++    const rng = prng.random();
++    var total: usize = 0;
++    var off: usize = 0;
++    var worst_rel: f64 = 0;
++    for (0..2000) |trial| {
++        var x: [128]f32 = undefined;
++        randomRow(rng, std.math.pow(f32, 2, @floatFromInt(@as(i32, @intCast(trial % 24)) - 12)), &x);
++        var c32: [128]u8 = undefined;
++        var c64: [128]u8 = undefined;
++        const s32 = twin.quantRow(&x, .none, 0, &c32);
++        var x64: [128]f64 = undefined;
++        for (&x64, x) |*d, v| d.* = v;
++        const s64 = mr.quantRow(&x64, &c64);
++        try testing.expectApproxEqRel(s64, @as(f64, s32), 1e-6);
++        // the twin's own function is the reference's fp32 form
++        var cf: [128]u8 = undefined;
++        try testing.expectEqual(s32, mr.quantRowF32(&x, &cf));
++        try testing.expectEqualSlices(u8, &c32, &cf);
++        var dec: [128]f64 = undefined;
++        mr.dequantRow(&c32, s32, &dec);
++        for (c32, c64, x64, dec) |a, b, v, d| {
++            total += 1;
++            if (a != b) {
++                off += 1;
++                // neighbouring codes only: the fp32 product sat next to a midpoint
++                try testing.expect(@abs(@as(i32, a & 0x7f) - @as(i32, b & 0x7f)) <= 1);
++            }
++            // half a step: relative 2^-4 above the subnormal range (|y| >= 2^-6), 2^-10 scales below it
++            const y = @abs(v / @as(f64, s32));
++            const bound = @as(f64, s32) * if (y >= 0x1p-6) y * 0x1p-4 * 1.0001 else 0x1p-10 * 1.0001;
++            try testing.expect(@abs(d - v) <= bound);
++            if (v != 0 and y >= 1) worst_rel = @max(worst_rel, @abs(d - v) / @abs(v));
++        }
++    }
++    try testing.expect(off * 1000 < total); // near-midpoint disagreements: under 0.1 percent of values
++    try testing.expect(worst_rel <= 0x1p-4 * 1.0001);
++}
++
++test "rule corners: zero rows, tiny rows, the largest value, one huge value, negative zero" {
++    var c: [128]u8 = undefined;
++    var x: [128]f32 = @splat(0);
++    try testing.expectEqual(@as(f32, 1), twin.quantRow(&x, .none, 0, &c)); // all zero: scale 1, zero codes
++    try testing.expectEqualSlices(u8, &@as([128]u8, @splat(0)), &c);
++    x[3] = -0.0;
++    _ = twin.quantRow(&x, .none, 0, &c);
++    try testing.expectEqual(@as(u8, 0x80), c[3]); // the sign of a zero survives
++    // the largest magnitude is code 448 exactly, in either sign
++    x = @splat(0);
++    x[0] = 3.5;
++    x[1] = -3.5;
++    const s = twin.quantRow(&x, .none, 0, &c);
++    try testing.expectEqual(@as(f32, 3.5 / 448.0), s);
++    try testing.expectEqual(@as(u8, 0x7e), c[0]);
++    try testing.expectEqual(@as(u8, 0xfe), c[1]);
++    // a denormal row: the scale is floored at 2^-126 and the codes stay finite
++    for ([_]f32{ 1e-40, 1e-37, 4e-36, 5.3e-36 }) |tiny| {
++        x = @splat(0);
++        x[7] = tiny;
++        const st = twin.quantRow(&x, .none, 0, &c);
++        try testing.expect(st >= 0x1p-126 and std.math.isFinite(st));
++        try testing.expect(c[7] & 0x7f != 0x7f);
++        var x64: [128]f64 = undefined;
++        for (&x64, x) |*d, v| d.* = v;
++        var c64: [128]u8 = undefined;
++        try testing.expectApproxEqRel(@as(f64, st), mr.quantRow(&x64, &c64), 1e-6);
++    }
++    // a huge row: scale near 3e36, no overflow
++    x = @splat(1e38);
++    const sh = twin.quantRow(&x, .none, 0, &c);
++    try testing.expect(std.math.isFinite(sh));
++    try testing.expectEqual(@as(u8, 0x7e), c[0]);
++    var dec: [128]f64 = undefined;
++    mr.dequantRow(&c, sh, &dec);
++    for (dec) |d| try testing.expect(std.math.isFinite(d));
++}
++
++test "NaN and infinity: the whole row reads back NaN, a clean neighbour is untouched" {
++    for ([_]f32{ nan32, inf32, -inf32 }) |bad| {
++        var x: [128]f32 = undefined;
++        var prng = std.Random.DefaultPrng.init(4);
++        randomRow(prng.random(), 1, &x);
++        x[77] = bad;
++        var c: [128]u8 = undefined;
++        const s = twin.quantRow(&x, .none, 0, &c);
++        try testing.expect(std.math.isNan(s));
++        try testing.expectEqualSlices(u8, &@as([128]u8, @splat(0)), &c);
++        var dec: [128]f64 = undefined;
++        mr.dequantRow(&c, s, &dec);
++        for (dec) |d| try testing.expect(std.math.isNan(d));
++        var x64: [128]f64 = undefined;
++        for (&x64, x) |*d, v| d.* = v;
++        var c64: [128]u8 = undefined;
++        try testing.expect(std.math.isNan(mr.quantRow(&x64, &c64)));
++        try testing.expectEqualSlices(u8, &c, &c64);
++    }
++}
++
++const nan32 = std.math.nan(f32);
++const inf32 = std.math.inf(f32);
++
++test "a row's bits do not depend on the window: 1, 3 or 16 rows in a call give the same codes and scales" {
++    var prng = std.Random.DefaultPrng.init(5);
++    const rng = prng.random();
++    var rows: [16][128]f32 = undefined;
++    for (&rows, 0..) |*r, i| randomRow(rng, 0.25 * @as(f32, @floatFromInt(1 + i * i)), r);
++    var alone_c: [16][128]u8 = undefined;
++    var alone_s: [16]f32 = undefined;
++    for (rows, &alone_c, &alone_s) |r, *c, *s| s.* = twin.quantRow(&r, .none, 0, c);
++    for ([_]usize{ 1, 3, 16 }) |w| {
++        var at: usize = 0;
++        while (at < 16) : (at += w) {
++            const n = @min(w, 16 - at);
++            var c: [16][128]u8 = undefined;
++            var s: [16]f32 = undefined;
++            twin.quantWindow(rows[at..][0..n], .none, c[0..n], s[0..n]);
++            for (0..n) |i| {
++                try testing.expectEqualSlices(u8, &alone_c[at + i], &c[i]);
++                try testing.expectEqual(alone_s[at + i], s[i]);
++            }
++        }
++    }
++    // control: scaling by the window's amax makes a row depend on its neighbours
++    var c: [16][128]u8 = undefined;
++    var s: [16]f32 = undefined;
++    twin.quantWindow(&rows, .batch_amax, &c, &s);
++    try must(s[0] != alone_s[0], @src());
++}
++
++test "planted controls on the quantizer: each mutant breaks the rule and the checks see it" {
++    var prng = std.Random.DefaultPrng.init(6);
++    const rng = prng.random();
++    // ties: amax 448 gives scale 1 and inv 1, so 1.0625 and 1.1875 are exact ties
++    var x: [128]f32 = @splat(0);
++    x[0] = 448;
++    x[1] = 1.0625;
++    x[2] = 1.1875;
++    x[3] = -1.0625;
++    x[4] = 2.4;
++    var good: [128]u8 = undefined;
++    var bad: [128]u8 = undefined;
++    _ = twin.quantRow(&x, .none, 0, &good);
++    try testing.expectEqual(@as(u8, 0x38), good[1]);
++    try testing.expectEqual(@as(u8, 0x3a), good[2]);
++    _ = twin.quantRow(&x, .ties_up, 0, &bad);
++    try must(bad[1] == 0x39 and bad[2] == good[2], @src()); // the second tie is odd below, even above: both rules agree
++    _ = twin.quantRow(&x, .truncate, 0, &bad);
++    try must(bad[4] != good[4] or bad[1] != good[1], @src()); // 2.4 sits above 2.25 and below 2.5: truncation keeps 2.25 ...
++    try testing.expect(mr.e4m3Value(good[4]) == 2.5); // ... the nearest is 2.5
++    try testing.expect(mr.e4m3Value(bad[4]) == 2.25);
++    // the reference scale catches a wrong maximum; the poison rule catches an ignored NaN
++    var r: [128]f32 = undefined;
++    randomRow(rng, 1, &r);
++    const s_ok = twin.quantRow(&r, .none, 0, &good);
++    try must(twin.quantRow(&r, .wrong_max, 0, &bad) != s_ok, @src());
++    r[10] = nan32;
++    try must(std.math.isNan(twin.quantRow(&r, .none, 0, &good)), @src());
++    try must(!std.math.isNan(twin.quantRow(&r, .nan_ignored, 0, &bad)), @src());
++    r[10] = inf32;
++    try must(!std.math.isNan(twin.quantRow(&r, .nan_ignored, 0, &bad)), @src());
++    // the scale floor: a denormal row without it saturates every nonzero value and turns zeros into NaN codes
++    var t: [128]f32 = @splat(0);
++    t[7] = 1e-40;
++    _ = twin.quantRow(&t, .none, 0, &good);
++    _ = twin.quantRow(&t, .no_floor, 0, &bad);
++    try must(!std.mem.eql(u8, &good, &bad), @src());
++    // k from its bf16 rounding: fp32 inputs that bf16 moves across a rounding midpoint change a code
++    var moved = false;
++    for (0..40) |_| {
++        var o: [128]f32 = undefined;
++        for (&o) |*v| v.* = rng.floatNorm(f32);
++        _ = twin.quantKey(&o, .none, 0, &good);
++        _ = twin.quantKey(&o, .k_unrounded, 0, &bad);
++        moved = moved or !std.mem.eql(u8, &good, &bad);
++    }
++    try must(moved, @src());
++}
++
++fn idsFor(pos: usize, out: *[geom.topk]i32) []const i32 {
++    @memset(out, -1);
++    const nb = geom.blocks(pos);
++    const n = @min(nb, geom.topk);
++    for (out[0..n], 0..) |*o, i| o.* = @intCast(nb - n + i);
++    return out[0..n];
++}
++
++const Case = struct {
++    q: []f32,
++    k: []f32,
++    v: []f32,
++    kc: []u8,
++    vc: []u8,
++    ks: []f32,
++    vs: []f32,
++    n: usize,
++
++    fn init(rng: std.Random, pos: usize) !Case {
++        const n = pos + 1;
++        const a = testing.allocator;
++        var c: Case = .{ .q = try bf16v(rng, 16 * 128, 1), .k = try bf16v(rng, n * 128, 1), .v = try bf16v(rng, n * 128, 1), .kc = try a.alloc(u8, n * 128), .vc = try a.alloc(u8, n * 128), .ks = try a.alloc(f32, n), .vs = try a.alloc(f32, n), .n = n };
++        c.requant();
++        return c;
++    }
++
++    fn requant(c: *Case) void {
++        for (0..c.n) |j| {
++            c.ks[j] = twin.quantRow(c.k[j * 128 ..][0..128], .none, 0, c.kc[j * 128 ..][0..128]);
++            c.vs[j] = twin.quantRow(c.v[j * 128 ..][0..128], .none, 0, c.vc[j * 128 ..][0..128]);
++        }
++    }
++
++    fn deinit(c: Case) void {
++        const a = testing.allocator;
++        a.free(c.q);
++        a.free(c.k);
++        a.free(c.v);
++        a.free(c.kc);
++        a.free(c.vc);
++        a.free(c.ks);
++        a.free(c.vs);
++    }
++};
++
++/// The float64 attention over exactly the values the twin's codes and scales dequantize to.
++fn attendDecoded(c: Case, rids: []const usize, pos: usize, out: []f64) !void {
++    const a = testing.allocator;
++    const q64 = try widen(c.q);
++    defer a.free(q64);
++    const kd = try a.alloc(f64, c.n * 128);
++    defer a.free(kd);
++    const vd = try a.alloc(f64, c.n * 128);
++    defer a.free(vd);
++    for (0..c.n) |j| {
++        mr.dequantRow(c.kc[j * 128 ..][0..128], c.ks[j], kd[j * 128 ..][0..128]);
++        mr.dequantRow(c.vc[j * 128 ..][0..128], c.vs[j], vd[j * 128 ..][0..128]);
++    }
++    var keys: [geom.topk * 128]usize = undefined;
++    mr.attendBlocks(q64, kd, vd, rids, pos, 128, 128, 16, &keys, out);
++}
++
++fn maxAbs(x: []const f64) f64 {
++    var m: f64 = 0;
++    for (x) |v| m = @max(m, @abs(v));
++    return m;
++}
++
++fn rmsRel(want: []const f64, got: []const f32) f64 {
++    var num: f64 = 0;
++    var den: f64 = 0;
++    for (want, got) |a, b| {
++        num += (a - b) * (a - b);
++        den += a * a;
++    }
++    return @sqrt(num / den);
++}
++
++fn worstDiff(want: []const f64, got: []const f32) f64 {
++    var w: f64 = 0;
++    for (want, got) |a, b| w = @max(w, if (std.math.isNan(a) and std.math.isNan(b)) 0 else @abs(a - b));
++    return w;
++}
++
++test "attention over fp8 K/V: the twin follows the float64 reference, and the fp8 error against bf16 K/V is bounded" {
++    var prng = std.Random.DefaultPrng.init(7);
++    const rng = prng.random();
++    var worst_vs_bf16: f64 = 0;
++    var worst_rms: f64 = 0;
++    for ([_]usize{ 127, 128, 129, 2047, 2048, 2049 }) |pos| {
++        const c = try Case.init(rng, pos);
++        defer c.deinit();
++        var idb: [geom.topk]i32 = undefined;
++        const ids = idsFor(pos, &idb);
++        var rids: [geom.topk]usize = undefined;
++        for (rids[0..ids.len], ids) |*r, i| r.* = @intCast(i);
++        const q64 = try widen(c.q);
++        defer testing.allocator.free(q64);
++        const k64 = try widen(c.k);
++        defer testing.allocator.free(k64);
++        const v64 = try widen(c.v);
++        defer testing.allocator.free(v64);
++        const kq = try testing.allocator.alloc(f64, c.n * 128);
++        defer testing.allocator.free(kq);
++        const vq = try testing.allocator.alloc(f64, c.n * 128);
++        defer testing.allocator.free(vq);
++        var keys: [geom.topk * 128]usize = undefined;
++        var want8: [16 * 128]f64 = undefined;
++        var want16: [16 * 128]f64 = undefined;
++        mr.attendBlocksKv8(q64, k64, v64, rids[0..ids.len], pos, 128, 128, 16, &keys, kq, vq, &want8);
++        mr.attendBlocks(q64, k64, v64, rids[0..ids.len], pos, 128, 128, 16, &keys, &want16);
++        var got: [16 * 128]f32 = undefined;
++        twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &got);
++        const big = maxAbs(&want8);
++        // over the twin's own codes the float64 attention differs only by fp32 order and where the scale is applied
++        var same: [16 * 128]f64 = undefined;
++        try attendDecoded(c, rids[0..ids.len], pos, &same);
++        try testing.expect(worstDiff(&same, &got) <= 2e-4 * big + 1e-9);
++        // against the float64 reference that quantizes by itself: exact ties in x / scale go the other way, 4 in 10,000
++        try testing.expect(worstDiff(&want8, &got) <= 1e-2 * big);
++        worst_vs_bf16 = @max(worst_vs_bf16, worstDiff(&want16, &got) / maxAbs(&want16));
++        worst_rms = @max(worst_rms, rmsRel(&want16, &got));
++        // padding with more -1 entries, again: the same bits
++        var again: [16 * 128]f32 = undefined;
++        twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, &idb, pos, scale32, .none, false, &again);
++        try testing.expectEqualSlices(f32, &got, &again);
++    }
++    std.debug.print("kv8 attention vs bf16 K/V, random N(0,1) rows, 6 positions: worst element error {d:.4} of the output's largest value, worst relative rms {d:.4}\n", .{ worst_vs_bf16, worst_rms });
++    try testing.expect(worst_vs_bf16 < 0.1 and worst_rms < 0.06); // 3 mantissa bits: a few percent per element, never more
++}
++
++test "planted controls on the attention twin: a missing or misplaced scale, or a window-dependent tile, is caught" {
++    var prng = std.Random.DefaultPrng.init(8);
++    const rng = prng.random();
++    const pos = 4 * 128 + 9;
++    const c = try Case.init(rng, pos);
++    defer c.deinit();
++    var idb: [geom.topk]i32 = undefined;
++    const ids = idsFor(pos, &idb);
++    var rids: [geom.topk]usize = undefined;
++    for (rids[0..ids.len], ids) |*r, i| r.* = @intCast(i);
++    var want: [16 * 128]f64 = undefined;
++    try attendDecoded(c, rids[0..ids.len], pos, &want);
++    const big = maxAbs(&want);
++    var out: [16 * 128]f32 = undefined;
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &out);
++    try testing.expect(worstDiff(&want, &out) <= 2e-4 * big);
++    for ([_]twin.Mutant{ .k_scale_missing, .v_scale_missing, .v_scale_on_sum }) |m| {
++        twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, m, false, &out);
++        try must(worstDiff(&want, &out) > 0.05 * big, @src());
++    }
++    // window_split: the 16-key tile changes fp32 bits for a short row; the fixed 32-key twin repeats exactly
++    var a: [16 * 128]f32 = undefined;
++    var b: [16 * 128]f32 = undefined;
++    var s: [16 * 128]f32 = undefined;
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &a);
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &b);
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .window_split, false, &s);
++    try testing.expectEqualSlices(f32, &a, &b);
++    try must(!std.mem.eql(f32, &a, &s), @src());
++}
++
++test "a NaN or infinity in a key or value row turns that head's output NaN through its scale; other rows' heads stay finite" {
++    var prng = std.Random.DefaultPrng.init(9);
++    const rng = prng.random();
++    const pos = 300;
++    var c = try Case.init(rng, pos);
++    defer c.deinit();
++    var idb: [geom.topk]i32 = undefined;
++    const ids = idsFor(pos, &idb);
++    var out: [16 * 128]f32 = undefined;
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &out);
++    for (out) |x| try testing.expect(std.math.isFinite(x));
++    // a poisoned key: every head's score for it is NaN, so every head is NaN (as with a NaN key in bf16)
++    c.k[5 * 128 + 3] = nan32;
++    c.requant();
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &out);
++    for (out) |x| try testing.expect(std.math.isNan(x));
++    // a poisoned value row: its weight times a NaN scale makes every output dim NaN (bf16 would poison only dim 9)
++    c.k[5 * 128 + 3] = 0.5;
++    c.v[7 * 128 + 9] = inf32;
++    c.requant();
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &out);
++    for (out) |x| try testing.expect(std.math.isNan(x));
++    // a bad key row beyond the row's position is never read
++    c.v[7 * 128 + 9] = 0.5;
++    c.k[(pos + 1 - 1) * 128] = 1;
++    c.requant();
++    var dup = try Case.init(rng, pos + 40);
++    defer dup.deinit();
++    @memcpy(dup.q, c.q);
++    @memcpy(dup.kc[0 .. c.n * 128], c.kc);
++    @memcpy(dup.vc[0 .. c.n * 128], c.vc);
++    @memcpy(dup.ks[0..c.n], c.ks);
++    @memcpy(dup.vs[0..c.n], c.vs);
++    var a: [16 * 128]f32 = undefined;
++    twin.attend(c.q, c.kc, c.ks, c.vc, c.vs, ids, pos, scale32, .none, false, &out);
++    twin.attend(dup.q, dup.kc, dup.ks, dup.vc, dup.vs, ids, pos, scale32, .none, false, &a);
++    try testing.expectEqualSlices(f32, &out, &a);
++}
+diff --git a/zig/tests/minimax_kv8_twin.zig b/zig/tests/minimax_kv8_twin.zig
+new file mode 100644
+index 0000000..eaa92e9
+--- /dev/null
++++ b/zig/tests/minimax_kv8_twin.zig
+@@ -0,0 +1,143 @@
++//! Host twins of quant_row8 and tf_mm3_attn's kv8 mode (docs/fp8-kv.md), in the kernels' fp32 order, with mutants.
++const std = @import("std");
++const core = @import("core");
++
++const mr = core.minimax_ref;
++const bf = core.bf16_round;
++const inf32 = std.math.inf(f32);
++const nan32 = std.math.nan(f32);
++
++pub const Mutant = enum {
++    none,
++    /// Codes round toward zero instead of to nearest even.
++    truncate,
++    /// A tie goes up (away from zero) instead of to the even code.
++    ties_up,
++    /// The scale divides by 240, not 448 (the e4m3fnuz maximum).
++    wrong_max,
++    /// A NaN or infinity does not poison its row: the row is scaled by its finite maximum.
++    nan_ignored,
++    /// The scale's 2^-126 floor is missing: a tiny row's inverse overflows.
++    no_floor,
++    /// The scale is taken over the whole window of rows, not the row (a row's bits would depend on its neighbours).
++    batch_amax,
++    /// The key is quantized from its fp32 value, not from the bf16 the bf16 cache would hold.
++    k_unrounded,
++    /// The key's scale is not applied to its score.
++    k_scale_missing,
++    /// The value's scale is not applied to its weight.
++    v_scale_missing,
++    /// The value's scale multiplies the softmax sum l as well (it must not).
++    v_scale_on_sum,
++    /// The attention's key tile depends on how many keys the row sees.
++    window_split,
++};
++
++/// Code of |a| by the chosen rounding; mutants change the rule, `none` is mr.e4m3Code's.
++fn code(x: f32, m: Mutant) u8 {
++    if (m != .truncate and m != .ties_up) return mr.e4m3Code(@as(f64, x));
++    if (std.math.isNan(x)) return 0x7f;
++    const sign: u8 = if (std.math.signbit(x)) 0x80 else 0;
++    const a: f64 = @abs(x);
++    if (a >= 448) return sign | 0x7e;
++    var i: u8 = 0;
++    while (i < 0x7e and mr.e4m3Value(i + 1) <= a) i += 1;
++    if (m == .truncate or i == 0x7e) return sign | i;
++    const mid = (mr.e4m3Value(i) + mr.e4m3Value(i + 1)) / 2;
++    return sign | (if (a >= mid) i + 1 else i);
++}
++
++/// quant_row8 for a row of 128 fp32 values: writes the codes, returns the scale (`window_amax` is for `.batch_amax`).
++pub fn quantRow(x: []const f32, m: Mutant, window_amax: f32, codes: []u8) f32 {
++    var amax: f32 = 0;
++    var bad = false;
++    for (x) |v| {
++        if (!std.math.isFinite(v)) bad = true else amax = @max(amax, @abs(v));
++    }
++    if (m == .batch_amax) amax = @max(amax, window_amax);
++    if (bad and m != .nan_ignored) {
++        @memset(codes, 0);
++        return nan32;
++    }
++    const top: f32 = if (m == .wrong_max) 240.0 else 448.0;
++    var inv: f32 = 1;
++    var scale: f32 = 1;
++    if (amax > 0) {
++        inv = top / amax;
++        scale = amax / top;
++        if (scale < 0x1p-126 and m != .no_floor) {
++            scale = 0x1p-126;
++            inv = 1.0 / scale;
++        }
++    }
++    for (codes, x) |*c, v| c.* = code(if (std.math.isFinite(v)) v * inv else v, m);
++    return scale;
++}
++
++/// A key as the writer stores it: the normed and rotated fp32 value rounded to bf16, then quantized.
++pub fn quantKey(o: []const f32, m: Mutant, window_amax: f32, codes: []u8) f32 {
++    var r: [128]f32 = undefined;
++    for (&r, o) |*d, v| d.* = if (m == .k_unrounded) v else bf.round32(v);
++    return quantRow(&r, m, window_amax, codes);
++}
++
++/// The rows a launch writes: each quantized alone (the kernel's rule) or, as a mutant, by the window's amax.
++pub fn quantWindow(rows: []const [128]f32, m: Mutant, codes: [][128]u8, scales: []f32) void {
++    var wmax: f32 = 0;
++    for (rows) |r| for (r) |v| {
++        if (std.math.isFinite(v)) wmax = @max(wmax, @abs(v));
++    };
++    for (rows, codes, scales) |r, *c, *s| s.* = quantRow(&r, m, wmax, c);
++}
++
++fn widen(c: u8) f32 {
++    return @floatCast(mr.e4m3Value(c));
++}
++
++fn nmax(a: f32, b: f32) f32 {
++    return if (std.math.isNan(a)) a else if (std.math.isNan(b)) b else if (a > b) a else b;
++}
++
++/// tf_mm3_attn in kv8 mode for one (row, kv head): q [16][128], codes kc, vc [pos + 1][128], scales ks, vs, ids.
++pub fn attend(q: []const f32, kc: []const u8, ks: []const f32, vc: []const u8, vs: []const f32, ids: []const i32, pos: usize, scale: f32, m: Mutant, round: bool, out: []f32) void {
++    for (0..16) |h| {
++        var o: [128]f32 = @splat(0);
++        var mx: f32 = -inf32;
++        var l: f32 = 0;
++        var seen: usize = 0;
++        for (ids) |b| if (b >= 0) {
++            seen += 128;
++        };
++        const tile: usize = if (m == .window_split and seen < 1024) 16 else 32;
++        for (ids) |b| {
++            if (b < 0) break;
++            var k0: usize = 0;
++            while (k0 < 128) : (k0 += tile) {
++                const first = @as(usize, @intCast(b)) * 128 + k0;
++                if (first > pos) break;
++                const nvalid = @min(tile, pos + 1 - first);
++                var sc: [32]f32 = undefined;
++                for (0..nvalid) |j| {
++                    var a: f32 = 0;
++                    for (0..128) |e| a = a + q[h * 128 + e] * widen(kc[(first + j) * 128 + e]);
++                    if (m != .k_scale_missing) a = a * ks[first + j];
++                    sc[j] = a * scale;
++                }
++                var mt = sc[0];
++                for (sc[1..nvalid]) |s| mt = nmax(mt, s);
++                const mn = nmax(mx, mt);
++                const alpha: f32 = if (mx == -inf32) 0 else @exp(mx - mn);
++                l = l * alpha;
++                for (&o) |*x| x.* = x.* * alpha;
++                for (0..nvalid) |j| {
++                    const p = @exp(sc[j] - mn);
++                    l = l + (if (m == .v_scale_on_sum) p * vs[first + j] else p);
++                    const ps = if (m == .v_scale_missing) p else p * vs[first + j];
++                    for (&o, 0..) |*x, e| x.* = x.* + ps * widen(vc[(first + j) * 128 + e]);
++                }
++                mx = mn;
++            }
++        }
++        for (0..128) |e| out[h * 128 + e] = if (round) bf.round32(o[e] / l) else o[e] / l;
++    }
++}
+-- 
+2.43.0
+

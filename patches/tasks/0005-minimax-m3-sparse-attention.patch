@@ -1,0 +1,1823 @@
+From 737a8bb14beafd146db8863eb93abecac1b4cfc8 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:00:10 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: block-sparse attention kernels (T5)
+
+Adds minimax_m3_index.cu (index scores + per-128-key block maxima),
+minimax_m3_select.cu (forced-block top-16, ascending lists; init/local/tie
+rules are launch parameters mirroring minimax_ref.Switches),
+minimax_m3_attn.cu (selected-block GQA attention, 16 q heads share one K/V
+stream, fixed 32-key steps, decode and prompt) over paged K/V/IK addressed by
+page ids (page = 128 tokens). Zig wrapper and std-only geometry module,
+kernel registration, gate-5 launch records from nvcc 13.0.88 compiles, GPU
+contract test types (compile-checked only), and host tests (geometry, block
+boundaries, memory sizing, fp32 host twins vs the float64 reference, planted
+mutant controls) as `zig build test-minimax-sparse`. No GPU has run any kernel.
+Written from the plan's formulas; no third-party code.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/cuda_kernels.zig                   |   3 +
+ zig/build/minimax_ref_host.zig               |  10 +
+ zig/kernels/cuda/minimax_m3_attn.cu          | 127 ++++++
+ zig/kernels/cuda/minimax_m3_index.cu         |  48 +++
+ zig/kernels/cuda/minimax_m3_select.cu        |  81 ++++
+ zig/kernels/cuda/minimax_m3_sparse.cuh       |  49 +++
+ zig/src/core/contract/minimax_m3_records.zig |  16 +
+ zig/src/core/contract/registry.zig           |   2 +-
+ zig/src/cuda/kernels.zig                     |   3 +
+ zig/src/cuda/minimax_m3_geom.zig             | 120 ++++++
+ zig/src/cuda/minimax_m3_sparse.zig           | 142 ++++++
+ zig/src/cuda/root.zig                        |   2 +
+ zig/tests/cuda/contract_minimax_sparse.zig   | 431 +++++++++++++++++++
+ zig/tests/cuda/contract_tests.zig            |  13 +-
+ zig/tests/minimax_sparse_tests.zig           | 415 ++++++++++++++++++
+ zig/tests/minimax_sparse_twin.zig            | 165 +++++++
+ 16 files changed, 1625 insertions(+), 2 deletions(-)
+ create mode 100644 zig/kernels/cuda/minimax_m3_attn.cu
+ create mode 100644 zig/kernels/cuda/minimax_m3_index.cu
+ create mode 100644 zig/kernels/cuda/minimax_m3_select.cu
+ create mode 100644 zig/kernels/cuda/minimax_m3_sparse.cuh
+ create mode 100644 zig/src/core/contract/minimax_m3_records.zig
+ create mode 100644 zig/src/cuda/minimax_m3_geom.zig
+ create mode 100644 zig/src/cuda/minimax_m3_sparse.zig
+ create mode 100644 zig/tests/cuda/contract_minimax_sparse.zig
+ create mode 100644 zig/tests/minimax_sparse_tests.zig
+ create mode 100644 zig/tests/minimax_sparse_twin.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 9315da5..aa953d3 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -105,6 +105,9 @@ pub const kernels = [_]Kernel{
+     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
+     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+     .{ .name = "roce_gather", .src = "roce_gather", .flags = &.{"-O3"} }, // b12x's one-shot RoCE all-gather, two ranks
++    .{ .name = "minimax_m3_index", .flags = glue }, // ours: MiniMax-M3.1-Flash index scores and per-128-key block maxima (cuda/minimax_m3_sparse.zig)
++    .{ .name = "minimax_m3_select", .flags = glue }, // ours: forced-block top-16 with the tie and forcing rules as launch parameters
++    .{ .name = "minimax_m3_attn", .flags = glue }, // ours: selected-block GQA attention over paged K/V, 16 q heads a K/V stream
+     .{ .name = "drama3_staged_gemv", .flags = glue },
+     .{ .name = "drama3", .flags = &.{"-O3"} },
+     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+diff --git a/zig/build/minimax_ref_host.zig b/zig/build/minimax_ref_host.zig
+index b94dec1..2c3c636 100644
+--- a/zig/build/minimax_ref_host.zig
++++ b/zig/build/minimax_ref_host.zig
+@@ -17,4 +17,14 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Mod
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = tests }));
+     b.step("test-minimax-ref", "MiniMax-M3.1-Flash float64 CPU reference tests without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
++    const geom = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/minimax_m3_geom.zig"), .target = host, .optimize = .ReleaseSafe });
++    const sparse = b.createModule(.{
++        .root_source_file = b.path("zig/tests/minimax_sparse_tests.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "mm3_geom", .module = geom } },
++    });
++    const sparse_run = b.addRunArtifact(b.addTest(.{ .root_module = sparse }));
++    b.step("test-minimax-sparse", "MiniMax-M3.1-Flash sparse attention geometry, host twins and launch records without a GPU").dependOn(&sparse_run.step);
++    umbrella.dependOn(&sparse_run.step);
+ }
+diff --git a/zig/kernels/cuda/minimax_m3_attn.cu b/zig/kernels/cuda/minimax_m3_attn.cu
+new file mode 100644
+index 0000000..f7b1851
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_attn.cu
+@@ -0,0 +1,127 @@
++// MiniMax-M3.1-Flash selected-block GQA attention (float64 reference: core/minimax_ref.zig attendBlocks).
++// One CTA per (row, kv head): the 16 query heads of the group share one K/V stream over the row's selected blocks, taken in
++// the select kernel's ascending order, 32 keys at a time with an online softmax. The key order, the 32-key tile and the
++// fp32 chains are fixed by the row's own selection alone, so a row's bits do not depend on the window width, on the other
++// rows of a call, or on whether the call is a decode window or a prompt chunk (pos null: pos0 + r).
++// Keys past the row's position are never read (an unwritten page may hold NaN) and a -1 entry ends the list.
++// Scores: sequential fp32 dot over d = 0..127, then times `scale`; softmax weights expf(s - m) in fp32; P.V in key order.
++#include "minimax_m3_sparse.cuh"
++
++using namespace tf_mm3;
++
++namespace {
++
++constexpr int TILE = 32;     // keys a step
++constexpr int KSTRIDE = 136; // K row stride in shared (bf16): 272 B, 16-byte aligned and not a bank multiple
++
++/// max that propagates a NaN (the float64 reference's softmax does).
++__device__ __forceinline__ float nmax(float a, float b) {
++    if (a != a) return a;
++    if (b != b) return b;
++    return a > b ? a : b;
++}
++
++__device__ __forceinline__ uint32_t pack2(float a, float b) {
++    __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
++    return *reinterpret_cast<uint32_t*>(&v);
++}
++
++} // namespace
++
++extern "C" __global__ void __launch_bounds__(256) tf_mm3_attn(
++    const bf16* __restrict__ q,        // [rows, kvh * 16, 128] post norm and rotary
++    const int* __restrict__ sel,       // [rows, kvh, 16] ascending block ids, -1 padded
++    const int* __restrict__ pos,
++    int pos0,
++    const int* __restrict__ row_tab,
++    const int* __restrict__ tables,
++    const char* __restrict__ pool,
++    long long page_bytes, long long layer_off,
++    int kvh,
++    bf16* __restrict__ out,            // [rows, kvh * 16, 128]
++    float scale) {
++    const int r = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
++    const int h = t >> 4, c = t & 15; // query head of the group, 8-dim slice of its output
++    const int p = row_pos(pos, pos0, r);
++    const int* tab = tables + row_table(row_tab, r);
++    const int* ids = sel + ((long long)r * kvh + g) * TOPK;
++    const long long head = ((long long)r * kvh + g) * GROUP + h;
++
++    __shared__ float sq[GROUP * D];
++    __shared__ __align__(16) bf16 sk[TILE * KSTRIDE];
++    __shared__ __align__(16) bf16 sv[TILE * D];
++    __shared__ float sp[GROUP * TILE];
++
++    {
++        const uint4 w = __ldg(reinterpret_cast<const uint4*>(q + head * D) + c);
++        float* d = sq + h * D + c * 8;
++        d[0] = lo(w.x); d[1] = hi(w.x); d[2] = lo(w.y); d[3] = hi(w.y);
++        d[4] = lo(w.z); d[5] = hi(w.z); d[6] = lo(w.w); d[7] = hi(w.w);
++    }
++    float o[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) o[i] = 0.f;
++    float m = -INFINITY, l = 0.f;
++
++    for (int s = 0; s < TOPK; ++s) {
++        const int b = ids[s];
++        if (b < 0) break;
++        const char* base = page_layer(pool, page_bytes, layer_off, __ldg(tab + b));
++        const bf16* kb = reinterpret_cast<const bf16*>(base) + kv_elem(kvh, 0, g, 0);
++        const bf16* vb = reinterpret_cast<const bf16*>(base) + kv_elem(kvh, 1, g, 0);
++        for (int k0 = 0; k0 < BLOCK; k0 += TILE) {
++            const int nvalid = min(TILE, p + 1 - (b * BLOCK + k0));
++            if (nvalid <= 0) break;
++            __syncthreads();
++            for (int i = t; i < TILE * 16; i += 256) {
++                const int row = i >> 4, vec = i & 15;
++                uint4 kw = make_uint4(0, 0, 0, 0), vw = kw;
++                if (row < nvalid) {
++                    kw = __ldg(reinterpret_cast<const uint4*>(kb + (long long)(k0 + row) * D) + vec);
++                    vw = __ldg(reinterpret_cast<const uint4*>(vb + (long long)(k0 + row) * D) + vec);
++                }
++                *reinterpret_cast<uint4*>(sk + row * KSTRIDE + vec * 8) = kw;
++                *reinterpret_cast<uint4*>(sv + row * D + vec * 8) = vw;
++            }
++            __syncthreads();
++            for (int u = 0; u < 2; ++u) {
++                const int j = c + 16 * u;
++                if (j >= nvalid) continue;
++                const float* qh = sq + h * D;
++                const uint32_t* kr = reinterpret_cast<const uint32_t*>(sk + j * KSTRIDE);
++                float a = 0.f;
++#pragma unroll 8
++                for (int e = 0; e < D / 2; ++e) {
++                    const uint32_t w = kr[e];
++                    a = __fadd_rn(a, __fmul_rn(qh[2 * e], lo(w)));
++                    a = __fadd_rn(a, __fmul_rn(qh[2 * e + 1], hi(w)));
++                }
++                sp[h * TILE + j] = __fmul_rn(a, scale);
++            }
++            __syncthreads();
++            float mt = sp[h * TILE];
++            for (int j = 1; j < nvalid; ++j) mt = nmax(mt, sp[h * TILE + j]);
++            const float mn = nmax(m, mt);
++            const float alpha = (m == -INFINITY) ? 0.f : expf(__fsub_rn(m, mn));
++            l = __fmul_rn(l, alpha);
++#pragma unroll
++            for (int i = 0; i < 8; ++i) o[i] = __fmul_rn(o[i], alpha);
++            for (int j = 0; j < nvalid; ++j) {
++                const float pj = expf(__fsub_rn(sp[h * TILE + j], mn));
++                l = __fadd_rn(l, pj);
++                const uint4 vw = *reinterpret_cast<const uint4*>(sv + j * D + c * 8);
++                o[0] = __fadd_rn(o[0], __fmul_rn(pj, lo(vw.x))); o[1] = __fadd_rn(o[1], __fmul_rn(pj, hi(vw.x)));
++                o[2] = __fadd_rn(o[2], __fmul_rn(pj, lo(vw.y))); o[3] = __fadd_rn(o[3], __fmul_rn(pj, hi(vw.y)));
++                o[4] = __fadd_rn(o[4], __fmul_rn(pj, lo(vw.z))); o[5] = __fadd_rn(o[5], __fmul_rn(pj, hi(vw.z)));
++                o[6] = __fadd_rn(o[6], __fmul_rn(pj, lo(vw.w))); o[7] = __fadd_rn(o[7], __fmul_rn(pj, hi(vw.w)));
++            }
++            m = mn;
++        }
++    }
++    uint4 w;
++    w.x = pack2(__fdiv_rn(o[0], l), __fdiv_rn(o[1], l));
++    w.y = pack2(__fdiv_rn(o[2], l), __fdiv_rn(o[3], l));
++    w.z = pack2(__fdiv_rn(o[4], l), __fdiv_rn(o[5], l));
++    w.w = pack2(__fdiv_rn(o[6], l), __fdiv_rn(o[7], l));
++    reinterpret_cast<uint4*>(out + head * D)[c] = w;
++}
+diff --git a/zig/kernels/cuda/minimax_m3_index.cu b/zig/kernels/cuda/minimax_m3_index.cu
+new file mode 100644
+index 0000000..21496a3
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_index.cu
+@@ -0,0 +1,48 @@
++// MiniMax-M3.1-Flash index scoring and per-128-key block maxima (float64 reference: core/minimax_ref.zig blockScores).
++//   s[j] = (iq[g] . IK[j]) * scale   for keys j <= pos of a row, fp32; bmax[r][g][b] = max over the block's valid keys.
++// One CTA per (block, index head g, row): 4 warps, a warp scores its keys one at a time with the 32 lanes split over the
++// 128 dims (4 each, fixed order) and a fixed xor tree, so a score's bits depend on nothing but its two vectors.
++// NaN rule (stated, matches the reference): fmax drops a NaN key score; a block whose keys are all NaN scores -inf.
++#include "minimax_m3_sparse.cuh"
++
++using namespace tf_mm3;
++
++extern "C" __global__ void __launch_bounds__(128) tf_mm3_index(
++    const bf16* __restrict__ iq,       // [rows, kvh, 128] post norm and rotary
++    const int* __restrict__ pos,       // [rows] or null (pos0 + r)
++    int pos0,
++    const int* __restrict__ row_tab,   // [rows] offsets into tables, or null
++    const int* __restrict__ tables,    // page ids by block
++    const char* __restrict__ pool,
++    long long page_bytes, long long layer_off,
++    int kvh,
++    float* __restrict__ bmax,          // [rows, kvh, bm_stride]
++    int bm_stride,
++    float scale) {
++    const int b = blockIdx.x, g = blockIdx.y, r = blockIdx.z;
++    const int p = row_pos(pos, pos0, r);
++    if (b > p / BLOCK) return;
++    const int page = __ldg(tables + row_table(row_tab, r) + b);
++    const char* base = page_layer(pool, page_bytes, layer_off, page);
++    const bf16* ik = reinterpret_cast<const bf16*>(base) + ik_elem(kvh, 0);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const uint2 qw = __ldg(reinterpret_cast<const uint2*>(iq + ((long long)r * kvh + g) * D) + lane);
++    const float q0 = lo(qw.x), q1 = hi(qw.x), q2 = lo(qw.y), q3 = hi(qw.y);
++    const int valid = min(BLOCK, p + 1 - b * BLOCK);
++    float best = -INFINITY;
++    for (int j = warp; j < valid; j += 4) {
++        const uint2 kw = __ldg(reinterpret_cast<const uint2*>(ik + (long long)j * D) + lane);
++        float a = __fmul_rn(q0, lo(kw.x));
++        a = __fadd_rn(a, __fmul_rn(q1, hi(kw.x)));
++        a = __fadd_rn(a, __fmul_rn(q2, lo(kw.y)));
++        a = __fadd_rn(a, __fmul_rn(q3, hi(kw.y)));
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, o));
++        best = fmaxf(best, __fmul_rn(a, scale));
++    }
++    __shared__ float part[4];
++    if (lane == 0) part[warp] = best;
++    __syncthreads();
++    if (threadIdx.x == 0)
++        bmax[((long long)r * kvh + g) * bm_stride + b] = fmaxf(fmaxf(part[0], part[1]), fmaxf(part[2], part[3]));
++}
+diff --git a/zig/kernels/cuda/minimax_m3_select.cu b/zig/kernels/cuda/minimax_m3_select.cu
+new file mode 100644
+index 0000000..f701db5
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_select.cu
+@@ -0,0 +1,81 @@
++// MiniMax-M3.1-Flash forced-block top-16 (float64 reference: core/minimax_ref.zig forced, topk, selectBlocks).
++// A row with nb = pos / 128 + 1 blocks attends all of them when nb <= 16, else the 16 best by (score desc, then block id
++// by the tie rule) with forced blocks scored +inf. The forcing rules and the tie rule are UNVERIFIED upstream semantics,
++// so they are launch parameters mirroring minimax_ref.Switches: init_n/init_inclusive (sparse_init_block count or
++// inclusive), local_n/local_trailing (sparse_local_block as "own block if > 0" or "trailing window of n"), higher_tie.
++// A NaN block score ranks as -inf (the reference's rule). Output: ascending block ids, -1 padded, per (row, kv head).
++#include "minimax_m3_sparse.cuh"
++
++using namespace tf_mm3;
++
++namespace {
++
++__device__ __forceinline__ bool forced(int b, int own, int init_n, int init_inclusive, int local_n, int local_trailing) {
++    const bool init = init_inclusive ? b <= init_n : b < init_n;
++    const bool local = local_trailing ? (b <= own && own - b < local_n) : (local_n > 0 && b == own);
++    return init || local;
++}
++
++/// True when (sa, ia) ranks strictly before (sb, ib): larger score, then the tie rule's block id.
++__device__ __forceinline__ bool before(float sa, int ia, float sb, int ib, int higher) {
++    return sa > sb || (sa == sb && (higher ? ia > ib : ia < ib));
++}
++
++} // namespace
++
++extern "C" __global__ void __launch_bounds__(256) tf_mm3_select(
++    const float* __restrict__ bmax,    // [rows, kvh, bm_stride]
++    const int* __restrict__ pos,
++    int pos0,
++    int* __restrict__ sel,             // [rows, kvh, 16]
++    int kvh, int bm_stride,
++    int init_n, int init_inclusive, int local_n, int local_trailing, int higher_tie) {
++    const int g = blockIdx.x, r = blockIdx.y;
++    const int p = row_pos(pos, pos0, r);
++    const int nb = p / BLOCK + 1, own = nb - 1;
++    int* out = sel + ((long long)r * kvh + g) * TOPK;
++    const int t = threadIdx.x;
++    if (nb <= TOPK) {
++        if (t < TOPK) out[t] = t < nb ? t : -1;
++        return;
++    }
++    const float* sc = bmax + ((long long)r * kvh + g) * bm_stride;
++    __shared__ float ws[8];
++    __shared__ int wi[8];
++    __shared__ int chosen[TOPK];
++    __shared__ float prev_s;
++    __shared__ int prev_i;
++    for (int k = 0; k < TOPK; ++k) {
++        float bs = -INFINITY;
++        int bi = -1;
++        for (int b = t; b < nb; b += 256) {
++            float s = forced(b, own, init_n, init_inclusive, local_n, local_trailing) ? INFINITY : __ldg(sc + b);
++            if (s != s) s = -INFINITY;
++            if (k > 0 && !before(prev_s, prev_i, s, b, higher_tie)) continue;
++            if (bi < 0 || before(s, b, bs, bi, higher_tie)) { bs = s; bi = b; }
++        }
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) {
++            const float os = __shfl_xor_sync(0xffffffffu, bs, o);
++            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++            if (oi >= 0 && (bi < 0 || before(os, oi, bs, bi, higher_tie))) { bs = os; bi = oi; }
++        }
++        if ((t & 31) == 0) { ws[t >> 5] = bs; wi[t >> 5] = bi; }
++        __syncthreads();
++        if (t == 0) {
++            float s = ws[0];
++            int i = wi[0];
++            for (int w = 1; w < 8; ++w)
++                if (wi[w] >= 0 && (i < 0 || before(ws[w], wi[w], s, i, higher_tie))) { s = ws[w]; i = wi[w]; }
++            chosen[k] = i;
++            prev_s = s;
++            prev_i = i;
++        }
++        __syncthreads();
++    }
++    if (t < TOPK) {
++        int rank = 0;
++        for (int u = 0; u < TOPK; ++u) rank += chosen[u] < chosen[t];
++        out[rank] = chosen[t];
++    }
++}
+diff --git a/zig/kernels/cuda/minimax_m3_sparse.cuh b/zig/kernels/cuda/minimax_m3_sparse.cuh
+new file mode 100644
+index 0000000..2462163
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_sparse.cuh
+@@ -0,0 +1,49 @@
++// MiniMax-M3.1-Flash block-sparse attention: constants and paged addressing shared by minimax_m3_{index,select,attn}.cu.
++// Semantics: core/minimax_ref.zig (float64). Nothing here is copied from another project; written from the formulas in
++// the engine-port plan (section 2, T5).
++//
++// Page = 128 tokens = one selection block. Inside one page and one layer (head-major, bf16):
++//   K[kvh][128 tok][128] | V[kvh][128][128] | IK[128 tok][128]
++// A pool address is  base + page * page_bytes + layer_off + element offset * 2; the kernels take page ids from a block
++// table (tables[row_tab[r] + block]), never an address, so a pool may move or grow between launches.
++#pragma once
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <math.h>
++#include <stdint.h>
++
++namespace tf_mm3 {
++
++constexpr int D = 128;     // head_dim and index_head_dim
++constexpr int BLOCK = 128; // keys a selection block (= tokens a page)
++constexpr int TOPK = 16;   // blocks a row attends (sparse_topk_blocks)
++constexpr int GROUP = 16;  // query heads a kv head (64 / 4)
++
++typedef __nv_bfloat16 bf16;
++
++__device__ __forceinline__ float bf(uint32_t half_bits) { return __uint_as_float(half_bits << 16); }
++__device__ __forceinline__ float lo(uint32_t w) { return __uint_as_float(w << 16); }
++__device__ __forceinline__ float hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
++
++constexpr long long K_ELEMS = (long long)BLOCK * D; // one head's block of K (or V)
++
++/// Element offset (bf16) of K (which 0) or V (which 1) head h, token t inside a page's layer region.
++__device__ __forceinline__ long long kv_elem(int kvh, int which, int h, int t) {
++    return ((long long)which * kvh + h) * K_ELEMS + (long long)t * D;
++}
++
++/// Element offset of index-key token t.
++__device__ __forceinline__ long long ik_elem(int kvh, int t) { return 2LL * kvh * K_ELEMS + (long long)t * D; }
++
++__device__ __forceinline__ const char* page_layer(const char* pool, long long page_bytes, long long layer_off, int page) {
++    return pool + (long long)page * page_bytes + layer_off;
++}
++
++/// A row's position: pos[r], or pos0 + r when pos is null (a prompt chunk of one stream).
++__device__ __forceinline__ int row_pos(const int* pos, int pos0, int r) { return pos ? __ldg(pos + r) : pos0 + r; }
++
++/// Offset of a row's block table in `tables` (row_tab null: one table for every row).
++__device__ __forceinline__ int row_table(const int* row_tab, int r) { return row_tab ? __ldg(row_tab + r) : 0; }
++
++} // namespace tf_mm3
+diff --git a/zig/src/core/contract/minimax_m3_records.zig b/zig/src/core/contract/minimax_m3_records.zig
+new file mode 100644
+index 0000000..32d77a1
+--- /dev/null
++++ b/zig/src/core/contract/minimax_m3_records.zig
+@@ -0,0 +1,16 @@
++//! MiniMax-M3.1-Flash sparse attention CUDA launch records (registry.cuda): nvcc 13.0.88 `cuobjdump --dump-resource-usage` of
++//! each kernel built with the cuda_kernels.zig flags for sm_80, 86, 89, 120 and 121 (sm_120/121 static shared = reported - 1 KiB).
++//! The kernels take no dynamic shared memory. Values come from a compile, not a GPU run.
++const L = @import("limits.zig");
++
++fn u(regs: u32, static: u32, bound: u32) L.Usage {
++    return .{ .regs = regs, .static = static, .bound = bound };
++}
++
++pub fn records(comptime Record: type) [3]Record {
++    return .{
++        .{ .launch = .{ .name = "minimax_m3 tf_mm3_index", .symbol = "tf_mm3_index", .image = "minimax_m3_index", .threads = 128 }, .usage = .{ u(31, 16, 128), u(32, 16, 128), u(32, 16, 128), u(40, 16, 128), u(40, 16, 128) } },
++        .{ .launch = .{ .name = "minimax_m3 tf_mm3_select", .symbol = "tf_mm3_select", .image = "minimax_m3_select", .threads = 256 }, .usage = .{ u(30, 136, 256), u(26, 136, 256), u(26, 136, 256), u(32, 136, 256), u(33, 136, 256) } },
++        .{ .launch = .{ .name = "minimax_m3 tf_mm3_attn", .symbol = "tf_mm3_attn", .image = "minimax_m3_attn", .threads = 256 }, .usage = .{ u(48, 27136, 256), u(79, 27136, 256), u(79, 27136, 256), u(75, 27136, 256), u(75, 27136, 256) } },
++    };
++}
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index faa99bb..0a9fd03 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -192,7 +192,7 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "experts3_prefill down", .symbol = "_ZN19tf_experts3_prefill14prefill_kernelILi1ELi3ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3_prefill", .threads = 256, .dynamic = 47104, .opt_in = true }, .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_widen", .symbol = "tf_experts3_widen", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_planes", .symbol = "tf_experts3_planes", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 } } },
+-} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda;
++} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("minimax_m3_records.zig").records(CudaRecord);
+ 
+ /// The nvcc release `cuda`'s usage records come from: the compiler that builds the release fatbins.
+ pub const cuda_release: limits.Nvcc = .{ .major = 13, .minor = 0 };
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 2b7ff0f..58e7036 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -54,6 +54,9 @@ pub const tree_attention: []const u8 = if (available) &Blob("fatbin_tree_attenti
+ pub const block_attention: []const u8 = if (available) &Blob("fatbin_block_attention").bytes else &.{};
+ pub const window_attention: []const u8 = if (available) &Blob("fatbin_window_attention").bytes else &.{};
+ pub const moe_glue: []const u8 = if (available) &Blob("fatbin_moe_glue").bytes else &.{};
++pub const minimax_m3_index: []const u8 = if (available) &Blob("fatbin_minimax_m3_index").bytes else &.{};
++pub const minimax_m3_select: []const u8 = if (available) &Blob("fatbin_minimax_m3_select").bytes else &.{};
++pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_attn").bytes else &.{};
+ pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
+ pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
+ pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
+diff --git a/zig/src/cuda/minimax_m3_geom.zig b/zig/src/cuda/minimax_m3_geom.zig
+new file mode 100644
+index 0000000..5122d24
+--- /dev/null
++++ b/zig/src/cuda/minimax_m3_geom.zig
+@@ -0,0 +1,120 @@
++//! MiniMax-M3.1-Flash sparse attention: paged cache addressing, launch geometry and memory sizing (std only, host-testable).
++//! Mirrors zig/kernels/cuda/minimax_m3_sparse.cuh; the engine-port plan (sections 2 and 5) gives the numbers.
++const std = @import("std");
++
++pub const d = 128; // head_dim and index_head_dim
++pub const block = 128; // keys a selection block = tokens a page
++pub const topk = 16; // blocks a row attends
++pub const group = 16; // query heads a kv head
++pub const bf16_bytes = 2;
++
++pub const index_threads = 128;
++pub const select_threads = 256;
++pub const attn_threads = 256;
++/// Static shared bytes the attention kernel declares: sq 8 KiB + sk 8.5 KiB + sv 8 KiB + sp 2 KiB (plus 1 KiB reserved).
++pub const attn_static_shared = (group * d + group * 32) * 4 + (32 * 136 + 32 * d) * bf16_bytes;
++/// Scores a block at 1 key a warp step: the index kernel's reduction tree (32 lanes, offsets 16..1) is fixed.
++pub const max_grid_z = 65535;
++
++/// One rank's cache: `kvh` local kv heads (2 of 4 on a two-rank split) and the layers it holds.
++pub const Pool = struct {
++    kvh: usize,
++    layers: usize,
++
++    /// Bytes one page holds for one layer: K and V for each local head, plus the shared index keys.
++    pub fn layerBytes(p: Pool) usize {
++        return block * (2 * p.kvh * d + d) * bf16_bytes;
++    }
++    pub fn pageBytes(p: Pool) usize {
++        return p.layers * p.layerBytes();
++    }
++    pub fn tokenBytes(p: Pool) usize {
++        return p.pageBytes() / block;
++    }
++    pub fn layerOff(p: Pool, layer: usize) usize {
++        return layer * p.layerBytes();
++    }
++    /// Byte offset from the pool base of K (which 0) or V (which 1), local head h, token t of a page, in a layer.
++    pub fn kv(p: Pool, page: usize, layer: usize, which: usize, h: usize, t: usize) usize {
++        return page * p.pageBytes() + p.layerOff(layer) + ((which * p.kvh + h) * block + t) * d * bf16_bytes;
++    }
++    pub fn ik(p: Pool, page: usize, layer: usize, t: usize) usize {
++        return page * p.pageBytes() + p.layerOff(layer) + (2 * p.kvh * block + t) * d * bf16_bytes;
++    }
++    pub fn pagesFor(tokens: usize) usize {
++        return (tokens + block - 1) / block;
++    }
++    /// Cache bytes of a stream holding `tokens` (whole pages).
++    pub fn bytesFor(p: Pool, tokens: usize) usize {
++        return pagesFor(tokens) * p.pageBytes();
++    }
++    /// Most tokens (a whole number of pages) that fit in `bytes`.
++    pub fn tokensFitting(p: Pool, bytes: usize) usize {
++        return bytes / p.pageBytes() * block;
++    }
++};
++
++/// Blocks a row at `pos` can see (the last is its own and may be partial).
++pub fn blocks(pos: usize) usize {
++    return pos / block + 1;
++}
++/// Valid keys of the row's own block (causal): pos % 128 + 1.
++pub fn ownKeys(pos: usize) usize {
++    return pos % block + 1;
++}
++/// Blocks a row attends: all when it has at most 16, else 16.
++pub fn selected(pos: usize) usize {
++    return @min(topk, blocks(pos));
++}
++/// Keys a row attends when its own block is among the selected (always so with the default forcing).
++pub fn keysAttended(pos: usize) usize {
++    return if (blocks(pos) <= topk) pos + 1 else (topk - 1) * block + ownKeys(pos);
++}
++/// 32-key steps the attention kernel runs for that row.
++pub fn attnSteps(pos: usize) usize {
++    const full = (selected(pos) - 1) * (block / 32);
++    return full + (ownKeys(pos) + 31) / 32;
++}
++
++pub const Launch = struct { grid: [3]u32, block: u32, dynamic_shared: u32 = 0 };
++
++/// Scoring: a CTA per (block, kv head, row); `max_pos` is the largest position of the rows.
++pub fn indexLaunch(rows: usize, kvh: usize, max_pos: usize) Launch {
++    return .{ .grid = .{ @intCast(blocks(max_pos)), @intCast(kvh), @intCast(rows) }, .block = index_threads };
++}
++pub fn selectLaunch(rows: usize, kvh: usize) Launch {
++    return .{ .grid = .{ @intCast(kvh), @intCast(rows), 1 }, .block = select_threads };
++}
++pub fn attnLaunch(rows: usize, kvh: usize) Launch {
++    return .{ .grid = .{ @intCast(rows), @intCast(kvh), 1 }, .block = attn_threads };
++}
++
++/// fp32 block maxima [rows, kvh, stride]; the stride is the block-table length (>= blocks(max_pos)).
++pub fn bmaxBytes(rows: usize, kvh: usize, stride: usize) usize {
++    return rows * kvh * stride * 4;
++}
++/// int32 selected-block lists [rows, kvh, 16].
++pub fn selBytes(rows: usize, kvh: usize) usize {
++    return rows * kvh * topk * 4;
++}
++/// IK bytes one scoring pass reads from the cache for a row at `pos` (one shared key head, 256 B a token).
++pub fn indexReadBytes(pos: usize) usize {
++    return (pos + 1) * d * bf16_bytes;
++}
++
++pub const LaunchError = error{ TooManyRows, KvHeads, Empty };
++
++pub fn check(rows: usize, kvh: usize) LaunchError!void {
++    if (rows == 0) return error.Empty;
++    if (rows > max_grid_z) return error.TooManyRows;
++    if (kvh == 0 or kvh > 4) return error.KvHeads;
++}
++
++/// The select kernel's launch arguments; the defaults are core/minimax_ref.zig's Switches defaults (UNVERIFIED upstream).
++pub const Rules = struct {
++    init_n: i32 = 0,
++    init_inclusive: bool = false,
++    local_n: i32 = 1,
++    local_trailing: bool = false,
++    higher_tie: bool = false,
++};
+diff --git a/zig/src/cuda/minimax_m3_sparse.zig b/zig/src/cuda/minimax_m3_sparse.zig
+new file mode 100644
+index 0000000..6960301
+--- /dev/null
++++ b/zig/src/cuda/minimax_m3_sparse.zig
+@@ -0,0 +1,142 @@
++//! MiniMax-M3.1-Flash block-sparse attention launches: index scoring + block maxima, forced-block top-16, selected-block
++//! GQA attention (zig/kernels/cuda/minimax_m3_{index,select,attn}.cu). K/V/IK live in 128-token pages addressed by page
++//! ids from block tables (geometry in minimax_m3_geom.zig). Decode rows come with positions; a prompt chunk is `pos == 0`
++//! and `pos0`. Never run on a GPU in this tree's history: see docs for what is checked.
++const std = @import("std");
++const kernels = @import("kernels.zig");
++const module = @import("module.zig");
++const launch_ = @import("launch.zig");
++const stream_ = @import("stream.zig");
++pub const geom = @import("minimax_m3_geom.zig");
++
++const Driver = @import("driver.zig").Driver;
++const Module = module.Module;
++const Function = module.Function;
++const Stream = stream_.Stream;
++
++/// The paged cache one launch reads: the pool's base, its page and layer strides, local kv heads and the block tables.
++pub const Paged = struct {
++    pool: u64,
++    page_bytes: u64,
++    layer_off: u64,
++    kvh: u32,
++    tables: u64,
++    /// int32 [rows] offsets into `tables`, or 0 when every row uses the table at its start (one stream).
++    row_tab: u64 = 0,
++};
++
++/// Rows of a call: device int32 positions [n], or 0 and `pos0` (rows pos0, pos0 + 1, ... of one stream).
++pub const Rows = struct { n: usize, pos: u64 = 0, pos0: i32 = 0 };
++
++pub const Scratch = struct {
++    /// fp32 [rows, kvh, bm_stride] and int32 [rows, kvh, 16] device buffers.
++    bmax: u64,
++    sel: u64,
++    bm_stride: usize,
++};
++
++pub const Sparse = struct {
++    index_mod: Module,
++    select_mod: Module,
++    attn_mod: Module,
++    index_fn: Function,
++    select_fn: Function,
++    attn_fn: Function,
++
++    pub fn load(d: *const Driver) !Sparse {
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var im = try Module.load(d, kernels.minimax_m3_index);
++        errdefer im.unload();
++        var sm = try Module.load(d, kernels.minimax_m3_select);
++        errdefer sm.unload();
++        var am = try Module.load(d, kernels.minimax_m3_attn);
++        errdefer am.unload();
++        return .{
++            .index_mod = im,
++            .select_mod = sm,
++            .attn_mod = am,
++            .index_fn = try im.function("tf_mm3_index"),
++            .select_fn = try sm.function("tf_mm3_select"),
++            .attn_fn = try am.function("tf_mm3_attn"),
++        };
++    }
++
++    pub fn unload(s: *Sparse) void {
++        s.index_mod.unload();
++        s.select_mod.unload();
++        s.attn_mod.unload();
++    }
++
++    fn cfg(l: geom.Launch) launch_.Config {
++        return .{ .grid = .{ .x = l.grid[0], .y = l.grid[1], .z = l.grid[2] }, .block = .{ .x = l.block }, .shared = l.dynamic_shared };
++    }
++
++    /// iq [rows, kvh, 128] bf16 -> scratch.bmax; `max_pos` bounds the rows' positions (the grid's block count).
++    pub fn score(s: *const Sparse, st: Stream, iq: u64, rows: Rows, p: Paged, sc: Scratch, max_pos: usize, scale: f32) !void {
++        try geom.check(rows.n, p.kvh);
++        if (geom.blocks(max_pos) > sc.bm_stride) return error.TableTooShort;
++        var a: launch_.Args = .{};
++        a.add(iq);
++        a.add(rows.pos);
++        a.add(rows.pos0);
++        a.add(p.row_tab);
++        a.add(p.tables);
++        a.add(p.pool);
++        a.add(@as(i64, @intCast(p.page_bytes)));
++        a.add(@as(i64, @intCast(p.layer_off)));
++        a.add(@as(i32, @intCast(p.kvh)));
++        a.add(sc.bmax);
++        a.add(@as(i32, @intCast(sc.bm_stride)));
++        a.add(scale);
++        try launch_.launch(s.index_fn, cfg(geom.indexLaunch(rows.n, p.kvh, max_pos)), st, &a);
++    }
++
++    /// scratch.bmax -> scratch.sel: ascending block ids per (row, kv head), -1 padded, by the forcing and tie rules.
++    pub fn select(s: *const Sparse, st: Stream, rows: Rows, kvh: usize, sc: Scratch, rules: geom.Rules) !void {
++        try geom.check(rows.n, kvh);
++        var a: launch_.Args = .{};
++        a.add(sc.bmax);
++        a.add(rows.pos);
++        a.add(rows.pos0);
++        a.add(sc.sel);
++        a.add(@as(i32, @intCast(kvh)));
++        a.add(@as(i32, @intCast(sc.bm_stride)));
++        a.add(rules.init_n);
++        a.add(@as(i32, @intFromBool(rules.init_inclusive)));
++        a.add(rules.local_n);
++        a.add(@as(i32, @intFromBool(rules.local_trailing)));
++        a.add(@as(i32, @intFromBool(rules.higher_tie)));
++        try launch_.launch(s.select_fn, cfg(geom.selectLaunch(rows.n, kvh)), st, &a);
++    }
++
++    /// q [rows, kvh * 16, 128] bf16 and scratch.sel -> out [rows, kvh * 16, 128] bf16.
++    pub fn attend(s: *const Sparse, st: Stream, q: u64, rows: Rows, p: Paged, sc: Scratch, out: u64, scale: f32) !void {
++        try geom.check(rows.n, p.kvh);
++        var a: launch_.Args = .{};
++        a.add(q);
++        a.add(sc.sel);
++        a.add(rows.pos);
++        a.add(rows.pos0);
++        a.add(p.row_tab);
++        a.add(p.tables);
++        a.add(p.pool);
++        a.add(@as(i64, @intCast(p.page_bytes)));
++        a.add(@as(i64, @intCast(p.layer_off)));
++        a.add(@as(i32, @intCast(p.kvh)));
++        a.add(out);
++        a.add(scale);
++        try launch_.launch(s.attn_fn, cfg(geom.attnLaunch(rows.n, p.kvh)), st, &a);
++    }
++
++    /// The three launches of one layer's sparse attention, in order, on one stream.
++    pub fn run(s: *const Sparse, st: Stream, iq: u64, q: u64, rows: Rows, p: Paged, sc: Scratch, rules: geom.Rules, max_pos: usize, out: u64) !void {
++        const scale: f32 = @floatCast(std.math.pow(f64, geom.d, -0.5));
++        try s.score(st, iq, rows, p, sc, max_pos, scale);
++        try s.select(st, rows, p.kvh, sc, rules);
++        try s.attend(st, q, rows, p, sc, out, scale);
++    }
++};
++
++test {
++    _ = geom;
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index f80060d..daf7289 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -58,6 +58,7 @@ pub const tree_attention = @import("tree_attention.zig");
+ pub const block_attention = @import("block_attention.zig");
+ pub const window_attention = @import("window_attention.zig");
+ pub const moe_glue = @import("moe_glue.zig");
++pub const minimax_m3_sparse = @import("minimax_m3_sparse.zig");
+ pub const dense_rows = @import("dense_rows.zig");
+ pub const exl3 = @import("exl3.zig");
+ pub const exl3_experts = @import("exl3_experts.zig");
+@@ -114,6 +115,7 @@ test {
+     _ = @import("block_attention.zig");
+     _ = @import("window_attention.zig");
+     _ = @import("moe_glue.zig");
++    _ = @import("minimax_m3_sparse.zig");
+     _ = @import("dense_rows.zig");
+ }
+ 
+diff --git a/zig/tests/cuda/contract_minimax_sparse.zig b/zig/tests/cuda/contract_minimax_sparse.zig
+new file mode 100644
+index 0000000..a07e1af
+--- /dev/null
++++ b/zig/tests/cuda/contract_minimax_sparse.zig
+@@ -0,0 +1,431 @@
++//! MiniMax-M3.1-Flash block-sparse attention under the contract on CUDA: the forced-block top-16 against
++//! core/minimax_ref.zig selectBlocks (a stated, exact rule) and the selected-block GQA attention against attention_ref, head by head,
++//! over paged K/V (page ids from a shuffled block table, the other layer and unwritten tokens poisoned with NaN).
++//! Compile-checked only so far: no GPU has run these. The planted controls for these kernels are the host mutants in
++//! zig/tests/minimax_sparse_tests.zig; no contract_controls.cu kernel exists for them yet.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++const attn = @import("contract_attn.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const mr = core.minimax_ref;
++const sp = cuda.minimax_m3_sparse;
++const geom = sp.geom;
++
++/// Local kv heads, layers in the test pool, and the layer read (the other is NaN).
++const kvh = 2;
++const layers = 2;
++const layer = 1;
++const pool: geom.Pool = .{ .kvh = kvh, .layers = layers };
++
++fn zero(_: c.Shape) usize {
++    return 0;
++}
++
++pub const Variant = struct { name: []const u8, sw: mr.Switches };
++
++pub const variants = [_]Variant{
++    .{ .name = "cuda minimax_m3 tf_mm3_select, own block forced, ties to the lower block", .sw = .{} },
++    .{ .name = "cuda minimax_m3 tf_mm3_select, init block 0 inclusive, trailing window 2, ties to the higher block", .sw = .{ .sparse_init_block = 0, .init_mode = .inclusive, .sparse_local_block = 2, .local_mode = .trailing_window, .tie = .higher_block } },
++};
++
++pub fn rulesOf(sw: mr.Switches) geom.Rules {
++    return .{
++        .init_n = @intCast(sw.sparse_init_block),
++        .init_inclusive = sw.init_mode == .inclusive,
++        .local_n = @intCast(sw.sparse_local_block),
++        .local_trailing = sw.local_mode == .trailing_window,
++        .higher_tie = sw.tie == .higher_block,
++    };
++}
++
++pub fn selectSpec(v: Variant) c.Spec {
++    return .{
++        .name = v.name,
++        .accum = .none,
++        .depth = zero,
++        .out = .raw,
++        .nan = .{ .stated = "a NaN block score ranks as -inf, as minimax_ref.topk; forced blocks are +inf; ties by the switch's block order" },
++        // rows = query rows, n = blocks of the first row (its position's block + 1), k unused
++        .tiles = .{ .{}, .{ .size = geom.topk }, .{} },
++        .served = &.{
++            .{ .rows = 8, .n = 17, .k = 0 },
++            .{ .rows = 1, .n = 1024, .k = 0 },
++            .{ .rows = 4, .n = 16, .k = 0 },
++            .{ .rows = 3, .n = 3, .k = 0 },
++            .{ .rows = 2, .n = 2, .k = 0 },
++        },
++    };
++}
++
++pub const Select = struct {
++    rig: rig_.Rig,
++    f: *const sp.Sparse,
++    v: Variant,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    bm: std.ArrayList(f32) = .empty,
++    pos: std.ArrayList(i32) = .empty,
++    want: std.ArrayList(i32) = .empty,
++    ptr: [3]u64 = @splat(0),
++
++    pub fn deinit(self: *Select) void {
++        const a = self.rig.gpu.gpa;
++        self.bm.deinit(a);
++        self.pos.deinit(a);
++        self.want.deinit(a);
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Select) g.Kernel {
++        return .{ .spec = selectSpec(self.v), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Select);
++
++    /// Row r's block count: the first row's, one fewer for odd rows (never below 1).
++    fn blocksOf(self: *const Select, r: usize) usize {
++        return @max(1, self.shape.n - (r % 2) * @min(1, self.shape.n - 1));
++    }
++
++    pub fn prepare(self: *Select, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.rows == 0 or shape.n == 0 or shape.n > 4096) return false;
++        self.rig.reset();
++        const a = self.rig.gpu.gpa;
++        self.shape = shape;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        const rows = shape.rows;
++        const stride = shape.n;
++        try self.bm.resize(a, rows * kvh * stride);
++        try self.pos.resize(a, rows);
++        try self.want.resize(a, rows * kvh * geom.topk);
++        // small integer scores make ties on both sides of the cut
++        for (self.bm.items) |*x| x.* = @floatFromInt(@as(i32, @intCast(rng.uintLessThan(u32, 9))) - 4);
++        if (fill == .nonfinite) {
++            const special = [_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32), -0.0, 0.0 };
++            for (self.bm.items, 0..) |*x, i| if (i % 7 == 3) {
++                x.* = special[(i / 7) % special.len];
++            };
++        }
++        var scratch: [4096]f64 = undefined;
++        var wide: [4096]f64 = undefined;
++        var rids: [geom.topk]usize = undefined;
++        for (0..rows) |r| {
++            const nb = self.blocksOf(r);
++            self.pos.items[r] = @intCast((nb - 1) * geom.block + (r * 37) % geom.block);
++            for (0..kvh) |h| {
++                const row = self.bm.items[(r * kvh + h) * stride ..][0..nb];
++                for (wide[0..nb], row) |*d, s| d.* = s;
++                const cnt = mr.selectBlocks(wide[0..nb], nb - 1, geom.topk, self.v.sw, &scratch, &rids);
++                const out = self.want.items[(r * kvh + h) * geom.topk ..][0..geom.topk];
++                for (out, 0..) |*o, i| o.* = if (i < cnt) @intCast(rids[i]) else -1;
++            }
++        }
++        self.ptr[0] = try self.rig.input(std.mem.sliceAsBytes(self.bm.items));
++        self.ptr[1] = try self.rig.input(std.mem.sliceAsBytes(self.pos.items));
++        self.ptr[2] = try self.rig.output(self.want.items.len * 4);
++        return true;
++    }
++
++    pub fn run(self: *Select) !void {
++        const sc: sp.Scratch = .{ .bmax = self.ptr[0], .sel = self.ptr[2], .bm_stride = self.shape.n };
++        try self.f.select(self.rig.s, .{ .n = self.shape.rows, .pos = self.ptr[1] }, kvh, sc, rulesOf(self.v.sw));
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Select) usize {
++        return self.want.items.len * 4;
++    }
++
++    pub fn reference(self: *Select, want: []f64, mag: []f64) !void {
++        for (want, mag, std.mem.sliceAsBytes(self.want.items)) |*w, *m, byte| {
++            w.* = @floatFromInt(byte);
++            m.* = 0;
++        }
++    }
++
++    pub fn check(self: *Select, at: g.Gate) !?[]const u8 {
++        _ = at;
++        if (!try self.rig.intact()) return "selection changed a buffer guard";
++        const inputs = try self.rig.inputBytes();
++        const bm = std.mem.sliceAsBytes(self.bm.items);
++        const pos = std.mem.sliceAsBytes(self.pos.items);
++        if (inputs.len != bm.len + pos.len or !std.mem.eql(u8, bm, inputs[0..bm.len]) or !std.mem.eql(u8, pos, inputs[bm.len..])) return "selection changed its scores or positions";
++        const got = try self.rig.outputBytes();
++        return if (std.mem.eql(u8, std.mem.sliceAsBytes(self.want.items), got)) null else "selected block ids differ from minimax_ref.selectBlocks (ascending, -1 padded)";
++    }
++};
++
++/// A decode window (positions given) or a prompt chunk (positions k, k + 1, ...).
++pub const Cfg = struct { name: []const u8, prompt: bool };
++
++pub const cfgs = [_]Cfg{
++    .{ .name = "cuda minimax_m3 tf_mm3_attn decode, 32 q heads over 2 kv heads, paged", .prompt = false },
++    .{ .name = "cuda minimax_m3 tf_mm3_attn prompt chunk, 32 q heads over 2 kv heads, paged", .prompt = true },
++};
++
++fn keyChain(s: c.Shape) usize {
++    return @min(s.k, geom.topk * geom.block) + 32 + 32;
++}
++
++pub fn attnSpec(f: Cfg) c.Spec {
++    return .{
++        .name = f.name,
++        .accum = .f32,
++        .depth = keyChain,
++        .ops = 1,
++        .out = .bf16,
++        // rows, the 32 query heads, and the positions' bound (the last row's position + 1): edges at a block boundary
++        .tiles = .{ .{}, .{}, .{ .size = geom.block, .min = 1 } },
++        .served = &.{ .{ .rows = 16, .n = 32, .k = 3000 }, .{ .rows = 4, .n = 32, .k = 2048 }, .{ .rows = 2, .n = 32, .k = 129 }, .{ .rows = 8, .n = 32, .k = 128 } },
++        .sums = .{ .why = attn.why },
++    };
++}
++
++pub const Attn = struct {
++    rig: rig_.Rig,
++    f: Cfg,
++    s: *const sp.Sparse,
++    r: ?attn.Ref = null,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    pos: std.ArrayList(i32) = .empty,
++    sel: std.ArrayList(i32) = .empty,
++    table: std.ArrayList(i32) = .empty,
++    q: std.ArrayList(u16) = .empty,
++    cache: std.ArrayList(u16) = .empty,
++    dev: [5]u64 = @splat(0),
++    out: u64 = 0,
++    blocks_max: usize = 0,
++
++    pub fn deinit(self: *Attn) void {
++        const a = self.rig.gpu.gpa;
++        if (self.r) |*r| r.deinit();
++        inline for (.{ "pos", "sel", "table", "q", "cache" }) |n| @field(self, n).deinit(a);
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Attn) g.Kernel {
++        return .{ .spec = attnSpec(self.f), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Attn);
++
++    fn posOf(self: *const Attn, r: usize) usize {
++        return @intCast(self.pos.items[r]);
++    }
++
++    fn cell(self: *Attn, page: usize, which: usize, h: usize, t: usize, e: usize) *u16 {
++        return &self.cache.items[(pool.kv(page, layer, which, h, t) >> 1) + e];
++    }
++
++    fn rowOf(self: *Attn, page: usize, which: usize, h: usize, t: usize) []u16 {
++        return self.cache.items[pool.kv(page, layer, which, h, t) >> 1 ..][0..geom.d];
++    }
++
++    pub fn prepare(self: *Attn, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.n != kvh * geom.group or shape.rows == 0 or shape.k == 0 or shape.k + shape.rows > 8192) return false;
++        self.rig.reset();
++        const a = self.rig.gpu.gpa;
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.shape = shape;
++        const n = shape.rows;
++        // positions: a decode window's spread over [0, k), the last at k - 1 (stress: all there); a prompt chunk's k + i
++        try self.pos.resize(a, n);
++        for (self.pos.items, 0..) |*p, i| p.* = @intCast(if (self.f.prompt) shape.k + i else if (fill == .stress or i == n - 1) shape.k - 1 else (i * 7919) % shape.k);
++        var top: usize = 0;
++        for (self.pos.items) |p| top = @max(top, @as(usize, @intCast(p)));
++        const nb = geom.blocks(top);
++        self.blocks_max = nb;
++        // the pool's pages in a shuffled order; the table maps block -> page id
++        const pages = nb + 3;
++        try self.table.resize(a, nb);
++        var perm = try a.alloc(i32, pages);
++        defer a.free(perm);
++        for (perm, 0..) |*x, i| x.* = @intCast(i);
++        rng.shuffle(i32, perm);
++        @memcpy(self.table.items, perm[0..nb]);
++        // the cache: the other layer and every token not yet written are NaN, the read layer random
++        try self.cache.resize(a, pages * pool.pageBytes() / 2);
++        @memset(self.cache.items, c.toBf16(std.math.nan(f32)));
++        for (0..nb) |b| for (0..geom.block) |t| {
++            const page: usize = @intCast(self.table.items[b]);
++            if (b * geom.block + t > top) continue;
++            for (0..2) |w| for (0..kvh) |h| for (0..geom.d) |e| {
++                self.cell(page, w, h, t, e).* = attn.normal(rng);
++            };
++            const ik = (pool.ik(page, layer, t) >> 1);
++            @memset(self.cache.items[ik..][0..geom.d], 0);
++        };
++        // selected lists: every block when a row has at most 16, else its own block and 15 others; ascending, -1 padded
++        try self.sel.resize(a, n * kvh * geom.topk);
++        for (0..n) |r| for (0..kvh) |h| {
++            const own = geom.blocks(self.posOf(r)) - 1;
++            const out = self.sel.items[(r * kvh + h) * geom.topk ..][0..geom.topk];
++            @memset(out, -1);
++            if (own + 1 <= geom.topk) {
++                for (out[0 .. own + 1], 0..) |*o, i| o.* = @intCast(i);
++            } else {
++                var chosen: [geom.topk]i32 = undefined;
++                chosen[0] = @intCast(own);
++                var m: usize = 1;
++                while (m < geom.topk) {
++                    const cand: i32 = @intCast(rng.uintLessThan(usize, own));
++                    if (std.mem.indexOfScalar(i32, chosen[0..m], cand) == null) {
++                        chosen[m] = cand;
++                        m += 1;
++                    }
++                }
++                std.mem.sort(i32, &chosen, {}, std.sort.asc(i32));
++                @memcpy(out, &chosen);
++            }
++        };
++        try self.q.resize(a, n * shape.n * geom.d);
++        for (self.q.items) |*e| e.* = attn.normal(rng);
++        if (self.r) |*r| r.deinit();
++        self.r = null;
++        self.r = try attn.Ref.init(a, geom.d, geom.topk * geom.block);
++        switch (fill) {
++            .random => {},
++            .nonfinite => self.plant(),
++            .stress => try self.stress(rng),
++        }
++        const poolb = std.mem.sliceAsBytes(self.cache.items);
++        for ([_][]const u8{ std.mem.sliceAsBytes(self.q.items), std.mem.sliceAsBytes(self.sel.items), std.mem.sliceAsBytes(self.pos.items), std.mem.sliceAsBytes(self.table.items), poolb }, &self.dev) |bytes, *p| p.* = try self.rig.input(bytes);
++        self.out = try self.rig.output(n * shape.n * geom.d * 2);
++        return true;
++    }
++
++    /// Row r's key list for kv head h: the tokens of its selected blocks up to its position, as (block, token).
++    fn key(self: *const Attn, r: usize, h: usize, i: usize) struct { b: usize, t: usize } {
++        const ids = self.sel.items[(r * kvh + h) * geom.topk ..][0..geom.topk];
++        const p = self.posOf(r);
++        var left = i;
++        for (ids) |b| {
++            if (b < 0) break;
++            const bb: usize = @intCast(b);
++            const valid = @min(geom.block, p + 1 - bb * geom.block);
++            if (left < valid) return .{ .b = bb, .t = left };
++            left -= valid;
++        }
++        unreachable;
++    }
++
++    fn keysOf(self: *const Attn, r: usize) usize {
++        const p = self.posOf(r);
++        var n: usize = 0;
++        for (self.sel.items[(r * kvh) * geom.topk ..][0..geom.topk]) |b| {
++            if (b < 0) break;
++            n += @min(geom.block, p + 1 - @as(usize, @intCast(b)) * geom.block);
++        }
++        return n;
++    }
++
++    /// NaN query; +inf / -inf values in one column; a NaN key; +inf at the first key.
++    fn plant(self: *Attn) void {
++        const n = self.shape.rows;
++        const nan = c.toBf16(std.math.nan(f32));
++        const inf = c.toBf16(std.math.inf(f32));
++        const ninf = c.toBf16(-std.math.inf(f32));
++        self.q.items[3] = nan;
++        const k0 = self.key(0, 0, self.keysOf(0) - 1);
++        self.cell(@intCast(self.table.items[k0.b]), 1, 0, k0.t, 7).* = inf;
++        if (n > 1) {
++            const k1 = self.key(1, 1, self.keysOf(1) - 1);
++            self.cell(@intCast(self.table.items[k1.b]), 1, 1, k1.t, 9).* = ninf;
++        }
++        if (n > 3) {
++            const k3 = self.key(3, 0, 0);
++            self.cell(@intCast(self.table.items[k3.b]), 0, 0, k3.t, 0).* = nan;
++        }
++        if (n > 4) {
++            const k4 = self.key(4, 1, 0);
++            self.cell(@intCast(self.table.items[k4.b]), 1, 1, k4.t, 13).* = inf;
++        }
++    }
++
++    /// Gate 4: every key alike (p = 1), values mirrored over the keys row 0 sees, 0 elsewhere. All rows share one list.
++    fn stress(self: *Attn, rng: std.Random) !void {
++        const n = self.shape.rows;
++        // one list for every row: row 0's
++        for (1..n) |r| @memcpy(self.sel.items[r * kvh * geom.topk ..][0 .. kvh * geom.topk], self.sel.items[0 .. kvh * geom.topk]);
++        const a = self.rig.gpu.gpa;
++        const key0 = try a.alloc(u16, kvh * geom.d);
++        defer a.free(key0);
++        for (key0) |*e| e.* = attn.normal(rng);
++        for (self.table.items) |pg| for (0..geom.block) |t| for (0..kvh) |h| {
++            @memcpy(self.rowOf(@intCast(pg), 0, h, t), key0[h * geom.d ..][0..geom.d]);
++            @memset(self.rowOf(@intCast(pg), 1, h, t), 0);
++        };
++        const nk = self.keysOf(0);
++        const col = try a.alloc(f32, nk);
++        defer a.free(col);
++        for (0..kvh) |h| for (0..geom.d) |e| {
++            attn.mirrored(rng, col);
++            for (col, 0..) |y, i| {
++                const k = self.key(0, h, i);
++                self.cell(@intCast(self.table.items[k.b]), 1, h, k.t, e).* = c.toBf16(y);
++            }
++        };
++        // a row's own-block tokens past row 0's are zero values with equal keys: p = 1 each, V = 0
++    }
++
++    fn paged(self: *const Attn) sp.Paged {
++        return .{ .pool = self.dev[4], .page_bytes = pool.pageBytes(), .layer_off = pool.layerOff(layer), .kvh = kvh, .tables = self.dev[3] };
++    }
++
++    pub fn run(self: *Attn) !void {
++        const n = self.shape.rows;
++        const rows: sp.Rows = if (self.f.prompt) .{ .n = n, .pos0 = @intCast(self.shape.k) } else .{ .n = n, .pos = self.dev[2] };
++        const sc: sp.Scratch = .{ .bmax = 0, .sel = self.dev[1], .bm_stride = 0 };
++        const scale32: f32 = @floatCast(self.scale());
++        try self.s.attend(self.rig.s, self.dev[0], rows, self.paged(), sc, self.out, scale32);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Attn) usize {
++        return self.shape.rows * self.shape.n * geom.d;
++    }
++
++    /// Output head i (row i / 32, head i % 32): the keys of the row's selected blocks up to its position.
++    pub fn load(self: *Attn, i: usize, hd: *attn.Head) !void {
++        const r = i / self.shape.n;
++        const head = i % self.shape.n;
++        const h = head / geom.group;
++        for (hd.q, 0..) |*x, e| x.* = c.fromBf16(self.q.items[i * geom.d + e]);
++        const nk = self.keysOf(r);
++        for (0..nk) |j| {
++            const k = self.key(r, h, j);
++            const page: usize = @intCast(self.table.items[k.b]);
++            for (0..geom.d) |e| {
++                hd.k[j * geom.d + e] = c.fromBf16(self.cell(page, 0, h, k.t, e).*);
++                hd.v[j * geom.d + e] = c.fromBf16(self.cell(page, 1, h, k.t, e).*);
++            }
++        }
++        hd.n = nk;
++    }
++
++    fn heads(self: *Attn) usize {
++        return self.shape.rows * self.shape.n;
++    }
++
++    fn scale(_: *const Attn) f64 {
++        return std.math.pow(f64, geom.d, -0.5);
++    }
++
++    pub fn check(self: *Attn, gate: g.Gate) !?[]const u8 {
++        return self.r.?.check(self, self.heads(), self.scale(), try self.rig.outputBytes(), gate);
++    }
++
++    pub fn reference(self: *Attn, want: []f64, mag: []f64) !void {
++        return self.r.?.reference(self, self.heads(), self.scale(), want, mag);
++    }
++
++    pub fn simulate(self: *Attn, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return self.r.?.simulate(self, self.heads(), self.scale(), acc, order, out);
++    }
++};
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index b5dcebd..2df0f5b 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -38,6 +38,7 @@ const block_k = @import("contract_block_attn.zig");
+ 
+ const window_k = @import("contract_window.zig");
+ const moe_k = @import("contract_moe.zig");
++const mm3_k = @import("contract_minimax_sparse.zig");
+ const qkr_k = @import("contract_qk_round.zig");
+ const fact_k = @import("contract_flashnext_fact.zig");
+ const route_k = @import("contract_route_rows.zig");
+@@ -62,7 +63,7 @@ const h3_image = struct {
+ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
+     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
+-    inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
++    inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "minimax_m3_index", "minimax_m3_select", "minimax_m3_attn", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
+     std.debug.print("FAIL kernel-contract: unknown image name: {s}\n", .{name});
+     return error.UnknownContractImage;
+@@ -318,6 +319,16 @@ pub fn run(gpu: check.Gpu) !void {
+     for (window_k.cfgs, &windows) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .g = &window_fns };
+     defer for (&windows) |*x| x.deinit();
+     for (&windows) |*x| try kernels.append(a, x.kernel());
++    var mm3 = try cuda.minimax_m3_sparse.Sparse.load(gpu.d);
++    defer mm3.unload();
++    var mm3_selects: [mm3_k.variants.len]mm3_k.Select = undefined;
++    for (mm3_k.variants, &mm3_selects) |v, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = &mm3, .v = v };
++    defer for (&mm3_selects) |*x| x.deinit();
++    for (&mm3_selects) |*x| try kernels.append(a, x.kernel());
++    var mm3_attns: [mm3_k.cfgs.len]mm3_k.Attn = undefined;
++    for (mm3_k.cfgs, &mm3_attns) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .s = &mm3 };
++    defer for (&mm3_attns) |*x| x.deinit();
++    for (&mm3_attns) |*x| try kernels.append(a, x.kernel());
+     var moe_fns = try cuda.moe_glue.MoeGlue.load(gpu.d);
+     defer moe_fns.unload();
+     var topks: [moe_k.routes.len]moe_k.TopK = undefined;
+diff --git a/zig/tests/minimax_sparse_tests.zig b/zig/tests/minimax_sparse_tests.zig
+new file mode 100644
+index 0000000..dfb7b56
+--- /dev/null
++++ b/zig/tests/minimax_sparse_tests.zig
+@@ -0,0 +1,415 @@
++//! MiniMax-M3.1-Flash sparse attention, host only: paged addressing, launch and memory arithmetic at block boundaries, the
++//! kernels' host twins against the float64 reference (core/minimax_ref.zig), planted controls, and the gate-5 launch records.
++//! No GPU ran any of this: the CUDA kernels are compile-checked only.
++const std = @import("std");
++const core = @import("core");
++const geom = @import("mm3_geom");
++const twin = @import("minimax_sparse_twin.zig");
++
++const mr = core.minimax_ref;
++const bf = core.bf16_round;
++const testing = std.testing;
++const registry = core.contract.registry;
++
++const gib: usize = 1 << 30;
++const boundary = [_]usize{ 127, 128, 129, 2047, 2048, 2049, 131071 };
++
++test "token bytes: 76,800 a rank for 2 of 4 kv heads over 60 layers, 2,304 a layer for all 4" {
++    const rank: geom.Pool = .{ .kvh = 2, .layers = 60 };
++    try testing.expectEqual(@as(usize, 76_800), rank.tokenBytes());
++    try testing.expectEqual(@as(usize, 9_830_400), rank.pageBytes());
++    try testing.expectEqual(@as(usize, 163_840), rank.layerBytes());
++    const full: geom.Pool = .{ .kvh = 4, .layers = 1 };
++    try testing.expectEqual(@as(usize, 2304), full.tokenBytes());
++}
++
++test "plan section 5: cache sizes and the tokens a 9 to 10 GiB budget holds" {
++    const rank: geom.Pool = .{ .kvh = 2, .layers = 60 };
++    // 32k = 2.34 GiB, 128k = 9.375 GiB, 256k = 18.75 GiB, 1M = 75 GiB
++    try testing.expectEqual(@as(usize, 32768 * 76_800), rank.bytesFor(32768));
++    try testing.expectEqual(@as(usize, 131072 * 76_800), rank.bytesFor(131072));
++    try testing.expectEqual(@as(usize, 9 * gib + gib * 3 / 8), rank.bytesFor(131072));
++    try testing.expectEqual(@as(usize, 75 * gib), rank.bytesFor(1 << 20));
++    try testing.expectEqual(@as(usize, 983 * 128), rank.tokensFitting(9 * gib)); // 125,824
++    try testing.expectEqual(@as(usize, 1092 * 128), rank.tokensFitting(10 * gib)); // 139,776
++    try testing.expect(rank.tokensFitting(9 * gib) < 131072 and rank.tokensFitting(10 * gib) > 131072);
++    try testing.expectEqual(@as(usize, 1), geom.Pool.pagesFor(1));
++    try testing.expectEqual(@as(usize, 1), geom.Pool.pagesFor(128));
++    try testing.expectEqual(@as(usize, 2), geom.Pool.pagesFor(129));
++    try testing.expectEqual(@as(usize, 128 * 76_800), rank.bytesFor(1));
++}
++
++test "plan sections 4-T5 and 5: scratch sizes and the IK bytes scoring reads each token" {
++    try testing.expectEqual(@as(usize, 134_217_728), geom.bmaxBytes(8192, 4, 1024)); // 128 MiB at 128k, all 4 heads
++    try testing.expectEqual(@as(usize, 67_108_864), geom.bmaxBytes(8192, 2, 1024)); // a rank's 2 heads
++    try testing.expectEqual(@as(usize, 8192 * 2 * 16 * 4), geom.selBytes(8192, 2));
++    try testing.expectEqual(@as(usize, 32 << 20), geom.indexReadBytes(131071)); // 32 MiB a layer
++    try testing.expectEqual(@as(usize, 60 * (32 << 20)), 60 * geom.indexReadBytes(131071)); // 1.875 GiB a token
++    try testing.expectEqual(@as(usize, 256), geom.indexReadBytes(0));
++}
++
++test "paged addressing: every (page, layer, K/V/IK, head, token) row is a distinct, gapless 256-byte row of the pool" {
++    const p: geom.Pool = .{ .kvh = 2, .layers = 3 };
++    const pages = 3;
++    const rows = pages * p.pageBytes() / 256;
++    const seen = try testing.allocator.alloc(bool, rows);
++    defer testing.allocator.free(seen);
++    @memset(seen, false);
++    for (0..pages) |pg| for (0..p.layers) |ly| for (0..128) |t| {
++        for (0..2) |w| for (0..p.kvh) |h| mark(seen, p.kv(pg, ly, w, h, t));
++        mark(seen, p.ik(pg, ly, t));
++    };
++    for (seen) |s| try testing.expect(s);
++    try testing.expectEqual(@as(usize, p.layerBytes()), p.layerOff(1));
++    // the three planes of a layer are contiguous: K heads, V heads, IK
++    try testing.expectEqual(p.kv(0, 0, 0, 0, 0) + 2 * 128 * 256, p.kv(0, 0, 1, 0, 0));
++    try testing.expectEqual(p.kv(0, 0, 1, 0, 0) + 2 * 128 * 256, p.ik(0, 0, 0));
++}
++
++fn mark(seen: []bool, byte: usize) void {
++    std.debug.assert(byte % 256 == 0);
++    std.debug.assert(!seen[byte / 256]);
++    seen[byte / 256] = true;
++}
++
++test "block boundaries: blocks, own-block keys, selected blocks, keys attended, steps and launch grids" {
++    const want = [_]struct { nb: usize, own: usize, sel: usize, keys: usize, steps: usize }{
++        .{ .nb = 1, .own = 128, .sel = 1, .keys = 128, .steps = 4 }, // 127: block 0 full
++        .{ .nb = 2, .own = 1, .sel = 2, .keys = 129, .steps = 5 }, // 128: block 1 holds one key
++        .{ .nb = 2, .own = 2, .sel = 2, .keys = 130, .steps = 5 },
++        .{ .nb = 16, .own = 128, .sel = 16, .keys = 2048, .steps = 64 }, // 2047: the last dense row
++        .{ .nb = 17, .own = 1, .sel = 16, .keys = 1921, .steps = 61 }, // 2048: the first row that selects
++        .{ .nb = 17, .own = 2, .sel = 16, .keys = 1922, .steps = 61 },
++        .{ .nb = 1024, .own = 128, .sel = 16, .keys = 2048, .steps = 64 }, // 128k - 1
++    };
++    for (boundary, want) |pos, w| {
++        try testing.expectEqual(w.nb, geom.blocks(pos));
++        try testing.expectEqual(w.own, geom.ownKeys(pos));
++        try testing.expectEqual(w.sel, geom.selected(pos));
++        try testing.expectEqual(w.keys, geom.keysAttended(pos));
++        try testing.expectEqual(w.steps, geom.attnSteps(pos));
++        const il = geom.indexLaunch(3, 2, pos);
++        try testing.expectEqual([3]u32{ @intCast(w.nb), 2, 3 }, il.grid);
++        try testing.expectEqual(@as(u32, 128), il.block);
++    }
++    const sl = geom.selectLaunch(5, 2);
++    try testing.expectEqual([3]u32{ 2, 5, 1 }, sl.grid);
++    try testing.expectEqual(@as(u32, 256), sl.block);
++    const al = geom.attnLaunch(5, 2);
++    try testing.expectEqual([3]u32{ 5, 2, 1 }, al.grid);
++    try testing.expectEqual(@as(u32, 256), al.block);
++    try testing.expectError(error.TooManyRows, geom.check(65536, 2));
++    try testing.expectError(error.Empty, geom.check(0, 2));
++    try geom.check(8192, 4);
++    // the scoring grid covers a window's furthest row: the block count is the max over its rows
++    try testing.expectEqual(@as(u32, 2), geom.indexLaunch(2, 4, 128).grid[0]);
++}
++
++fn bf16v(rng: std.Random, n: usize, sd: f32) ![]f32 {
++    const v = try testing.allocator.alloc(f32, n);
++    for (v) |*x| x.* = bf.round32(rng.floatNorm(f32) * sd);
++    return v;
++}
++
++fn widen(x: []const f32) ![]f64 {
++    const o = try testing.allocator.alloc(f64, x.len);
++    for (o, x) |*d, s| d.* = s;
++    return o;
++}
++
++const scale64 = 0.08838834764831845; // 128^-0.5
++const scale32: f32 = @floatCast(scale64);
++
++fn rulesOf(sw: mr.Switches) geom.Rules {
++    return .{
++        .init_n = @intCast(sw.sparse_init_block),
++        .init_inclusive = sw.init_mode == .inclusive,
++        .local_n = @intCast(sw.sparse_local_block),
++        .local_trailing = sw.local_mode == .trailing_window,
++        .higher_tie = sw.tie == .higher_block,
++    };
++}
++
++/// Scores, selects and attends one row at `pos` with the twins, and checks every stage against float64.
++fn row(pos: usize, seed: u64, compact: bool) !void {
++    var prng = std.Random.DefaultPrng.init(seed);
++    const rng = prng.random();
++    const n = pos + 1;
++    const iq = try bf16v(rng, 128, 1);
++    defer testing.allocator.free(iq);
++    const ik = try bf16v(rng, n * 128, 1);
++    defer testing.allocator.free(ik);
++    const iq64 = try widen(iq);
++    defer testing.allocator.free(iq64);
++    const ik64 = try widen(ik);
++    defer testing.allocator.free(ik64);
++    const nb = geom.blocks(pos);
++    const t_bm = try testing.allocator.alloc(f32, nb);
++    defer testing.allocator.free(t_bm);
++    const r_bm = try testing.allocator.alloc(f64, nb);
++    defer testing.allocator.free(r_bm);
++    try testing.expectEqual(nb, twin.blockMax(iq, ik, pos, scale32, .none, t_bm));
++    try testing.expectEqual(nb, mr.blockScores(iq64, ik64, pos, 128, scale64, 128, r_bm));
++    for (t_bm, r_bm) |t, r| try testing.expectApproxEqAbs(r, @as(f64, t), 1e-5 * (1 + @abs(r)));
++
++    // select on the twin's own fp32 maxima so the tie order is comparable bit for bit
++    const sw: mr.Switches = .{};
++    var ids: [geom.topk]i32 = undefined;
++    twin.select(t_bm, pos, rulesOf(sw), .none, &ids);
++    const tb64 = try widen(t_bm);
++    defer testing.allocator.free(tb64);
++    var scratch: [1024]f64 = undefined;
++    var rids: [geom.topk]usize = undefined;
++    const cnt = mr.selectBlocks(tb64, nb - 1, geom.topk, sw, &scratch, &rids);
++    try testing.expectEqual(geom.selected(pos), cnt);
++    for (0..cnt) |i| try testing.expectEqual(@as(i32, @intCast(rids[i])), ids[i]);
++    for (ids[cnt..]) |x| try testing.expectEqual(@as(i32, -1), x);
++    try testing.expectEqual(@as(i32, @intCast(nb - 1)), ids[cnt - 1]); // the own block is selected, and is the last
++
++    // attention over the selected keys
++    const q = try bf16v(rng, geom.group * 128, 1);
++    defer testing.allocator.free(q);
++    const q64 = try widen(q);
++    defer testing.allocator.free(q64);
++    var keys: [geom.topk * 128]usize = undefined;
++    var o64: [geom.group * 128]f64 = undefined;
++    var o32: [geom.group * 128]f32 = undefined;
++    if (!compact) {
++        const kk = try bf16v(rng, n * 128, 1);
++        defer testing.allocator.free(kk);
++        const vv = try bf16v(rng, n * 128, 1);
++        defer testing.allocator.free(vv);
++        const k64 = try widen(kk);
++        defer testing.allocator.free(k64);
++        const v64 = try widen(vv);
++        defer testing.allocator.free(v64);
++        mr.attendBlocks(q64, k64, v64, rids[0..cnt], pos, 128, 128, geom.group, &keys, &o64);
++        twin.attend(q, kk, vv, ids[0..cnt], pos, scale32, .none, &o32);
++        try closeBf16(&o64, &o32);
++        // fixed split: the same row alone, again, and padded with -1 entries gives the same bits
++        var again: [geom.group * 128]f32 = undefined;
++        twin.attend(q, kk, vv, &ids, pos, scale32, .none, &again);
++        try testing.expectEqualSlices(f32, &o32, &again);
++    } else {
++        // 128k - 1: only the 16 selected blocks matter; gather them in order and attend at the compacted position
++        const kk = try bf16v(rng, geom.topk * 128 * 128, 1);
++        defer testing.allocator.free(kk);
++        const vv = try bf16v(rng, geom.topk * 128 * 128, 1);
++        defer testing.allocator.free(vv);
++        const k64 = try widen(kk);
++        defer testing.allocator.free(k64);
++        const v64 = try widen(vv);
++        defer testing.allocator.free(v64);
++        const cpos = (geom.topk - 1) * 128 + pos % 128;
++        var cids: [geom.topk]i32 = undefined;
++        var crids: [geom.topk]usize = undefined;
++        for (&cids, &crids, 0..) |*c, *r, i| {
++            c.* = @intCast(i);
++            r.* = i;
++        }
++        mr.attendBlocks(q64, k64, v64, &crids, cpos, 128, 128, geom.group, &keys, &o64);
++        twin.attend(q, kk, vv, &cids, cpos, scale32, .none, &o32);
++        try closeBf16(&o64, &o32);
++    }
++}
++
++fn closeBf16(want: []const f64, got: []const f32) !void {
++    var big: f64 = 0;
++    for (want) |w| big = @max(big, @abs(w));
++    for (want, got) |w, g| try testing.expectApproxEqAbs(w, @as(f64, g), 0.01 * big + 1e-6);
++}
++
++test "twins of index, select and attention match float64 at pos 127, 128, 129, 2047, 2048, 2049" {
++    for (boundary[0..6], 0..) |pos, i| try row(pos, 100 + i, false);
++}
++
++test "twins match float64 at pos 131071 (1024 blocks): scores and selection on the whole cache, attention on the selected blocks" {
++    try row(131071, 7, true);
++}
++
++test "select twin equals the reference for every forcing, local and tie switch over tie-heavy, NaN and infinite scores" {
++    var prng = std.Random.DefaultPrng.init(55);
++    const rng = prng.random();
++    var scratch: [1024]f64 = undefined;
++    var trials: usize = 0;
++    for ([_]mr.InitBlocks{ .count, .inclusive }) |im| for ([_]mr.LocalBlocks{ .own_block_if_positive, .trailing_window }) |lm| {
++        for ([_]mr.Tie{ .lower_block, .higher_block }) |tie| for (0..3) |init_n| for (0..4) |local_n| {
++            const sw: mr.Switches = .{ .init_mode = im, .local_mode = lm, .tie = tie, .sparse_init_block = init_n, .sparse_local_block = local_n };
++            for (0..40) |_| {
++                const nb = 17 + rng.uintLessThan(usize, 90);
++                const pos = (nb - 1) * 128 + rng.uintLessThan(usize, 128);
++                var bm: [128]f32 = undefined;
++                const palette = [_]f32{ -1, 0, 0.5, 0.5, 1, 1, 2, nan32, inf32, -inf32 };
++                for (bm[0..nb]) |*x| x.* = palette[rng.uintLessThan(usize, palette.len)];
++                var got: [geom.topk]i32 = undefined;
++                twin.select(bm[0..nb], pos, rulesOf(sw), .none, &got);
++                var b64: [128]f64 = undefined;
++                for (b64[0..nb], bm[0..nb]) |*d, s| d.* = s;
++                var rids: [geom.topk]usize = undefined;
++                _ = mr.selectBlocks(b64[0..nb], nb - 1, geom.topk, sw, &scratch, &rids);
++                for (rids, got) |a, b| try testing.expectEqual(@as(i32, @intCast(a)), b);
++                for (got[1..], got[0 .. got.len - 1]) |a, b| try testing.expect(a > b); // strictly ascending
++                trials += 1;
++            }
++        };
++    };
++    try testing.expectEqual(@as(usize, 2 * 2 * 2 * 3 * 4 * 40), trials);
++}
++
++const nan32 = std.math.nan(f32);
++const inf32 = std.math.inf(f32);
++
++test "forcing semantics are launch parameters: block 0 forced by inclusive init, own block off when local is 0" {
++    var bm: [20]f32 = undefined;
++    for (&bm, 0..) |*x, i| x.* = @floatFromInt(i); // block 19 (own) scores highest, block 0 lowest
++    var out: [geom.topk]i32 = undefined;
++    const pos = 19 * 128 + 5;
++    twin.select(&bm, pos, .{}, .none, &out); // default: no init, own forced: 4..19
++    try testing.expectEqual(@as(i32, 4), out[0]);
++    twin.select(&bm, pos, .{ .init_n = 0, .init_inclusive = true }, .none, &out); // block 0 forced: 0, 5..19
++    try testing.expectEqual(@as(i32, 0), out[0]);
++    try testing.expectEqual(@as(i32, 5), out[1]);
++    bm[19] = -5; // own block scores lowest: forced when local_n > 0, dropped when 0
++    twin.select(&bm, pos, .{}, .none, &out);
++    try testing.expectEqual(@as(i32, 19), out[15]);
++    twin.select(&bm, pos, .{ .local_n = 0 }, .none, &out);
++    try testing.expect(out[15] != 19);
++}
++
++fn must(ok: bool, src: std.builtin.SourceLocation) !void {
++    if (!ok) {
++        std.debug.print("control check failed at line {d}\n", .{src.line});
++        return error.TestUnexpectedResult;
++    }
++}
++
++fn padded(head: []const i32) [geom.topk]i32 {
++    var o: [geom.topk]i32 = @splat(-1);
++    @memcpy(o[0..head.len], head);
++    return o;
++}
++
++fn differs(a: []const i32, b: []const i32) bool {
++    return !std.mem.eql(i32, a, b);
++}
++
++test "planted controls: each mutant is caught by the check that the real twin passes" {
++    var prng = std.Random.DefaultPrng.init(9);
++    const rng = prng.random();
++    var scratch: [1024]f64 = undefined;
++    // no_forcing and tie_flipped: caught against the reference on tie-heavy rows; the real twin never differs
++    var caught = [_]bool{ false, false };
++    for (0..400) |_| {
++        const nb = 17 + rng.uintLessThan(usize, 30);
++        const pos = (nb - 1) * 128 + rng.uintLessThan(usize, 128);
++        var bm: [64]f32 = undefined;
++        for (bm[0..nb]) |*x| x.* = @floatFromInt(rng.uintLessThan(u8, 4)); // ties; the own block rarely wins on score
++        var b64: [64]f64 = undefined;
++        for (b64[0..nb], bm[0..nb]) |*d, s| d.* = s;
++        var rids: [geom.topk]usize = undefined;
++        _ = mr.selectBlocks(b64[0..nb], nb - 1, geom.topk, .{}, &scratch, &rids);
++        var want: [geom.topk]i32 = undefined;
++        for (&want, rids) |*w, r| w.* = @intCast(r);
++        var got: [geom.topk]i32 = undefined;
++        twin.select(bm[0..nb], pos, .{}, .none, &got);
++        try must(!differs(&want, &got), @src());
++        twin.select(bm[0..nb], pos, .{}, .no_forcing, &got);
++        caught[0] = caught[0] or differs(&want, &got);
++        twin.select(bm[0..nb], pos, .{}, .tie_flipped, &got);
++        caught[1] = caught[1] or differs(&want, &got);
++    }
++    try must(caught[0] and caught[1], @src());
++
++    // drop_tail: pos 128 puts one key in block 1; dropping it turns a finite maximum into -inf
++    const ik = try bf16v(rng, 129 * 128, 1);
++    defer testing.allocator.free(ik);
++    const iq = try bf16v(rng, 128, 1);
++    defer testing.allocator.free(iq);
++    var good: [2]f32 = undefined;
++    var bad: [2]f32 = undefined;
++    _ = twin.blockMax(iq, ik, 128, scale32, .none, &good);
++    _ = twin.blockMax(iq, ik, 128, scale32, .drop_tail, &bad);
++    try must(std.math.isFinite(good[1]) and bad[1] == -inf32, @src());
++
++    // nan_poison: one NaN key in block 0; fmax drops it (the reference's rule), the mutant yields NaN
++    ik[5 * 128 + 3] = nan32;
++    _ = twin.blockMax(iq, ik, 127, scale32, .none, good[0..1]);
++    _ = twin.blockMax(iq, ik, 127, scale32, .nan_poison, bad[0..1]);
++    try must(std.math.isFinite(good[0]) and std.math.isNan(bad[0]), @src());
++    var i64s: [128 * 128]f64 = undefined;
++    for (&i64s, ik[0 .. 128 * 128]) |*d, s| d.* = s;
++    var q64: [128]f64 = undefined;
++    for (&q64, iq) |*d, s| d.* = s;
++    var r0: [1]f64 = undefined;
++    _ = mr.blockScores(&q64, &i64s, 127, 128, scale64, 128, &r0);
++    try must(std.math.isFinite(r0[0]), @src());
++
++    // window_split: a 16-key tile for short rows changes bits; the fixed 32-key twin repeats exactly
++    const pos = 4 * 128 + 9;
++    const k = try bf16v(rng, (pos + 1) * 128, 1);
++    defer testing.allocator.free(k);
++    const v = try bf16v(rng, (pos + 1) * 128, 1);
++    defer testing.allocator.free(v);
++    const q = try bf16v(rng, geom.group * 128, 1);
++    defer testing.allocator.free(q);
++    const ids = padded(&.{ 0, 1, 2, 3, 4 });
++    var a: [geom.group * 128]f32 = undefined;
++    var b: [geom.group * 128]f32 = undefined;
++    var c: [geom.group * 128]f32 = undefined;
++    twin.attendRaw(q, k, v, &ids, pos, scale32, .none, &a);
++    twin.attendRaw(q, k, v, &ids, pos, scale32, .none, &b);
++    twin.attendRaw(q, k, v, &ids, pos, scale32, .window_split, &c);
++    try testing.expectEqualSlices(f32, &a, &b);
++    try must(!std.mem.eql(f32, &a, &c), @src());
++}
++
++test "attention propagates a NaN query like the float64 reference" {
++    var prng = std.Random.DefaultPrng.init(3);
++    const rng = prng.random();
++    const pos = 300;
++    const k = try bf16v(rng, (pos + 1) * 128, 1);
++    defer testing.allocator.free(k);
++    const v = try bf16v(rng, (pos + 1) * 128, 1);
++    defer testing.allocator.free(v);
++    const q = try bf16v(rng, geom.group * 128, 1);
++    defer testing.allocator.free(q);
++    q[7] = nan32; // head 0
++    const ids = padded(&.{ 0, 1, 2 });
++    var o: [geom.group * 128]f32 = undefined;
++    twin.attend(q, k, v, &ids, pos, scale32, .none, &o);
++    for (o[0..128]) |x| try testing.expect(std.math.isNan(x));
++    for (o[128..256]) |x| try testing.expect(std.math.isFinite(x));
++}
++
++test "gate 5: the three launches are registered, match the geometry, and fit every chip" {
++    const want = [_]struct { sym: []const u8, image: []const u8, threads: u32, static: u32 }{
++        .{ .sym = "tf_mm3_index", .image = "minimax_m3_index", .threads = geom.index_threads, .static = 16 },
++        .{ .sym = "tf_mm3_select", .image = "minimax_m3_select", .threads = geom.select_threads, .static = 136 },
++        .{ .sym = "tf_mm3_attn", .image = "minimax_m3_attn", .threads = geom.attn_threads, .static = geom.attn_static_shared },
++    };
++    var mine: [3]registry.CudaRecord = undefined;
++    for (want, &mine) |w, *m| {
++        const rec = for (registry.cuda) |r| {
++            if (std.mem.eql(u8, r.launch.symbol, w.sym)) break r;
++        } else return error.RecordMissing;
++        try testing.expectEqualStrings(w.image, rec.launch.image);
++        try testing.expectEqual(w.threads, rec.launch.threads);
++        try testing.expectEqual(@as(u32, 0), rec.launch.dynamic);
++        for (rec.usage) |u| {
++            try testing.expectEqual(w.static, u.static);
++            try testing.expectEqual(w.threads, u.bound);
++            try testing.expect(u.regs * w.threads <= 65536); // a block's registers fit the file
++        }
++        m.* = rec;
++        var found = false;
++        for (registry.all_cuda) |r| found = found or std.mem.eql(u8, r.launch.symbol, w.sym);
++        try testing.expect(found);
++    }
++    try testing.expectEqual(@as(usize, 0), try registry.checkCuda(testing.allocator, &mine, true));
++    // shared bytes the attention kernel declares: 8 KiB q + 8.5 KiB K tile + 8 KiB V tile + 2 KiB p
++    try testing.expectEqual(@as(usize, 27_136), geom.attn_static_shared);
++    // a planted control: the same launch asking for more threads than its bound must be reported
++    var over = mine[2];
++    over.launch.threads = 512;
++    try testing.expect(try registry.checkCuda(testing.allocator, &.{over}, true) > 0);
++}
+diff --git a/zig/tests/minimax_sparse_twin.zig b/zig/tests/minimax_sparse_twin.zig
+new file mode 100644
+index 0000000..3fbcd1c
+--- /dev/null
++++ b/zig/tests/minimax_sparse_twin.zig
+@@ -0,0 +1,165 @@
++//! Host twins of zig/kernels/cuda/minimax_m3_{index,select,attn}.cu: the same fp32 operation order, written in Zig (no fused
++//! multiply-add, as the kernels build with --fmad=false), plus planted mutants ("controls") that each break one rule. The
++//! kernels themselves have not run; a twin only shows the algorithm and its order are right and that the checks have teeth.
++const std = @import("std");
++const core = @import("core");
++const geom = @import("mm3_geom");
++
++const bf = core.bf16_round;
++const nan32 = std.math.nan(f32);
++const inf32 = std.math.inf(f32);
++
++pub const Mutant = enum {
++    none,
++    /// The block maximum skips the last valid key (a partial tail dropped).
++    drop_tail,
++    /// A NaN key score poisons the block maximum instead of being dropped by fmax.
++    nan_poison,
++    /// The own block is not forced.
++    no_forcing,
++    /// The tie rule is flipped.
++    tie_flipped,
++    /// The attention's key tile depends on how many keys the row sees (a window-dependent split).
++    window_split,
++};
++
++/// One score as tf_mm3_index computes it: 32 lanes of 4 dims in order, then the xor tree 16, 8, 4, 2, 1; times scale.
++pub fn score(iq: []const f32, ik: []const f32, scale: f32) f32 {
++    var lane: [32]f32 = undefined;
++    for (&lane, 0..) |*s, l| {
++        var a = iq[4 * l] * ik[4 * l];
++        a = a + iq[4 * l + 1] * ik[4 * l + 1];
++        a = a + iq[4 * l + 2] * ik[4 * l + 2];
++        a = a + iq[4 * l + 3] * ik[4 * l + 3];
++        s.* = a;
++    }
++    var o: usize = 16;
++    while (o > 0) : (o >>= 1) {
++        var next: [32]f32 = undefined;
++        for (&next, 0..) |*n, l| n.* = lane[l] + lane[l ^ o];
++        lane = next;
++    }
++    return lane[0] * scale;
++}
++
++/// Block maxima of one index head over ik [pos + 1, 128]; returns the block count.
++pub fn blockMax(iq: []const f32, ik: []const f32, pos: usize, scale: f32, m: Mutant, out: []f32) usize {
++    const nb = geom.blocks(pos);
++    for (out[0..nb], 0..) |*o, b| {
++        var valid = @min(geom.block, pos + 1 - b * geom.block);
++        if (m == .drop_tail and valid > 0) valid -= 1;
++        var best: f32 = -inf32;
++        for (0..valid) |j| {
++            const s = score(iq, ik[(b * geom.block + j) * 128 ..][0..128], scale);
++            if (m == .nan_poison) {
++                if (std.math.isNan(s) or std.math.isNan(best)) best = nan32 else best = @max(best, s);
++            } else best = @max(best, s); // fmaxf: a NaN operand yields the other
++        }
++        o.* = best;
++    }
++    return nb;
++}
++
++fn forced(b: i32, own: i32, r: geom.Rules) bool {
++    const init = if (r.init_inclusive) b <= r.init_n else b < r.init_n;
++    const local = if (r.local_trailing) (b <= own and own - b < r.local_n) else (r.local_n > 0 and b == own);
++    return init or local;
++}
++
++fn before(sa: f32, ia: i32, sb: f32, ib: i32, higher: bool) bool {
++    return sa > sb or (sa == sb and (if (higher) ia > ib else ia < ib));
++}
++
++/// tf_mm3_select for one (row, head): ascending ids, -1 padded.
++pub fn select(bmax: []const f32, pos: usize, rules: geom.Rules, m: Mutant, out: *[geom.topk]i32) void {
++    const nb: i32 = @intCast(geom.blocks(pos));
++    const own = nb - 1;
++    var r = rules;
++    if (m == .no_forcing) {
++        r.local_n = 0;
++        r.init_n = 0;
++        r.init_inclusive = false;
++    }
++    if (m == .tie_flipped) r.higher_tie = !r.higher_tie;
++    if (nb <= geom.topk) {
++        for (out, 0..) |*o, t| o.* = if (t < nb) @intCast(t) else -1;
++        return;
++    }
++    var chosen: [geom.topk]i32 = undefined;
++    var prev_s: f32 = 0;
++    var prev_i: i32 = 0;
++    for (0..geom.topk) |k| {
++        var bs: f32 = -inf32;
++        var bi: i32 = -1;
++        var b: i32 = 0;
++        while (b < nb) : (b += 1) {
++            var s: f32 = if (forced(b, own, r)) inf32 else bmax[@intCast(b)];
++            if (std.math.isNan(s)) s = -inf32;
++            if (k > 0 and !before(prev_s, prev_i, s, b, r.higher_tie)) continue;
++            if (bi < 0 or before(s, b, bs, bi, r.higher_tie)) {
++                bs = s;
++                bi = b;
++            }
++        }
++        chosen[k] = bi;
++        prev_s = bs;
++        prev_i = bi;
++    }
++    for (&chosen, 0..) |c, t| {
++        var rank: usize = 0;
++        for (chosen) |u| rank += @intFromBool(u < chosen[t]);
++        out[rank] = c;
++    }
++}
++
++/// tf_mm3_attn for one (row, kv head): q [16][128] (bf16 values in f32), k and v [pos + 1][128] of that head, ids from select.
++/// Returns out [16][128] rounded to bf16 values. `m == .window_split` uses a 16-key tile when the row sees under 1024 keys.
++pub fn attend(q: []const f32, k: []const f32, v: []const f32, ids: []const i32, pos: usize, scale: f32, m: Mutant, out: []f32) void {
++    attendImpl(q, k, v, ids, pos, scale, m, true, out);
++}
++
++/// The same with the fp32 result before the bf16 store, where a tile change shows (bf16 hides most fp32-level differences).
++pub fn attendRaw(q: []const f32, k: []const f32, v: []const f32, ids: []const i32, pos: usize, scale: f32, m: Mutant, out: []f32) void {
++    attendImpl(q, k, v, ids, pos, scale, m, false, out);
++}
++
++fn attendImpl(q: []const f32, k: []const f32, v: []const f32, ids: []const i32, pos: usize, scale: f32, m: Mutant, round: bool, out: []f32) void {
++    for (0..geom.group) |h| {
++        var o: [128]f32 = @splat(0);
++        var mx: f32 = -inf32;
++        var l: f32 = 0;
++        var seen: usize = 0;
++        for (ids) |b| if (b >= 0) {
++            seen += 128;
++        };
++        const tile: usize = if (m == .window_split and seen < 1024) 16 else 32;
++        for (ids) |b| {
++            if (b < 0) break;
++            var k0: usize = 0;
++            while (k0 < geom.block) : (k0 += tile) {
++                const first = @as(usize, @intCast(b)) * geom.block + k0;
++                if (first > pos) break;
++                const nvalid = @min(tile, pos + 1 - first);
++                var sc: [32]f32 = undefined;
++                for (0..nvalid) |j| {
++                    var a: f32 = 0;
++                    for (0..128) |e| a = a + q[h * 128 + e] * k[(first + j) * 128 + e];
++                    sc[j] = a * scale;
++                }
++                var mt = sc[0];
++                for (sc[1..nvalid]) |s| mt = if (std.math.isNan(mt)) mt else if (std.math.isNan(s)) s else if (mt > s) mt else s;
++                const mn = if (std.math.isNan(mx)) mx else if (std.math.isNan(mt)) mt else if (mx > mt) mx else mt;
++                const alpha: f32 = if (mx == -inf32) 0 else @exp(mx - mn);
++                l = l * alpha;
++                for (&o) |*x| x.* = x.* * alpha;
++                for (0..nvalid) |j| {
++                    const p = @exp(sc[j] - mn);
++                    l = l + p;
++                    for (&o, 0..) |*x, e| x.* = x.* + p * v[(first + j) * 128 + e];
++                }
++                mx = mn;
++            }
++        }
++        for (0..128) |e| out[h * 128 + e] = if (round) bf.round32(o[e] / l) else o[e] / l;
++    }
++}
+-- 
+2.43.0
+

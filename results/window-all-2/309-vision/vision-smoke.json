@@ -1,0 +1,150 @@
+{
+  "label": "",
+  "started": "2026-10-26T02:13:50+0700",
+  "config": {
+    "command": "smoke",
+    "base": "http://127.0.0.1:8000",
+    "model": "MiniMax-M3.1-Flash-EXL3",
+    "timeout": 600,
+    "out": "out/windowall2-20261025T172620Z/309-vision/vision-smoke.json",
+    "label": "",
+    "max_images": 4,
+    "max_image_mb": 10.0,
+    "vision_urls": false,
+    "reps": 3,
+    "sizes": "small,square,wide",
+    "suites": "timing,vqa",
+    "max_tokens": 256,
+    "min_accuracy": 0.0,
+    "engine_api_tools": null,
+    "api_tools": true
+  },
+  "ok": true,
+  "passed": 9,
+  "total": 9,
+  "cases": [
+    {
+      "case": "describe",
+      "ok": true,
+      "problems": [],
+      "seconds": 1.54,
+      "detail": {
+        "content": "A solid red circle on a white background.",
+        "usage": {
+          "prompt_tokens": 479,
+          "completion_tokens": 10,
+          "total_tokens": 489,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        }
+      }
+    },
+    {
+      "case": "describe-anthropic",
+      "ok": true,
+      "problems": [],
+      "seconds": 1.46,
+      "detail": {
+        "content": "A solid blue square on a white background.",
+        "usage": {
+          "input_tokens": 479,
+          "output_tokens": 10,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          }
+        }
+      }
+    },
+    {
+      "case": "tool",
+      "ok": true,
+      "problems": [],
+      "seconds": 2.73,
+      "detail": {
+        "tool_choice": "required",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_4f79b65565f5836c7ebdfb69",
+            "type": "function",
+            "function": {
+              "name": "record_color",
+              "arguments": "{\"color\":\"green\"}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case": "refuse-bytes",
+      "ok": true,
+      "problems": [],
+      "seconds": 0.15,
+      "detail": {
+        "status": 400,
+        "error": "image data URL exceeds the encoded byte limit",
+        "seconds": 0.03
+      }
+    },
+    {
+      "case": "refuse-count",
+      "ok": true,
+      "problems": [],
+      "seconds": 0.0,
+      "detail": {
+        "status": 400,
+        "error": "a request may hold at most 4 images (--vision-max-images); it has 5",
+        "seconds": 0.0
+      }
+    },
+    {
+      "case": "refuse-video",
+      "ok": true,
+      "problems": [],
+      "seconds": 0.0,
+      "detail": {
+        "status": 400,
+        "error": "content parts must be text or image_url; audio and video inputs are unsupported",
+        "seconds": 0.0
+      }
+    },
+    {
+      "case": "refuse-gif",
+      "ok": true,
+      "problems": [],
+      "seconds": 0.0,
+      "detail": {
+        "status": 400,
+        "error": "image 1 is not PNG, JPEG or WebP; send one of those",
+        "seconds": 0.0
+      }
+    },
+    {
+      "case": "refuse-url",
+      "ok": true,
+      "problems": [],
+      "seconds": 0.0,
+      "detail": {
+        "status": 400,
+        "error": "image URLs are off on this server; send the image as a data URL, or start the server with --vision-urls",
+        "seconds": 0.0
+      }
+    },
+    {
+      "case": "alive",
+      "ok": true,
+      "problems": [],
+      "seconds": 0.68,
+      "detail": {
+        "health": 200,
+        "content": "Paris"
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=DGX Spark device thermal guard (throttle at 92 C, emergency clocks at 93 C held 30 s; /etc/spark/thermal.env)
+After=nvidia-persistenced.service dgx-gpu-clock-cap.service
+Wants=dgx-gpu-clock-cap.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/spark-thermal-guard
+Restart=always
+RestartSec=5
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# Path globs scripts/export-engine.sh leaves out of engine/patches (one per line). A file the engine branch added is
+# dropped; a file it changed keeps the TF_REF + patches/0001 version.
+#
+# docs/receipts: the measurement runs behind each engine change (machines, locks, device readings), kept with the engine
+# branch; the results that matter are in docs/RESULTS.md.
+docs/receipts/**

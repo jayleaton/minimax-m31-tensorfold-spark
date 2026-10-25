@@ -1,0 +1,10 @@
+# gitleaks: the default rules, plus one allowlist. The bench results record a hash of each reply's token ids
+# ("token_sha" / "token_sha256", hex) to prove replies equal across runs; the default generic-api-key rule reads any key
+# named token_* as a credential. Only a hex value under exactly those keys passes; every other finding still fails.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "hashes of reply token ids in bench results"
+regexTarget = "match"
+regexes = ['''token_sha(256)?"\s*:\s*"[0-9a-f]{12,64}"''']

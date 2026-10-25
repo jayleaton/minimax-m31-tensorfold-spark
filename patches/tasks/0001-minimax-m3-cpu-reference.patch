@@ -1,0 +1,1393 @@
+From 825afd08cdc11aded0261428aab0f805f24341af Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 10:31:13 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: float64 CPU reference (T0) and
+ test-minimax-ref step
+
+Adds core/minimax_ref.zig (Gemma norm, partial RoPE, block scores, forced-block
+top-k with deterministic ties, selected-block attention, sigmoid router,
+swigluoai), families/minimax_m3/ref.zig (full layer, 2-layer model, head) and
+host-only tests wired as `zig build test-minimax-ref`. Every unverified
+semantic is a field of minimax_ref.Switches. Written from the engine-port
+plan's formulas; no third-party code copied.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/cuda.zig                    |   1 +
+ zig/build/minimax_ref_host.zig        |  20 ++
+ zig/src/core/minimax_ref.zig          | 197 +++++++++++++
+ zig/src/core/root.zig                 |   1 +
+ zig/src/families/minimax_m3/ref.zig   | 241 ++++++++++++++++
+ zig/tests/minimax_ref_model_tests.zig | 312 ++++++++++++++++++++
+ zig/tests/minimax_ref_synth.zig       | 129 +++++++++
+ zig/tests/minimax_ref_tests.zig       | 399 ++++++++++++++++++++++++++
+ 8 files changed, 1300 insertions(+)
+ create mode 100644 zig/build/minimax_ref_host.zig
+ create mode 100644 zig/src/core/minimax_ref.zig
+ create mode 100644 zig/src/families/minimax_m3/ref.zig
+ create mode 100644 zig/tests/minimax_ref_model_tests.zig
+ create mode 100644 zig/tests/minimax_ref_synth.zig
+ create mode 100644 zig/tests/minimax_ref_tests.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index c224600..0f42b0d 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -270,6 +270,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("inc4_host.zig").rows(b, cuda, mods.core);
+     @import("living_dense.zig").host(b, cuda, mods.qwen35, draft_ids, runtime, family, kernels.len);
+     @import("cuda_family_host.zig").steps(b, cuda, mods, step);
++    @import("minimax_ref_host.zig").steps(b, host, mods.core, step);
+     const exl3_host = b.step("test-exl3-cuda-host", "EXL3 loader and CUDA host regressions without a GPU");
+     const exl3_compile = b.addObject(.{ .name = "exl3_host_compile", .root_module = b.createModule(.{
+         .root_source_file = b.path("zig/tests/exl3_compile.zig"),
+diff --git a/zig/build/minimax_ref_host.zig b/zig/build/minimax_ref_host.zig
+new file mode 100644
+index 0000000..b94dec1
+--- /dev/null
++++ b/zig/build/minimax_ref_host.zig
+@@ -0,0 +1,20 @@
++//! The MiniMax-M3.1-Flash float64 CPU reference's host-only test step (no GPU, no nvcc).
++const std = @import("std");
++
++pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module, umbrella: *std.Build.Step) void {
++    const ref = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/ref.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .imports = &.{.{ .name = "core", .module = core }},
++    });
++    const tests = b.createModule(.{
++        .root_source_file = b.path("zig/tests/minimax_ref_tests.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "minimax_ref", .module = ref } },
++    });
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = tests }));
++    b.step("test-minimax-ref", "MiniMax-M3.1-Flash float64 CPU reference tests without a GPU").dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++}
+diff --git a/zig/src/core/minimax_ref.zig b/zig/src/core/minimax_ref.zig
+new file mode 100644
+index 0000000..cd2d1da
+--- /dev/null
++++ b/zig/src/core/minimax_ref.zig
+@@ -0,0 +1,197 @@
++//! MiniMax-M3.1-Flash float64 reference helpers (engine-port-plan.md section 2); every UNVERIFIED semantic is a Switch.
++const std = @import("std");
++const bf = @import("bf16_round.zig");
++const attention = @import("attention_ref.zig");
++const route = @import("route_ref.zig");
++
++/// UNVERIFIED: RoPE pairing. neox_half rotates (i, i + rot/2), the plan's reading; gptj_interleaved (2i, 2i + 1).
++pub const RopeLayout = enum { neox_half, gptj_interleaved };
++/// UNVERIFIED: sparse_init_block n. count forces blocks [0, n) (0: none); inclusive forces [0, n] (0: block 0).
++pub const InitBlocks = enum { count, inclusive };
++/// UNVERIFIED: sparse_local_block n. own_block_if_positive forces the own block when n > 0; trailing_window the last n.
++pub const LocalBlocks = enum { own_block_if_positive, trailing_window };
++/// Which block wins among equal block scores when the top-k cuts through them; the plan defines lower_block.
++pub const Tie = enum { lower_block, higher_block };
++/// UNVERIFIED: router weights: divide by the picks' sum, then times routed_scaling_factor (or either alone).
++pub const RouterNorm = enum { normalize_then_scale, scale_only, normalize_only };
++/// UNVERIFIED: whether routed_scaling_factor multiplies the routed sum only or routed plus the shared expert.
++pub const ScaleOn = enum { routed, routed_plus_shared };
++/// UNVERIFIED: swigluoai's gate clamp; upper_only is min(g, limit), symmetric is clamp(g, -limit, limit).
++pub const GateClamp = enum { upper_only, symmetric };
++
++/// Every semantic not yet checked against upstream MiniMax code; defaults are the plan's unread REFERENCE reading.
++pub const Switches = struct {
++    rope_layout: RopeLayout = .neox_half,
++    /// UNVERIFIED: the index query and key get the main rotary (vLLM shares it); false leaves them unrotated.
++    index_rope: bool = true,
++    sparse_init_block: usize = 0,
++    init_mode: InitBlocks = .count,
++    sparse_local_block: usize = 1,
++    local_mode: LocalBlocks = .own_block_if_positive,
++    tie: Tie = .lower_block,
++    /// UNVERIFIED: w1 is the swish (gate) side of a routed expert and w3 the linear (up) side; false swaps them.
++    w1_is_gate: bool = true,
++    gate_clamp: GateClamp = .upper_only,
++    /// UNVERIFIED: swigluoai multiplies (u + 1); false multiplies u.
++    up_plus_one: bool = true,
++    router_norm: RouterNorm = .normalize_then_scale,
++    /// UNVERIFIED: the picked weights are sigmoid(logit) without the bias; true takes sigmoid(logit) + bias.
++    router_weights_use_bias: bool = false,
++    scale_on: ScaleOn = .routed,
++    /// UNVERIFIED: the (1 + w) Gemma form for the layer norms, the q/k norms and the index norms (false: plain w).
++    gemma_layer_norms: bool = true,
++    gemma_qk_norms: bool = true,
++    gemma_index_norms: bool = true,
++    /// UNVERIFIED rounding points: each true rounds that value to bf16 (RNE); all false is pure float64.
++    bf16_norm_out: bool = false,
++    bf16_proj_out: bool = false,
++    bf16_rope_out: bool = false,
++    bf16_attn_out: bool = false,
++    bf16_act_out: bool = false,
++    bf16_residual: bool = false,
++    /// UNVERIFIED: the bf16 activation is cast to fp16 before the fp16 index projections.
++    fp16_index_input: bool = false,
++};
++
++pub fn round16(on: bool, v: f64) f64 {
++    return if (on) bf.bf16(v) else v;
++}
++
++pub fn roundAll(on: bool, x: []f64) void {
++    if (on) for (x) |*v| {
++        v.* = bf.bf16(v.*);
++    };
++}
++
++pub fn roundFp16(on: bool, x: []f64) void {
++    if (on) for (x) |*v| {
++        const h: f16 = @floatCast(v.*);
++        v.* = h;
++    };
++}
++
++pub fn sigmoid(x: f64) f64 {
++    return 1 / (1 + @exp(-x));
++}
++
++/// out = x / sqrt(mean(x^2) + eps) * (w + 1 if `offset` else w): Gemma RMSNorm, one row.
++pub fn gemmaNorm(x: []const f64, w: []const f64, eps: f64, offset: bool, out: []f64) void {
++    var ss: f64 = 0;
++    for (x) |v| ss += v * v;
++    const inv = 1 / @sqrt(ss / @as(f64, @floatFromInt(x.len)) + eps);
++    const one: f64 = if (offset) 1 else 0;
++    for (out, x, w) |*o, v, ww| o.* = v * inv * (one + ww);
++}
++
++/// RoPE on the first `rot` entries of x at `pos`, inv_freq[i] = theta^(-2i/rot); the rest of x is untouched.
++pub fn rope(x: []f64, rot: usize, pos: usize, theta: f64, layout: RopeLayout) void {
++    const half = rot / 2;
++    for (0..half) |i| {
++        const ang = @as(f64, @floatFromInt(pos)) * std.math.pow(f64, theta, -2 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(rot)));
++        const c = @cos(ang);
++        const s = @sin(ang);
++        const ia: usize = if (layout == .neox_half) i else 2 * i;
++        const ib: usize = if (layout == .neox_half) i + half else 2 * i + 1;
++        const a = x[ia];
++        const b = x[ib];
++        x[ia] = a * c - b * s;
++        x[ib] = b * c + a * s;
++    }
++}
++
++/// swigluoai(g, u): gate clamped above (or both sides) at `limit`, u clamped to +-limit, g sigmoid(alpha g) (u + 1).
++pub fn swigluoai(g: f64, u: f64, alpha: f64, limit: f64, sw: Switches) f64 {
++    if (std.math.isNan(g) or std.math.isNan(u)) return std.math.nan(f64);
++    const gc = if (sw.gate_clamp == .symmetric) std.math.clamp(g, -limit, limit) else @min(g, limit);
++    const uc = std.math.clamp(u, -limit, limit);
++    return gc * sigmoid(alpha * gc) * (uc + if (sw.up_plus_one) @as(f64, 1) else 0);
++}
++
++/// The `ids.len` largest scores, largest first; equal scores go to the lower index (the higher with Tie.higher_block).
++pub fn topk(scores: []const f64, ids: []usize, tie: Tie) void {
++    for (ids, 0..) |*id, k| {
++        var best: ?usize = null;
++        var bv: f64 = 0;
++        for (scores, 0..) |s, i| {
++            if (std.mem.indexOfScalar(usize, ids[0..k], i) != null) continue;
++            const v = if (std.math.isNan(s)) -std.math.inf(f64) else s;
++            if (best == null or v > bv or (v == bv and tie == .higher_block)) {
++                best = i;
++                bv = v;
++            }
++        }
++        id.* = best.?;
++    }
++}
++
++/// Block scores of one index head: max over the causal keys j <= pos of each block of (iq . ik_j) * scale; returns nb.
++pub fn blockScores(iq: []const f64, ik: []const f64, pos: usize, d: usize, scale: f64, block: usize, out: []f64) usize {
++    const nb = pos / block + 1;
++    for (out[0..nb], 0..) |*o, b| {
++        o.* = -std.math.inf(f64);
++        for (b * block..@min((b + 1) * block, pos + 1)) |j| {
++            var s: f64 = 0;
++            for (0..d) |e| s += iq[e] * ik[j * d + e];
++            o.* = @max(o.*, s * scale);
++        }
++    }
++    return nb;
++}
++
++/// Whether block b is forced for a query in block `own`, from sparse_init_block and sparse_local_block.
++pub fn forced(b: usize, own: usize, sw: Switches) bool {
++    const init = switch (sw.init_mode) {
++        .count => b < sw.sparse_init_block,
++        .inclusive => b <= sw.sparse_init_block,
++    };
++    const local = switch (sw.local_mode) {
++        .own_block_if_positive => sw.sparse_local_block > 0 and b == own,
++        .trailing_window => b <= own and own - b < sw.sparse_local_block,
++    };
++    return init or local;
++}
++
++/// The blocks a query attends, ascending, into ids, and how many: all when nb <= k, else the top k with forced at +inf.
++pub fn selectBlocks(bs: []const f64, own: usize, k: usize, sw: Switches, scratch: []f64, ids: []usize) usize {
++    const nb = bs.len;
++    if (nb <= k) {
++        for (ids[0..nb], 0..) |*id, b| id.* = b;
++        return nb;
++    }
++    for (scratch[0..nb], bs, 0..) |*s, v, b| s.* = if (forced(b, own, sw)) std.math.inf(f64) else v;
++    topk(scratch[0..nb], ids[0..k], sw.tie);
++    std.mem.sort(usize, ids[0..k], {}, std.sort.asc(usize));
++    return k;
++}
++
++/// Attention of `rep` query heads (rep x d) over the keys of blocks `ids` up to `pos` in one kv head's k and v (n x d).
++pub fn attendBlocks(q: []const f64, k: []const f64, v: []const f64, ids: []const usize, pos: usize, block: usize, d: usize, rep: usize, keys: []usize, out: []f64) void {
++    var n: usize = 0;
++    for (ids) |b| for (b * block..@min((b + 1) * block, pos + 1)) |j| {
++        keys[n] = j;
++        n += 1;
++    };
++    var tol: [512]f64 = undefined;
++    const scale = std.math.pow(f64, @floatFromInt(d), -0.5);
++    for (0..rep) |h| attention.head(q[h * d ..][0..d], k, v, keys[0..n], d, scale, out[h * d ..][0..d], tol[0..d]);
++}
++
++/// A router's picks by sigmoid(logit) + bias (lower id on ties) and their weights per Switches, `scale` applied here.
++pub fn routerPick(logits: []const f64, bias: []const f64, scale: f64, sw: Switches, scratch: []f64, ids: []usize, weights: []f64) void {
++    for (scratch[0..logits.len], logits, bias) |*s, l, b| s.* = sigmoid(l) + b;
++    var unused: [64]f64 = undefined;
++    route.topk(scratch[0..logits.len], ids, unused[0..ids.len]);
++    var sum: f64 = 0;
++    for (ids, weights) |id, *w| {
++        w.* = if (sw.router_weights_use_bias) scratch[id] else sigmoid(logits[id]);
++        sum += w.*;
++    }
++    const norm = sw.router_norm != .scale_only;
++    const factor = if (sw.router_norm == .normalize_only or sw.scale_on == .routed_plus_shared) 1 else scale;
++    for (weights) |*w| w.* = (if (norm) w.* / sum else w.*) * factor;
++}
++
++/// What the combined routed + shared output is multiplied by after the add (1 unless scale_on is routed_plus_shared).
++pub fn totalScale(sw: Switches, scale: f64) f64 {
++    return if (sw.scale_on == .routed_plus_shared and sw.router_norm != .normalize_only) scale else 1;
++}
+diff --git a/zig/src/core/root.zig b/zig/src/core/root.zig
+index 9481f2f..84daadc 100644
+--- a/zig/src/core/root.zig
++++ b/zig/src/core/root.zig
+@@ -48,6 +48,7 @@ pub const tree_round = @import("tree_round.zig");
+ pub const attention_ref = @import("attention_ref.zig");
+ pub const gdn_prep_ref = @import("gdn_prep_ref.zig");
+ pub const qk_ref = @import("qk_ref.zig");
++pub const minimax_ref = @import("minimax_ref.zig");
+ pub const moe_ref = @import("moe_ref.zig");
+ pub const dense_ref = @import("dense_ref.zig");
+ 
+diff --git a/zig/src/families/minimax_m3/ref.zig b/zig/src/families/minimax_m3/ref.zig
+new file mode 100644
+index 0000000..a710149
+--- /dev/null
++++ b/zig/src/families/minimax_m3/ref.zig
+@@ -0,0 +1,241 @@
++//! MiniMax-M3.1-Flash on the CPU in float64: a full layer, a small model and the head (engine-port-plan.md T0).
++const std = @import("std");
++const core = @import("core");
++const mr = core.minimax_ref;
++
++pub const Switches = mr.Switches;
++
++/// The text model's shape; the defaults are the real checkpoint's, tests shrink hidden, experts and the block count.
++pub const Config = struct {
++    hidden: usize = 6144,
++    n_q: usize = 64,
++    n_kv: usize = 4,
++    head_dim: usize = 128,
++    rot_dim: usize = 64,
++    rope_theta: f64 = 1e7,
++    eps: f64 = 1e-6,
++    /// Index heads: one per kv head, all scoring the one shared index key (index head g selects for kv head g).
++    n_index: usize = 4,
++    block: usize = 128,
++    topk_blocks: usize = 16,
++    n_experts: usize = 128,
++    experts_topk: usize = 4,
++    routed_scale: f64 = 2.0,
++    alpha: f64 = 1.702,
++    limit: f64 = 7.0,
++    sw: Switches = .{},
++
++    pub fn rep(c: Config) usize {
++        return c.n_q / c.n_kv;
++    }
++};
++
++/// y = x W for W stored [k][n] row-major, the layout exl3_format.dequantize writes.
++pub const Linear = struct {
++    k: usize,
++    n: usize,
++    w: []const f64,
++
++    pub fn apply(l: Linear, x: []const f64, out: []f64) void {
++        @memset(out[0..l.n], 0);
++        for (x[0..l.k], 0..) |xv, i| {
++            const row = l.w[i * l.n ..][0..l.n];
++            for (out[0..l.n], row) |*o, wv| o.* += xv * wv;
++        }
++    }
++};
++
++/// A gated MLP: w1, w3 are [hidden][inter], w2 [inter][hidden]; dense and shared MLPs: gate_proj is w1, up_proj w3.
++pub const Mlp = struct {
++    w1: Linear,
++    w3: Linear,
++    w2: Linear,
++
++    /// out = w2 swigluoai(gate, up); `routed` applies Switches.w1_is_gate, dense and shared MLPs never swap.
++    pub fn apply(m: Mlp, c: Config, x: []const f64, routed: bool, a: std.mem.Allocator, out: []f64) !void {
++        const n = m.w1.n;
++        const p = try a.alloc(f64, 2 * n);
++        m.w1.apply(x, p[0..n]);
++        m.w3.apply(x, p[n..]);
++        const swap = routed and !c.sw.w1_is_gate;
++        for (0..n) |i| {
++            const g, const u = if (swap) .{ p[n + i], p[i] } else .{ p[i], p[n + i] };
++            p[i] = mr.round16(c.sw.bf16_act_out, mr.swigluoai(g, u, c.alpha, c.limit, c.sw));
++        }
++        m.w2.apply(p[0..n], out);
++    }
++};
++
++pub const Moe = struct {
++    gate: Linear,
++    bias: []const f64,
++    experts: []const Mlp,
++    shared: Mlp,
++};
++
++pub const Ffn = union(enum) { dense: Mlp, moe: Moe };
++
++pub const Layer = struct {
++    input_norm: []const f64,
++    post_norm: []const f64,
++    q: Linear,
++    k: Linear,
++    v: Linear,
++    o: Linear,
++    q_norm: []const f64,
++    k_norm: []const f64,
++    index_q: Linear,
++    index_k: Linear,
++    index_q_norm: []const f64,
++    index_k_norm: []const f64,
++    ffn: Ffn,
++};
++
++pub const Model = struct {
++    cfg: Config,
++    embed: []const f64,
++    layers: []const Layer,
++    final_norm: []const f64,
++    head: Linear,
++};
++
++/// One layer's K, V ([kv head][pos][d]) and index-key (IK [pos][d]) history, `cap` positions.
++pub const LayerCache = struct {
++    k: []f64,
++    v: []f64,
++    ik: []f64,
++    cap: usize,
++};
++
++pub const Cache = struct {
++    layers: []LayerCache,
++
++    pub fn init(a: std.mem.Allocator, c: Config, n_layers: usize, cap: usize) !Cache {
++        const ls = try a.alloc(LayerCache, n_layers);
++        for (ls) |*l| l.* = .{
++            .k = try a.alloc(f64, c.n_kv * cap * c.head_dim),
++            .v = try a.alloc(f64, c.n_kv * cap * c.head_dim),
++            .ik = try a.alloc(f64, cap * c.head_dim),
++            .cap = cap,
++        };
++        return .{ .layers = ls };
++    }
++};
++
++fn norm(c: Config, x: []const f64, w: []const f64, gemma: bool, out: []f64) void {
++    mr.gemmaNorm(x, w, c.eps, gemma, out);
++    mr.roundAll(c.sw.bf16_norm_out, out);
++}
++
++fn heads(c: Config, x: []f64, n: usize, w: []const f64, gemma: bool, pos: ?usize) void {
++    const d = c.head_dim;
++    var t: [512]f64 = undefined;
++    for (0..n) |h| {
++        const s = x[h * d ..][0..d];
++        norm(c, s, w, gemma, t[0..d]);
++        @memcpy(s, t[0..d]);
++        if (pos) |p| mr.rope(s, c.rot_dim, p, c.rope_theta, c.sw.rope_layout);
++        mr.roundAll(c.sw.bf16_rope_out, s);
++    }
++}
++
++/// The attention half of a layer for the token at `pos`: h += o_proj(sparse attention(norm(h))), cache appended.
++pub fn attention(c: Config, ly: Layer, lc: *LayerCache, h: []f64, pos: usize, a: std.mem.Allocator) !void {
++    const d = c.head_dim;
++    const x = try a.alloc(f64, c.hidden);
++    norm(c, h, ly.input_norm, c.sw.gemma_layer_norms, x);
++    const q = try a.alloc(f64, c.n_q * d);
++    const k = try a.alloc(f64, c.n_kv * d);
++    const v = try a.alloc(f64, c.n_kv * d);
++    ly.q.apply(x, q);
++    ly.k.apply(x, k);
++    ly.v.apply(x, v);
++    for ([_][]f64{ q, k, v }) |t| mr.roundAll(c.sw.bf16_proj_out, t);
++    heads(c, q, c.n_q, ly.q_norm, c.sw.gemma_qk_norms, pos);
++    heads(c, k, c.n_kv, ly.k_norm, c.sw.gemma_qk_norms, pos);
++    const iq = try a.alloc(f64, c.n_index * d);
++    const ik = try a.alloc(f64, d);
++    mr.roundFp16(c.sw.fp16_index_input, x);
++    ly.index_q.apply(x, iq);
++    ly.index_k.apply(x, ik);
++    mr.roundAll(c.sw.bf16_proj_out, iq);
++    mr.roundAll(c.sw.bf16_proj_out, ik);
++    heads(c, iq, c.n_index, ly.index_q_norm, c.sw.gemma_index_norms, if (c.sw.index_rope) pos else null);
++    heads(c, ik, 1, ly.index_k_norm, c.sw.gemma_index_norms, if (c.sw.index_rope) pos else null);
++    for (0..c.n_kv) |g| {
++        @memcpy(lc.k[(g * lc.cap + pos) * d ..][0..d], k[g * d ..][0..d]);
++        @memcpy(lc.v[(g * lc.cap + pos) * d ..][0..d], v[g * d ..][0..d]);
++    }
++    @memcpy(lc.ik[pos * d ..][0..d], ik);
++    const bs = try a.alloc(f64, pos / c.block + 1);
++    const ids = try a.alloc(usize, c.topk_blocks);
++    const scratch = try a.alloc(f64, bs.len);
++    const keys = try a.alloc(usize, c.topk_blocks * c.block);
++    const ao = try a.alloc(f64, c.n_q * d);
++    const rep = c.rep();
++    for (0..c.n_kv) |g| {
++        _ = mr.blockScores(iq[g * d ..][0..d], lc.ik, pos, d, std.math.pow(f64, @floatFromInt(d), -0.5), c.block, bs);
++        const n = mr.selectBlocks(bs, pos / c.block, c.topk_blocks, c.sw, scratch, ids);
++        const base = g * lc.cap * d;
++        mr.attendBlocks(q[g * rep * d ..][0 .. rep * d], lc.k[base..][0 .. lc.cap * d], lc.v[base..][0 .. lc.cap * d], ids[0..n], pos, c.block, d, rep, keys, ao[g * rep * d ..][0 .. rep * d]);
++    }
++    mr.roundAll(c.sw.bf16_attn_out, ao);
++    const o = try a.alloc(f64, c.hidden);
++    ly.o.apply(ao, o);
++    for (h, o) |*hv, ov| hv.* = mr.round16(c.sw.bf16_residual, hv.* + ov);
++}
++
++/// The feed-forward half: h += ffn(norm(h)); dense MLP, or routed experts plus the shared expert.
++pub fn feedForward(c: Config, ly: Layer, h: []f64, a: std.mem.Allocator) !void {
++    const m = try a.alloc(f64, c.hidden);
++    norm(c, h, ly.post_norm, c.sw.gemma_layer_norms, m);
++    const f = try a.alloc(f64, c.hidden);
++    switch (ly.ffn) {
++        .dense => |mlp| try mlp.apply(c, m, false, a, f),
++        .moe => |moe| {
++            const logits = try a.alloc(f64, c.n_experts);
++            moe.gate.apply(m, logits);
++            const ids = try a.alloc(usize, c.experts_topk);
++            const w = try a.alloc(f64, c.experts_topk);
++            mr.routerPick(logits, moe.bias, c.routed_scale, c.sw, try a.alloc(f64, c.n_experts), ids, w);
++            @memset(f, 0);
++            const y = try a.alloc(f64, c.hidden);
++            for (ids, w) |e, we| {
++                try moe.experts[e].apply(c, m, true, a, y);
++                for (f, y) |*o, yv| o.* += we * yv;
++            }
++            try moe.shared.apply(c, m, false, a, y);
++            const t = mr.totalScale(c.sw, c.routed_scale);
++            for (f, y) |*o, yv| o.* = (o.* + yv) * t;
++        },
++    }
++    for (h, f) |*hv, fv| hv.* = mr.round16(c.sw.bf16_residual, hv.* + fv);
++}
++
++/// One whole layer for the token at `pos` (h in and out); `a` is scratch the caller may reset afterwards.
++pub fn layerStep(c: Config, ly: Layer, lc: *LayerCache, h: []f64, pos: usize, a: std.mem.Allocator) !void {
++    try attention(c, ly, lc, h, pos, a);
++    try feedForward(c, ly, h, a);
++}
++
++/// The head: logits = (gemma_norm(h, model.norm)) lm_head, as the engine's final fp32 logits.
++pub fn head(m: Model, h: []const f64, a: std.mem.Allocator, logits: []f64) !void {
++    const n = try a.alloc(f64, m.cfg.hidden);
++    norm(m.cfg, h, m.final_norm, m.cfg.sw.gemma_layer_norms, n);
++    m.head.apply(n, logits);
++}
++
++/// The model on one token at `pos` against its cache: embedding, every layer, the head into `logits`.
++pub fn step(m: Model, cache: Cache, token: usize, pos: usize, logits: []f64, gpa: std.mem.Allocator) !void {
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const h = try a.dupe(f64, m.embed[token * m.cfg.hidden ..][0..m.cfg.hidden]);
++    for (m.layers, cache.layers) |ly, *lc| try layerStep(m.cfg, ly, lc, h, pos, a);
++    try head(m, h, a, logits);
++}
++
++/// Every token in order; the last token's logits are left in `logits`.
++pub fn run(m: Model, cache: Cache, tokens: []const usize, logits: []f64, gpa: std.mem.Allocator) !void {
++    for (tokens, 0..) |t, pos| try step(m, cache, t, pos, logits, gpa);
++}
+diff --git a/zig/tests/minimax_ref_model_tests.zig b/zig/tests/minimax_ref_model_tests.zig
+new file mode 100644
+index 0000000..9dc6dfe
+--- /dev/null
++++ b/zig/tests/minimax_ref_model_tests.zig
+@@ -0,0 +1,312 @@
++//! MiniMax-M3.1-Flash float64 reference: layers and a 2-layer model on synthetic EXL3 weights, boundaries, switches.
++const std = @import("std");
++const core = @import("core");
++const ref = @import("minimax_ref");
++const synth = @import("minimax_ref_synth.zig");
++const mr = core.minimax_ref;
++
++const expect = std.testing.expect;
++
++fn arena() std.heap.ArenaAllocator {
++    return std.heap.ArenaAllocator.init(std.heap.page_allocator);
++}
++
++fn small(sw: ref.Switches) ref.Config {
++    var c = synth.tiny(sw);
++    c.block = 16;
++    c.topk_blocks = 3;
++    return c;
++}
++
++fn run(a: std.mem.Allocator, c: ref.Config, o: synth.Options, toks: []const usize) ![]f64 {
++    return synth.trace(a, try synth.model(a, c, o), toks, o.vocab);
++}
++
++test "EXL3 mul1 linears at 3, 4, 5 and 6 bits dequantize to finite, distinct, nonzero matrices" {
++    var ar = arena();
++    defer ar.deinit();
++    var g = synth.gen(ar.allocator(), 4);
++    var prev: ?ref.Linear = null;
++    for ([_]u16{ 6, 8, 10, 12 }) |halves| {
++        const l = try g.exl3Linear(halves, 128, 128, 1);
++        var sum: f64 = 0;
++        for (l.w) |v| {
++            try expect(std.math.isFinite(v));
++            sum += v * v;
++        }
++        try expect(sum > 1e-3);
++        if (prev) |p| try expect(synth.maxDiff(p.w, l.w) > 0);
++        prev = l;
++        var y: [128]f64 = undefined;
++        var x: [128]f64 = @splat(0);
++        x[5] = 2;
++        l.apply(&x, &y);
++        for (y, 0..) |v, j| try std.testing.expectApproxEqAbs(2 * l.w[5 * 128 + j], v, 1e-15);
++    }
++}
++
++test "model: deterministic, finite, and causal (a later token never changes an earlier position's logits)" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const c = small(.{});
++    const toks = try synth.tokens(a, 40, 128, 2);
++    const x = try run(a, c, .{}, toks);
++    const y = try run(a, c, .{}, toks);
++    try std.testing.expectEqualSlices(f64, x, y);
++    for (x) |v| try expect(std.math.isFinite(v));
++    var other = try a.dupe(usize, toks);
++    other[39] = (other[39] + 1) % 128;
++    const z = try run(a, c, .{}, other);
++    try std.testing.expectEqualSlices(f64, x[0 .. 39 * 128], z[0 .. 39 * 128]);
++    try expect(synth.maxDiff(x[39 * 128 ..], z[39 * 128 ..]) > 1e-6);
++}
++
++test "block boundary: pos 127 is dense with one block, pos 128 and 129 leave the older block out when topk = 1" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const toks = try synth.tokens(a, 131, 128, 6);
++    var one = synth.tiny(.{});
++    one.topk_blocks = 1;
++    var two = one;
++    two.topk_blocks = 2;
++    var wide = one;
++    wide.topk_blocks = 16;
++    const x1 = try run(a, one, .{}, toks);
++    const x2 = try run(a, two, .{}, toks);
++    const x16 = try run(a, wide, .{}, toks);
++    try std.testing.expectEqualSlices(f64, x2, x16);
++    try std.testing.expectEqualSlices(f64, x1[0 .. 128 * 128], x2[0 .. 128 * 128]);
++    for ([_]usize{ 128, 129, 130 }) |p| try expect(synth.maxDiff(x1[p * 128 ..][0..128], x2[p * 128 ..][0..128]) > 1e-6);
++}
++
++test "partial last block and more blocks than topk: the model runs on 70 tokens of 16-key blocks (5 blocks, topk 3)" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const toks = try synth.tokens(a, 70, 128, 8);
++    const sparse = try run(a, small(.{}), .{}, toks);
++    var dense = small(.{});
++    dense.topk_blocks = 16;
++    const full = try run(a, dense, .{}, toks);
++    try std.testing.expectEqualSlices(f64, sparse[0 .. 48 * 128], full[0 .. 48 * 128]);
++    try expect(synth.maxDiff(sparse[69 * 128 ..], full[69 * 128 ..]) > 1e-9);
++}
++
++fn proj(l: ref.Linear, x: []const f64, out: []f64) void {
++    for (0..l.n) |j| {
++        var s: f64 = 0;
++        for (0..l.k) |i| s += x[i] * l.w[i * l.n + j];
++        out[j] = s;
++    }
++}
++
++fn headNorm(w: []const f64, v: []f64, pos: ?usize, c: ref.Config) void {
++    var t: [128]f64 = undefined;
++    for (0..v.len / 128) |h| {
++        mr.gemmaNorm(v[h * 128 ..][0..128], w, c.eps, true, &t);
++        if (pos) |p| mr.rope(&t, c.rot_dim, p, c.rope_theta, c.sw.rope_layout);
++        @memcpy(v[h * 128 ..][0..128], &t);
++    }
++}
++
++const Scores = struct {
++    s: []const f64,
++    fn lt(self: @This(), x: usize, y: usize) bool {
++        return if (self.s[x] != self.s[y]) self.s[x] > self.s[y] else x < y;
++    }
++};
++
++/// Layer 0's attention at the last position, re-derived from the embeddings alone with sorted brute-force selection.
++fn oracle(a: std.mem.Allocator, m: ref.Model, toks: []const usize) ![]f64 {
++    const c = m.cfg;
++    const ly = m.layers[0];
++    const n = toks.len;
++    const p = n - 1;
++    const ks = try a.alloc(f64, n * 256);
++    const vs = try a.alloc(f64, n * 256);
++    const iks = try a.alloc(f64, n * 128);
++    var q: [512]f64 = undefined;
++    var iq: [256]f64 = undefined;
++    for (toks, 0..) |t, j| {
++        var x: [128]f64 = undefined;
++        mr.gemmaNorm(m.embed[t * 128 ..][0..128], ly.input_norm, c.eps, true, &x);
++        proj(ly.k, &x, ks[j * 256 ..][0..256]);
++        proj(ly.v, &x, vs[j * 256 ..][0..256]);
++        proj(ly.index_k, &x, iks[j * 128 ..][0..128]);
++        headNorm(ly.k_norm, ks[j * 256 ..][0..256], j, c);
++        headNorm(ly.index_k_norm, iks[j * 128 ..][0..128], j, c);
++        if (j == p) {
++            proj(ly.q, &x, &q);
++            proj(ly.index_q, &x, &iq);
++            headNorm(ly.q_norm, &q, p, c);
++            headNorm(ly.index_q_norm, &iq, p, c);
++        }
++    }
++    const ao = try a.alloc(f64, 512);
++    for (0..c.n_kv) |g| {
++        const nb = p / c.block + 1;
++        const sc = try a.alloc(f64, nb);
++        for (sc, 0..) |*b, bi| {
++            b.* = -std.math.inf(f64);
++            for (bi * c.block..@min(bi * c.block + c.block, p + 1)) |j| {
++                var s: f64 = 0;
++                for (0..128) |e| s += iq[g * 128 + e] * iks[j * 128 + e];
++                b.* = @max(b.*, s / @sqrt(128.0));
++            }
++        }
++        sc[nb - 1] = std.math.inf(f64);
++        const order = try a.alloc(usize, nb);
++        for (order, 0..) |*o, i| o.* = i;
++        std.mem.sort(usize, order, Scores{ .s = sc }, Scores.lt);
++        const take = @min(nb, c.topk_blocks);
++        std.mem.sort(usize, order[0..take], {}, std.sort.asc(usize));
++        for (g * 2..g * 2 + 2) |h| {
++            var sm = try a.alloc(f64, n);
++            var cnt: usize = 0;
++            var mx: f64 = -std.math.inf(f64);
++            for (order[0..take]) |b| for (b * c.block..@min(b * c.block + c.block, p + 1)) |j| {
++                var s: f64 = 0;
++                for (0..128) |e| s += q[h * 128 + e] * ks[j * 256 + g * 128 + e];
++                sm[j] = s / @sqrt(128.0);
++                mx = @max(mx, sm[j]);
++                cnt += 1;
++            };
++            var z: f64 = 0;
++            @memset(ao[h * 128 ..][0..128], 0);
++            for (order[0..take]) |b| for (b * c.block..@min(b * c.block + c.block, p + 1)) |j| {
++                const w = @exp(sm[j] - mx);
++                z += w;
++                for (0..128) |e| ao[h * 128 + e] += w * vs[j * 256 + g * 128 + e];
++            };
++            for (ao[h * 128 ..][0..128]) |*v| v.* /= z;
++        }
++    }
++    const h = try a.dupe(f64, m.embed[toks[p] * 128 ..][0..128]);
++    var o: [128]f64 = undefined;
++    proj(ly.o, ao, &o);
++    for (h, o) |*x, y| x.* += y;
++    return h;
++}
++
++fn checkOracle(c: ref.Config, n: usize) !void {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const m = try synth.model(a, c, .{});
++    const toks = try synth.tokens(a, n, 128, 12);
++    const lc = (try ref.Cache.init(a, c, 1, n)).layers;
++    var h: [128]f64 = undefined;
++    for (toks, 0..) |t, pos| {
++        @memcpy(&h, m.embed[t * 128 ..][0..128]);
++        try ref.attention(c, m.layers[0], &lc[0], &h, pos, a);
++    }
++    const want = try oracle(a, m, toks);
++    for (want, h) |p, q| try std.testing.expectApproxEqAbs(p, q, 1e-12);
++}
++
++test "layer attention equals a from-scratch brute-force derivation (70 tokens x 16-key blocks; 130 tokens x 128-key blocks)" {
++    try checkOracle(small(.{}), 70);
++    var c = synth.tiny(.{});
++    c.topk_blocks = 1;
++    try checkOracle(c, 130);
++    try checkOracle(c, 129);
++    try checkOracle(c, 128);
++}
++
++const Case = struct { name: []const u8, sw: ref.Switches };
++
++test "every UNVERIFIED switch changes the model's output (default vs the other branch)" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const toks = try synth.tokens(a, 70, 128, 21);
++    const base = try run(a, small(.{}), .{}, toks);
++    const cases = [_]Case{
++        .{ .name = "rope gptj", .sw = .{ .rope_layout = .gptj_interleaved } },
++        .{ .name = "index_rope off", .sw = .{ .index_rope = false } },
++        .{ .name = "init count 1", .sw = .{ .sparse_init_block = 1 } },
++        .{ .name = "init inclusive", .sw = .{ .init_mode = .inclusive } },
++        .{ .name = "local 0", .sw = .{ .sparse_local_block = 0 } },
++        .{ .name = "local window 2", .sw = .{ .local_mode = .trailing_window, .sparse_local_block = 2 } },
++        .{ .name = "w1 is up", .sw = .{ .w1_is_gate = false } },
++        .{ .name = "up_plus_one off", .sw = .{ .up_plus_one = false } },
++        .{ .name = "router scale only", .sw = .{ .router_norm = .scale_only } },
++        .{ .name = "router normalize only", .sw = .{ .router_norm = .normalize_only } },
++        .{ .name = "router bias in weights", .sw = .{ .router_weights_use_bias = true } },
++        .{ .name = "scale routed+shared", .sw = .{ .scale_on = .routed_plus_shared } },
++        .{ .name = "plain layer norms", .sw = .{ .gemma_layer_norms = false } },
++        .{ .name = "plain qk norms", .sw = .{ .gemma_qk_norms = false } },
++        .{ .name = "plain index norms", .sw = .{ .gemma_index_norms = false } },
++        .{ .name = "bf16 norm", .sw = .{ .bf16_norm_out = true } },
++        .{ .name = "bf16 proj", .sw = .{ .bf16_proj_out = true } },
++        .{ .name = "bf16 rope", .sw = .{ .bf16_rope_out = true } },
++        .{ .name = "bf16 attn", .sw = .{ .bf16_attn_out = true } },
++        .{ .name = "bf16 act", .sw = .{ .bf16_act_out = true } },
++        .{ .name = "bf16 residual", .sw = .{ .bf16_residual = true } },
++    };
++    for (cases) |cs| {
++        const x = try run(a, small(cs.sw), .{}, toks);
++        const d = synth.maxDiff(base, x);
++        std.testing.expect(d > 1e-9 and std.math.isFinite(d)) catch |e| {
++            std.debug.print("switch {s} did not change the output (diff {e})\n", .{ cs.name, d });
++            return e;
++        };
++    }
++}
++
++test "switches that need a special scenario: gate clamp (large activations) and the tie rule (all block scores equal)" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const toks = try synth.tokens(a, 20, 128, 5);
++    const big: synth.Options = .{ .gain = 60 };
++    const upper = try run(a, small(.{}), big, toks);
++    const sym = try run(a, small(.{ .gate_clamp = .symmetric }), big, toks);
++    try expect(synth.maxDiff(upper, sym) > 1e-9);
++    const flat: synth.Options = .{ .zero_index_q = true };
++    const long = try synth.tokens(a, 70, 128, 5);
++    const lo = try run(a, small(.{}), flat, long);
++    const hi = try run(a, small(.{ .tie = .higher_block }), flat, long);
++    try expect(synth.maxDiff(lo, hi) > 1e-9);
++    const again = try run(a, small(.{}), flat, long);
++    try std.testing.expectEqualSlices(f64, lo, again);
++}
++
++test "bf16 residual switch leaves the hidden state on the bf16 grid after attention and after the MoE FFN" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const m = try synth.model(a, small(.{ .bf16_residual = true }), .{});
++    const cache = try ref.Cache.init(a, m.cfg, 2, 4);
++    const h = try a.dupe(f64, m.embed[3 * 128 ..][0..128]);
++    try ref.attention(m.cfg, m.layers[1], &cache.layers[1], h, 0, a);
++    for (h) |v| try std.testing.expectEqual(core.bf16_round.bf16(v), v);
++    @memset(h, 0.3);
++    try ref.feedForward(m.cfg, m.layers[1], h, a);
++    for (h) |v| try std.testing.expectEqual(core.bf16_round.bf16(v), v);
++    var any = false;
++    for (h) |v| any = any or v != 0.3;
++    try expect(any);
++}
++
++test "fp16 index input changes the cached index keys (selection may not flip, the keys do)" {
++    var ar = arena();
++    defer ar.deinit();
++    const a = ar.allocator();
++    const m = try synth.model(a, small(.{}), .{});
++    var m16 = m;
++    m16.cfg.sw.fp16_index_input = true;
++    const toks = try synth.tokens(a, 5, 128, 3);
++    const c0 = try ref.Cache.init(a, m.cfg, 1, 5);
++    const c1 = try ref.Cache.init(a, m.cfg, 1, 5);
++    for (toks, 0..) |t, pos| {
++        const h0 = try a.dupe(f64, m.embed[t * 128 ..][0..128]);
++        const h1 = try a.dupe(f64, h0);
++        try ref.attention(m.cfg, m.layers[0], &c0.layers[0], h0[0..], pos, a);
++        try ref.attention(m16.cfg, m16.layers[0], &c1.layers[0], h1[0..], pos, a);
++    }
++    try expect(synth.maxDiff(c0.layers[0].ik, c1.layers[0].ik) > 1e-9);
++    try std.testing.expectEqualSlices(f64, c0.layers[0].v, c1.layers[0].v);
++}
+diff --git a/zig/tests/minimax_ref_synth.zig b/zig/tests/minimax_ref_synth.zig
+new file mode 100644
+index 0000000..e4cd6d7
+--- /dev/null
++++ b/zig/tests/minimax_ref_synth.zig
+@@ -0,0 +1,129 @@
++//! Synthetic MiniMax weights for the CPU reference tests: random EXL3 mul1 trellises at 6 to 12 halves, plain tensors.
++const std = @import("std");
++const core = @import("core");
++const ref = @import("minimax_ref");
++const exl3 = core.exl3_format;
++
++pub const Options = struct {
++    seed: u64 = 1,
++    n_layers: usize = 2,
++    vocab: usize = 128,
++    /// Multiplies every MLP matrix (expert, shared, dense) so activations reach swigluoai's limit.
++    gain: f64 = 1,
++    /// Zero index_q_proj: every block score is exactly 0, so only the tie rule picks blocks.
++    zero_index_q: bool = false,
++};
++
++pub fn tiny(sw: ref.Switches) ref.Config {
++    return .{ .hidden = 128, .n_q = 4, .n_kv = 2, .n_index = 2, .topk_blocks = 2, .n_experts = 8, .experts_topk = 2, .sw = sw };
++}
++
++pub const Gen = struct {
++    a: std.mem.Allocator,
++    rng: std.Random.DefaultPrng,
++
++    fn uni(g: *Gen) f64 {
++        return g.rng.random().float(f64) * 2 - 1;
++    }
++
++    fn vec(g: *Gen, n: usize, scale: f64, bf16: bool) ![]f64 {
++        const v = try g.a.alloc(f64, n);
++        for (v) |*x| x.* = if (bf16) core.bf16_round.bf16(g.uni() * scale) else g.uni() * scale;
++        return v;
++    }
++
++    /// A plain matrix as the checkpoint stores fp16 (index) or fp32 (router) weights: fp16 rounded when `half`.
++    fn plain(g: *Gen, k: usize, n: usize, gain: f64, half: bool) !ref.Linear {
++        const w = try g.vec(k * n, gain * 1.7 / @sqrt(@as(f64, @floatFromInt(k))), false);
++        if (half) for (w) |*x| {
++            const h: f16 = @floatCast(x.*);
++            x.* = h;
++        };
++        return .{ .k = k, .n = n, .w = w };
++    }
++
++    /// An EXL3 mul1 matrix of `halves` (6, 8, 10, 12 = 3..6 bits) from random trellis words, suh and svh.
++    pub fn exl3Linear(g: *Gen, halves: u16, k: usize, n: usize, gain: f64) !ref.Linear {
++        const tiles_k = k / 16;
++        const tiles_n = n / 16;
++        const trellis = try g.a.alloc(i16, tiles_k * tiles_n * @as(usize, halves) * 8);
++        for (trellis) |*t| t.* = @bitCast(g.rng.random().int(u16));
++        const suh = try g.a.alloc(f16, k);
++        const svh = try g.a.alloc(f16, n);
++        for (suh) |*s| s.* = @floatCast(if (g.rng.random().boolean()) @as(f64, 1) else -1);
++        const amp = gain / @sqrt(@as(f64, @floatFromInt(k)));
++        for (svh) |*s| s.* = @floatCast((if (g.rng.random().boolean()) @as(f64, 1) else -1) * amp * (0.5 + g.rng.random().float(f64)));
++        const w = try g.a.alloc(f64, k * n);
++        const scratch = try g.a.alloc(f64, 2 * k * n);
++        exl3.dequantize(.{ .halves = halves }, .mul1, trellis, tiles_k, tiles_n, suh, svh, w, scratch);
++        return .{ .k = k, .n = n, .w = w };
++    }
++
++    fn mlp(g: *Gen, h: usize, inter: usize, halves: u16, gain: f64) !ref.Mlp {
++        return .{ .w1 = try g.exl3Linear(halves, h, inter, gain), .w3 = try g.exl3Linear(halves, h, inter, gain), .w2 = try g.exl3Linear(halves, inter, h, gain) };
++    }
++};
++
++pub fn gen(a: std.mem.Allocator, seed: u64) Gen {
++    return .{ .a = a, .rng = std.Random.DefaultPrng.init(seed) };
++}
++
++/// A model of `o.n_layers` layers: layer 0 dense (5-bit), the rest MoE (experts 3/4-bit alternating, shared 5-bit).
++pub fn model(a: std.mem.Allocator, c: ref.Config, o: Options) !ref.Model {
++    var g = Gen{ .a = a, .rng = std.Random.DefaultPrng.init(o.seed) };
++    const h = c.hidden;
++    const d = c.head_dim;
++    const layers = try a.alloc(ref.Layer, o.n_layers);
++    for (layers, 0..) |*ly, li| {
++        const experts = try a.alloc(ref.Mlp, if (li == 0) 0 else c.n_experts);
++        for (experts) |*e| e.* = try g.mlp(h, 128, if (li % 2 == 1) 8 else 6, o.gain);
++        ly.* = .{
++            .input_norm = try g.vec(h, 0.3, true),
++            .post_norm = try g.vec(h, 0.3, true),
++            .q = try g.exl3Linear(12, h, c.n_q * d, 1),
++            .k = try g.exl3Linear(12, h, c.n_kv * d, 1),
++            .v = try g.exl3Linear(12, h, c.n_kv * d, 1),
++            .o = try g.exl3Linear(12, c.n_q * d, h, 1),
++            .q_norm = try g.vec(d, 0.3, true),
++            .k_norm = try g.vec(d, 0.3, true),
++            .index_q = try g.plain(h, c.n_index * d, if (o.zero_index_q) 0 else 1, true),
++            .index_k = try g.plain(h, d, 1, true),
++            .index_q_norm = try g.vec(d, 0.3, true),
++            .index_k_norm = try g.vec(d, 0.3, true),
++            .ffn = if (li == 0) .{ .dense = try g.mlp(h, 256, 10, o.gain) } else .{ .moe = .{
++                .gate = try g.plain(h, c.n_experts, 1, false),
++                .bias = try g.vec(c.n_experts, 0.1, false),
++                .experts = experts,
++                .shared = try g.mlp(h, 128, 10, o.gain),
++            } },
++        };
++    }
++    return .{
++        .cfg = c,
++        .embed = try g.vec(o.vocab * h, 1, true),
++        .layers = layers,
++        .final_norm = try g.vec(h, 0.3, true),
++        .head = try g.exl3Linear(12, h, o.vocab, 1),
++    };
++}
++
++/// Logits after every position of `tokens`, [tokens.len][vocab].
++pub fn trace(a: std.mem.Allocator, m: ref.Model, toks: []const usize, vocab: usize) ![]f64 {
++    const cache = try ref.Cache.init(a, m.cfg, m.layers.len, toks.len);
++    const out = try a.alloc(f64, toks.len * vocab);
++    for (toks, 0..) |t, pos| try ref.step(m, cache, t, pos, out[pos * vocab ..][0..vocab], a);
++    return out;
++}
++
++pub fn maxDiff(x: []const f64, y: []const f64) f64 {
++    var m: f64 = 0;
++    for (x, y) |p, q| m = @max(m, @abs(p - q));
++    return m;
++}
++
++pub fn tokens(a: std.mem.Allocator, n: usize, vocab: usize, seed: u64) ![]usize {
++    var rng = std.Random.DefaultPrng.init(seed);
++    const t = try a.alloc(usize, n);
++    for (t) |*x| x.* = rng.random().uintLessThan(usize, vocab);
++    return t;
++}
+diff --git a/zig/tests/minimax_ref_tests.zig b/zig/tests/minimax_ref_tests.zig
+new file mode 100644
+index 0000000..e67a884
+--- /dev/null
++++ b/zig/tests/minimax_ref_tests.zig
+@@ -0,0 +1,399 @@
++//! MiniMax-M3.1-Flash float64 reference: primitives against hand-computed vectors (layer and model tests: model_tests).
++const std = @import("std");
++const core = @import("core");
++const ref = @import("minimax_ref");
++const mr = core.minimax_ref;
++
++const expectEqual = std.testing.expectEqual;
++const near = std.testing.expectApproxEqAbs;
++
++test {
++    _ = @import("minimax_ref_model_tests.zig");
++}
++
++test "gemma norm: (1 + w) scales the unit-rms row, plain w when the offset is off" {
++    var out: [4]f64 = undefined;
++    mr.gemmaNorm(&.{ 3, 4, 0, 0 }, &.{ 0, 0.5, 9, 9 }, 0, true, &out);
++    try near(@as(f64, 1.2), out[0], 1e-15);
++    try near(@as(f64, 2.4), out[1], 1e-15);
++    try expectEqual(@as(f64, 0), out[2]);
++    mr.gemmaNorm(&.{ 3, 4, 0, 0 }, &.{ 0, 0.5, 9, 9 }, 0, false, &out);
++    try near(@as(f64, 0), out[0], 1e-15);
++    try near(@as(f64, 0.8), out[1], 1e-15);
++}
++
++test "gemma norm plus NeoX RoPE equals core/qk_ref.zig with the (1 + w) weight and rotate-half tables" {
++    var rng = std.Random.DefaultPrng.init(7);
++    var x: [128]f64 = undefined;
++    var w: [128]f64 = undefined;
++    var w1: [128]f64 = undefined;
++    for (&x, &w, &w1) |*a, *b, *c| {
++        a.* = rng.random().float(f64) * 4 - 2;
++        b.* = rng.random().float(f64) - 0.5;
++        c.* = 1 + b.*;
++    }
++    var cs: [64]f64 = undefined;
++    var sn: [64]f64 = undefined;
++    for (0..32) |i| {
++        const ang = 129.0 * std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(2 * i)) / 64.0);
++        cs[i] = @cos(ang);
++        cs[i + 32] = @cos(ang);
++        sn[i] = @sin(ang);
++        sn[i + 32] = @sin(ang);
++    }
++    var want: [128]f64 = undefined;
++    core.qk_ref.head(&x, &w1, 1e-6, &cs, &sn, 64, &want);
++    var got: [128]f64 = undefined;
++    mr.gemmaNorm(&x, &w, 1e-6, true, &got);
++    mr.rope(&got, 64, 129, 1e7, .neox_half);
++    for (want, got) |p, q| try near(p, q, 1e-12);
++}
++
++test "rope: position 0 and dims past rotary_dim are untouched; NeoX pairs (i, i + 32), GPT-J pairs (2i, 2i + 1)" {
++    var x: [128]f64 = @splat(0);
++    x[0] = 1;
++    x[1] = 1;
++    x[100] = 5;
++    mr.rope(&x, 64, 0, 1e7, .neox_half);
++    try expectEqual(@as(f64, 1), x[0]);
++    mr.rope(&x, 64, 1, 1e7, .neox_half);
++    try near(@cos(@as(f64, 1)), x[0], 1e-15);
++    try near(@sin(@as(f64, 1)), x[32], 1e-15);
++    try expectEqual(@as(f64, 5), x[100]);
++    const f1 = std.math.pow(f64, 1e7, -2.0 / 64.0);
++    var z: [128]f64 = @splat(0);
++    z[1] = 1;
++    mr.rope(&z, 64, 1, 1e7, .neox_half);
++    try near(@cos(f1), z[1], 1e-15);
++    try near(@sin(f1), z[33], 1e-15);
++    var y: [128]f64 = @splat(0);
++    y[0] = 1;
++    mr.rope(&y, 64, 1, 1e7, .gptj_interleaved);
++    try near(@cos(@as(f64, 1)), y[0], 1e-15);
++    try near(@sin(@as(f64, 1)), y[1], 1e-15);
++    try expectEqual(@as(f64, 0), y[32]);
++}
++
++test "rope: norm preserved and q.k depends only on the position gap, in both layouts" {
++    var rng = std.Random.DefaultPrng.init(3);
++    var q0: [128]f64 = undefined;
++    var k0: [128]f64 = undefined;
++    for (&q0, &k0) |*a, *b| {
++        a.* = rng.random().float(f64) - 0.5;
++        b.* = rng.random().float(f64) - 0.5;
++    }
++    for ([_]mr.RopeLayout{ .neox_half, .gptj_interleaved }) |layout| {
++        var dots: [2]f64 = undefined;
++        for ([_][2]usize{ .{ 40, 33 }, .{ 7040, 7033 } }, 0..) |pq, i| {
++            var q = q0;
++            var k = k0;
++            mr.rope(&q, 64, pq[0], 1e7, layout);
++            mr.rope(&k, 64, pq[1], 1e7, layout);
++            var d: f64 = 0;
++            for (q, k) |a, b| d += a * b;
++            dots[i] = d;
++            var n0: f64 = 0;
++            var n1: f64 = 0;
++            for (q0, q) |a, b| {
++                n0 += a * a;
++                n1 += b * b;
++            }
++            try near(n0, n1, 1e-12);
++        }
++        try near(dots[0], dots[1], 1e-9);
++    }
++    var a = q0;
++    var b = q0;
++    mr.rope(&a, 64, 5, 1e7, .neox_half);
++    mr.rope(&b, 64, 5, 1e7, .gptj_interleaved);
++    try std.testing.expect(a[1] != b[1]);
++}
++
++test "swigluoai: g sigmoid(1.702 g) (u + 1), g capped at 7, u clamped to +-7, NaN propagates" {
++    const sw: mr.Switches = .{};
++    const s1 = 1.0 / (1.0 + @exp(-1.702));
++    try near(s1 * 3, mr.swigluoai(1, 2, 1.702, 7, sw), 1e-15);
++    try expectEqual(@as(f64, 0), mr.swigluoai(0, 5, 1.702, 7, sw));
++    try expectEqual(@as(f64, 0), mr.swigluoai(3, -1, 1.702, 7, sw));
++    try expectEqual(mr.swigluoai(7, 0, 1.702, 7, sw), mr.swigluoai(100, 0, 1.702, 7, sw));
++    try expectEqual(mr.swigluoai(1, 7, 1.702, 7, sw), mr.swigluoai(1, 9, 1.702, 7, sw));
++    try expectEqual(mr.swigluoai(1, -7, 1.702, 7, sw), mr.swigluoai(1, -9, 1.702, 7, sw));
++    try near(s1 * -6, mr.swigluoai(1, -7, 1.702, 7, sw), 1e-15);
++    try std.testing.expect(std.math.isNan(mr.swigluoai(std.math.nan(f64), 1, 1.702, 7, sw)));
++    try std.testing.expect(std.math.isNan(mr.swigluoai(1, std.math.nan(f64), 1.702, 7, sw)));
++}
++
++test "swigluoai switches: up_plus_one off multiplies u, symmetric clamps the gate below too" {
++    try near(1.0 / (1.0 + @exp(-1.702)) * 2, mr.swigluoai(1, 2, 1.702, 7, .{ .up_plus_one = false }), 1e-15);
++    try expectEqual(@as(f64, 0), mr.swigluoai(3, 0, 1.702, 7, .{ .up_plus_one = false }));
++    const upper = mr.swigluoai(-100, 0, 1.702, 7, .{});
++    const sym = mr.swigluoai(-100, 0, 1.702, 7, .{ .gate_clamp = .symmetric });
++    try std.testing.expect(@abs(upper) < 1e-60);
++    try near(-7.0 / (1.0 + @exp(1.702 * 7.0)), sym, 1e-15);
++}
++
++test "topk: ties by the lower index, or the higher with the switch; NaN sorts last" {
++    const s = [_]f64{ 1, 3, 3, 3, 0, 3 };
++    var ids: [3]usize = undefined;
++    mr.topk(&s, &ids, .lower_block);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, &ids);
++    mr.topk(&s, &ids, .higher_block);
++    try std.testing.expectEqualSlices(usize, &.{ 5, 3, 2 }, &ids);
++    const n = [_]f64{ std.math.nan(f64), 2, 1 };
++    var two: [2]usize = undefined;
++    mr.topk(&n, &two, .lower_block);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, &two);
++}
++
++test "block scores: max over causal keys, blocks of 128, positions 127, 128, 129, partial last block" {
++    var ik: [300 * 2]f64 = undefined;
++    for (0..300) |j| {
++        const f: f64 = @floatFromInt(j);
++        ik[2 * j] = if (j % 3 == 0) f else -f;
++        ik[2 * j + 1] = 1e9;
++    }
++    var bs: [3]f64 = undefined;
++    try expectEqual(@as(usize, 1), mr.blockScores(&.{ 1, 0 }, &ik, 127, 2, 1, 128, &bs));
++    try expectEqual(@as(f64, 126), bs[0]);
++    try expectEqual(@as(usize, 2), mr.blockScores(&.{ 1, 0 }, &ik, 128, 2, 1, 128, &bs));
++    try expectEqual(@as(f64, 126), bs[0]);
++    try expectEqual(@as(f64, -128), bs[1]);
++    try expectEqual(@as(usize, 2), mr.blockScores(&.{ 1, 0 }, &ik, 129, 2, 0.5, 128, &bs));
++    try expectEqual(@as(f64, 63), bs[0]);
++    try expectEqual(@as(f64, 64.5), bs[1]);
++    try expectEqual(@as(usize, 3), mr.blockScores(&.{ 1, 0 }, &ik, 299, 2, 1, 128, &bs));
++    try expectEqual(@as(f64, 297), bs[2]);
++}
++
++fn pick(bs: []const f64, own: usize, k: usize, sw: mr.Switches, out: []usize) usize {
++    var scratch: [16]f64 = undefined;
++    var ids: [16]usize = undefined;
++    const n = mr.selectBlocks(bs, own, k, sw, &scratch, &ids);
++    @memcpy(out[0..n], ids[0..n]);
++    return n;
++}
++
++test "selection: own block forced, top-k of the rest, ascending; forced init and local variants" {
++    const bs = [_]f64{ 5, 1, 9, 2, 8, 7, 3 };
++    var o: [16]usize = undefined;
++    try expectEqual(@as(usize, 3), pick(&bs, 6, 3, .{}, &o));
++    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 6 }, o[0..3]);
++    _ = pick(&bs, 6, 3, .{ .sparse_local_block = 0 }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 5 }, o[0..3]);
++    _ = pick(&bs, 6, 3, .{ .sparse_init_block = 2 }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 6 }, o[0..3]);
++    _ = pick(&bs, 6, 3, .{ .init_mode = .inclusive }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 6 }, o[0..3]);
++    _ = pick(&bs, 6, 3, .{ .local_mode = .trailing_window, .sparse_local_block = 2 }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 5, 6 }, o[0..3]);
++    _ = pick(&bs, 6, 2, .{ .sparse_init_block = 2 }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, o[0..2]);
++    _ = pick(&bs, 6, 2, .{ .sparse_init_block = 2, .tie = .higher_block }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 6 }, o[0..2]);
++}
++
++test "selection: nb <= k attends every block; ties between scores go by the switch; own block beats a higher score" {
++    var o: [16]usize = undefined;
++    try expectEqual(@as(usize, 3), pick(&.{ 1, 2, 3 }, 2, 3, .{}, &o));
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, o[0..3]);
++    try expectEqual(@as(usize, 1), pick(&.{7}, 0, 16, .{}, &o));
++    try expectEqual(@as(usize, 2), pick(&.{ 1, 1 }, 1, 4, .{ .sparse_local_block = 0 }, &o));
++    const tied = [_]f64{ 4, 4, 4, 4, 4 };
++    _ = pick(&tied, 4, 3, .{}, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4 }, o[0..3]);
++    _ = pick(&tied, 4, 3, .{ .tie = .higher_block }, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 4 }, o[0..3]);
++    _ = pick(&.{ 0, 0, 100, 100, -5 }, 4, 2, .{}, &o);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 4 }, o[0..2]);
++}
++
++test "selection agrees with a sorted brute force on random tied scores" {
++    var rng = std.Random.DefaultPrng.init(11);
++    for (0..300) |_| {
++        var bs: [12]f64 = undefined;
++        const nb = 4 + rng.random().uintLessThan(usize, 9);
++        for (bs[0..nb]) |*v| v.* = @floatFromInt(rng.random().uintLessThan(usize, 4));
++        const own = nb - 1;
++        const k = 1 + rng.random().uintLessThan(usize, 5);
++        var o: [16]usize = undefined;
++        const n = pick(bs[0..nb], own, k, .{}, &o);
++        var order: [12]usize = undefined;
++        for (order[0..nb], 0..) |*p, i| p.* = i;
++        bs[own] = std.math.inf(f64);
++        std.mem.sort(usize, order[0..nb], @as([]const f64, bs[0..nb]), struct {
++            fn lt(s: []const f64, a: usize, b: usize) bool {
++                return if (s[a] != s[b]) s[a] > s[b] else a < b;
++            }
++        }.lt);
++        if (nb <= k) {
++            try expectEqual(nb, n);
++            continue;
++        }
++        std.mem.sort(usize, order[0..k], {}, std.sort.asc(usize));
++        try std.testing.expectEqualSlices(usize, order[0..k], o[0..n]);
++    }
++}
++
++fn naive(q: []const f64, k: []const f64, v: []const f64, keys: []const usize, d: usize, out: []f64) void {
++    var s: [512]f64 = undefined;
++    var m: f64 = -std.math.inf(f64);
++    for (keys, 0..) |j, i| {
++        var t: f64 = 0;
++        for (0..d) |e| t += q[e] * k[j * d + e];
++        s[i] = t / @sqrt(@as(f64, @floatFromInt(d)));
++        m = @max(m, s[i]);
++    }
++    var z: f64 = 0;
++    @memset(out, 0);
++    for (keys, 0..) |j, i| {
++        const p = @exp(s[i] - m);
++        z += p;
++        for (0..d) |e| out[e] += p * v[j * d + e];
++    }
++    for (out) |*o| o.* /= z;
++}
++
++fn fill(rng: *std.Random.DefaultPrng, x: []f64) void {
++    for (x) |*v| v.* = rng.random().float(f64) * 2 - 1;
++}
++
++test "selected-block attention: dense when nb <= topk, only selected keys otherwise, causal inside the own block" {
++    const d = 8;
++    var rng = std.Random.DefaultPrng.init(5);
++    var k: [300 * d]f64 = undefined;
++    var v: [300 * d]f64 = undefined;
++    var q: [2 * d]f64 = undefined;
++    fill(&rng, &k);
++    fill(&rng, &v);
++    fill(&rng, &q);
++    var keys: [512]usize = undefined;
++    var got: [2 * d]f64 = undefined;
++    var want: [d]f64 = undefined;
++    var all: [201]usize = undefined;
++    for (&all, 0..) |*a, i| a.* = i;
++    mr.attendBlocks(&q, &k, &v, &.{ 0, 1 }, 200, 128, d, 2, &keys, &got);
++    for (0..2) |h| {
++        naive(q[h * d ..][0..d], &k, &v, &all, d, &want);
++        for (want, got[h * d ..][0..d]) |p, g| try near(p, g, 1e-12);
++    }
++    @memset(v[128 * d .. 256 * d], 1e6);
++    mr.attendBlocks(&q, &k, &v, &.{ 0, 2 }, 299, 128, d, 2, &keys, &got);
++    var sel: [128 + 44]usize = undefined;
++    for (0..128) |i| sel[i] = i;
++    for (0..44) |i| sel[128 + i] = 256 + i;
++    for (0..2) |h| {
++        naive(q[h * d ..][0..d], &k, &v, &sel, d, &want);
++        for (want, got[h * d ..][0..d]) |p, g| {
++            try near(p, g, 1e-12);
++            try std.testing.expect(@abs(g) < 10);
++        }
++    }
++}
++
++test "GQA 64 q heads over 4 kv heads: head h reads kv head h / 16 and its index head's own blocks" {
++    const d = 128;
++    const pos = 300;
++    var rng = std.Random.DefaultPrng.init(9);
++    const a = std.testing.allocator;
++    const q = try a.alloc(f64, 64 * d);
++    const k = try a.alloc(f64, 4 * 320 * d);
++    const v = try a.alloc(f64, 4 * 320 * d);
++    const ik = try a.alloc(f64, 320 * d);
++    const iq = try a.alloc(f64, 4 * d);
++    defer for ([_][]f64{ q, k, v, ik, iq }) |s| a.free(s);
++    for ([_][]f64{ q, k, v, ik, iq }) |s| fill(&rng, s);
++    var sets: [4][2]usize = undefined;
++    var out: [64 * d]f64 = undefined;
++    var keys: [512]usize = undefined;
++    for (0..4) |g| {
++        var bs: [3]f64 = undefined;
++        var scratch: [3]f64 = undefined;
++        var ids: [16]usize = undefined;
++        const nb = mr.blockScores(iq[g * d ..][0..d], ik, pos, d, std.math.pow(f64, 128, -0.5), 128, &bs);
++        try expectEqual(@as(usize, 3), nb);
++        const n = mr.selectBlocks(&bs, 2, 2, .{}, &scratch, &ids);
++        try expectEqual(@as(usize, 2), n);
++        sets[g] = .{ ids[0], ids[1] };
++        mr.attendBlocks(q[g * 16 * d ..][0 .. 16 * d], k[g * 320 * d ..][0 .. 320 * d], v[g * 320 * d ..][0 .. 320 * d], ids[0..n], pos, 128, d, 16, &keys, out[g * 16 * d ..][0 .. 16 * d]);
++    }
++    var differ = false;
++    for (sets[1..]) |s| differ = differ or s[0] != sets[0][0];
++    try std.testing.expect(differ);
++    for ([_]usize{ 0, 15, 16, 47, 63 }) |h| {
++        const g = h / 16;
++        var list: [300]usize = undefined;
++        var n: usize = 0;
++        for (sets[g]) |b| for (b * 128..@min(b * 128 + 128, pos + 1)) |j| {
++            list[n] = j;
++            n += 1;
++        };
++        var want: [d]f64 = undefined;
++        naive(q[h * d ..][0..d], k[g * 320 * d ..], v[g * 320 * d ..], list[0..n], d, &want);
++        for (want, out[h * d ..][0..d]) |p, o| try near(p, o, 1e-12);
++    }
++}
++
++test "router: sigmoid + bias picks, ties to the lower id, bias not in the weights, normalize then x2" {
++    const l3 = @log(3.0);
++    const logits = [_]f64{ 0, l3, -l3, l3, 0, -l3 };
++    var scratch: [6]f64 = undefined;
++    var ids: [2]usize = undefined;
++    var w: [2]f64 = undefined;
++    mr.routerPick(&logits, &@as([6]f64, @splat(0)), 2.0, .{}, &scratch, &ids, &w);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, &ids);
++    try near(@as(f64, 1), w[0], 1e-15);
++    try near(@as(f64, 1), w[1], 1e-15);
++    const bias = [_]f64{ 0.3, 0, 0, 0, 0, 0 };
++    mr.routerPick(&logits, &bias, 2.0, .{}, &scratch, &ids, &w);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, &ids);
++    try near(@as(f64, 0.8), w[0], 1e-15);
++    try near(@as(f64, 1.2), w[1], 1e-15);
++    var rid: [2]usize = undefined;
++    var rw: [2]f64 = undefined;
++    core.route_ref.topk(&.{ 0.8, 0.75, 0.25, 0.75, 0.5, 0.25 }, &rid, &rw);
++    try std.testing.expectEqualSlices(usize, &rid, &ids);
++}
++
++test "router switches: scale only, normalize only, bias in the weights, scale on routed plus shared" {
++    const l3 = @log(3.0);
++    const logits = [_]f64{ 0, l3, -l3, l3, 0, -l3 };
++    const bias = [_]f64{ 0.3, 0, 0, 0, 0, 0 };
++    var scratch: [6]f64 = undefined;
++    var ids: [2]usize = undefined;
++    var w: [2]f64 = undefined;
++    mr.routerPick(&logits, &bias, 2.0, .{ .router_norm = .scale_only }, &scratch, &ids, &w);
++    try near(@as(f64, 1.0), w[0], 1e-15);
++    try near(@as(f64, 1.5), w[1], 1e-15);
++    mr.routerPick(&logits, &bias, 2.0, .{ .router_norm = .normalize_only }, &scratch, &ids, &w);
++    try near(@as(f64, 0.4), w[0], 1e-15);
++    try near(@as(f64, 0.6), w[1], 1e-15);
++    mr.routerPick(&logits, &bias, 2.0, .{ .router_weights_use_bias = true }, &scratch, &ids, &w);
++    try near(@as(f64, 1.6 / 1.55), w[0], 1e-15);
++    try near(@as(f64, 1.5 / 1.55), w[1], 1e-15);
++    const sw: mr.Switches = .{ .scale_on = .routed_plus_shared };
++    mr.routerPick(&logits, &bias, 2.0, sw, &scratch, &ids, &w);
++    try near(@as(f64, 0.4), w[0], 1e-15);
++    try expectEqual(@as(f64, 2), mr.totalScale(sw, 2));
++    try expectEqual(@as(f64, 1), mr.totalScale(.{}, 2));
++    try expectEqual(@as(f64, 1), mr.totalScale(.{ .scale_on = .routed_plus_shared, .router_norm = .normalize_only }, 2));
++}
++
++test "mlp: swigluoai(gate, up) down; w1 and w3 swap only for routed experts" {
++    const eye = [_]f64{ 1, 0, 0, 1 };
++    const swp = [_]f64{ 0, 1, 1, 0 };
++    const m: ref.Mlp = .{ .w1 = .{ .k = 2, .n = 2, .w = &eye }, .w3 = .{ .k = 2, .n = 2, .w = &swp }, .w2 = .{ .k = 2, .n = 2, .w = &eye } };
++    var out: [2]f64 = undefined;
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const c: ref.Config = .{};
++    try m.apply(c, &.{ 1, 2 }, false, arena.allocator(), &out);
++    try near(mr.swigluoai(1, 2, 1.702, 7, .{}), out[0], 1e-15);
++    try near(mr.swigluoai(2, 1, 1.702, 7, .{}), out[1], 1e-15);
++    var c2 = c;
++    c2.sw.w1_is_gate = false;
++    try m.apply(c2, &.{ 1, 2 }, true, arena.allocator(), &out);
++    try near(mr.swigluoai(2, 1, 1.702, 7, .{}), out[0], 1e-15);
++    try near(mr.swigluoai(1, 2, 1.702, 7, .{}), out[1], 1e-15);
++    try m.apply(c2, &.{ 1, 2 }, false, arena.allocator(), &out);
++    try near(mr.swigluoai(1, 2, 1.702, 7, .{}), out[0], 1e-15);
++}
+-- 
+2.43.0
+

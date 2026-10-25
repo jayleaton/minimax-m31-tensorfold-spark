@@ -1,0 +1,1170 @@
+From f5a4c8bc93e63bf5642723228f058f0a9927576c Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 10:43:34 +0300
+Subject: [PATCH] minimax_m3: paged KV pool, page-reference snapshots and
+ per-rank memory budget (host only)
+
+pool.zig: per-rank page geometry from config + shard (76,800 B/token, 128-token
+pages = selection blocks, K/V/IK head-major per layer), kv_pool Layout, and the
+int32 block tables (page ids, -1 padded) the attention kernels take.
+state.zig: stream state and prompt cache as page references in the radix store
+(no recurrent state), admit/keep/end.
+budget.zig: weights + runtime + workspaces + host reserve, largest fitting
+context and pool, refusal text for a CONTEXT that cannot fit.
+test-minimax-pool build step and tests.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/cuda.zig                         |   1 +
+ zig/build/minimax_pool.zig                 |  18 ++
+ zig/src/families/minimax_m3/budget.zig     | 236 +++++++++++++++++++
+ zig/src/families/minimax_m3/pool.zig       | 184 +++++++++++++++
+ zig/src/families/minimax_m3/pool_test.zig  | 250 +++++++++++++++++++++
+ zig/src/families/minimax_m3/state.zig      | 149 ++++++++++++
+ zig/src/families/minimax_m3/state_test.zig | 250 +++++++++++++++++++++
+ 7 files changed, 1088 insertions(+)
+ create mode 100644 zig/build/minimax_pool.zig
+ create mode 100644 zig/src/families/minimax_m3/budget.zig
+ create mode 100644 zig/src/families/minimax_m3/pool.zig
+ create mode 100644 zig/src/families/minimax_m3/pool_test.zig
+ create mode 100644 zig/src/families/minimax_m3/state.zig
+ create mode 100644 zig/src/families/minimax_m3/state_test.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 5f3c641..f70e964 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -271,6 +271,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("living_dense.zig").host(b, cuda, mods.qwen35, draft_ids, runtime, family, kernels.len);
+     @import("cuda_family_host.zig").steps(b, cuda, mods, step);
+     _ = @import("minimax_load.zig").step(b, host, mods.core);
++    _ = @import("minimax_pool.zig").step(b, host, mods.core);
+     const exl3_host = b.step("test-exl3-cuda-host", "EXL3 loader and CUDA host regressions without a GPU");
+     const exl3_compile = b.addObject(.{ .name = "exl3_host_compile", .root_module = b.createModule(.{
+         .root_source_file = b.path("zig/tests/exl3_compile.zig"),
+diff --git a/zig/build/minimax_pool.zig b/zig/build/minimax_pool.zig
+new file mode 100644
+index 0000000..b65203b
+--- /dev/null
++++ b/zig/build/minimax_pool.zig
+@@ -0,0 +1,18 @@
++//! test-minimax-pool: MiniMax-M3.1-Flash's KV pages, block tables, snapshots and memory budget on the host, no GPU.
++const std = @import("std");
++
++pub fn step(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module) *std.Build.Step {
++    const canon = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon.zig"), .target = host, .optimize = .debug });
++    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true });
++    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
++    const family = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/pool.zig"),
++        .target = host,
++        .optimize = .debug,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "canon", .module = canon }, .{ .name = "engine_api", .module = api } },
++    });
++    const s = b.step("test-minimax-pool", "MiniMax-M3.1-Flash KV pages, block tables, prompt snapshots and memory budget without a GPU");
++    s.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = family })).step);
++    return s;
++}
+diff --git a/zig/src/families/minimax_m3/budget.zig b/zig/src/families/minimax_m3/budget.zig
+new file mode 100644
+index 0000000..76793f5
+--- /dev/null
++++ b/zig/src/families/minimax_m3/budget.zig
+@@ -0,0 +1,236 @@
++//! A rank's memory budget for MiniMax-M3.1-Flash: weights, runtime, workspaces and host reserve first, the KV pool
++//! the rest. Gives the largest context that fits, or the words that refuse an explicit CONTEXT that cannot.
++const std = @import("std");
++const kv = @import("core").kv_pool;
++const pool = @import("pool.zig");
++
++pub const GiB: u64 = 1 << 30;
++const gib_f: f64 = @floatFromInt(GiB);
++
++/// What a rank sets aside besides weights and KV, in bytes. Two conventions fill it in (below).
++pub const Terms = struct {
++    /// Memory the budget leaves free for the OS and the host: not spent on weights, KV or workspaces.
++    reserve: u64,
++    /// CUDA context, NCCL and graph memory outside the weight estimate.
++    runtime: u64,
++    /// Prompt workspaces other than the block-score chunk: rotation buffers, scratch, the expert plan.
++    workspace: u64,
++    /// The prompt cache's host-side bounded state and a restore's staging set.
++    session_ram: u64 = 0,
++    staging: u64 = 0,
++    /// Rows of a prefill chunk and the index heads a rank scores: they size the block-score chunk (fp32 per block).
++    prefill_rows: u32 = 8192,
++    index_heads: u32 = 2,
++};
++
++/// Unified memory's reserve default and floor (native/cuda_memory.zig: `floor(true)`), as the server applies them.
++pub const unified_reserve_least_gib: f64 = 2;
++pub const unified_reserve_floor: u64 = 4 * GiB;
++pub const unified_reserve_share: u64 = 10;
++
++pub const Error = error{BadReserve};
++
++/// TENSORFOLD_MEMORY_RESERVE_GIB (2 GiB up to the memory's size), else a tenth of `total` and at least 4 GiB.
++pub fn reserveBytes(text: ?[]const u8, total: u64) Error!u64 {
++    const t = std.mem.trim(u8, text orelse "", " ");
++    if (t.len == 0) return @max(unified_reserve_floor, total / unified_reserve_share);
++    const gb = std.fmt.parseFloat(f64, t) catch return error.BadReserve;
++    if (!(gb >= unified_reserve_least_gib)) return error.BadReserve;
++    const bytes: u64 = @intFromFloat(@round(gb * gib_f));
++    return if (bytes <= total) bytes else error.BadReserve;
++}
++
++/// TensorFold's admission: the reserve above, 4.5 GiB of CUDA context, NCCL and graphs (the GLM recipe measured
++/// 3.5-4.8 GiB outside its estimate; plan section 5 takes 4-5), 1.5 GiB of prompt workspaces.
++pub fn tensorfold(total: u64, reserve_text: ?[]const u8) Error!Terms {
++    return .{ .reserve = try reserveBytes(reserve_text, total), .runtime = 4 * GiB + GiB / 2, .workspace = GiB + GiB / 2 };
++}
++
++/// The DeepSeek sibling's priced floor (families/deepseek_v41/kv/budget.zig): a hard floor of 4 GiB MemAvailable kept
++/// after boot, runtime 1.0, workspace 4.0 (graphs 1.2, prefill 1.3, select .25, drafting .35, slack .9), session RAM
++/// .25 and the 128 MiB staging set. The workspace is its fitted total, so no block-score chunk is added on top.
++pub fn dsv41() Terms {
++    return .{ .reserve = 4 * GiB, .runtime = GiB, .workspace = 4 * GiB, .session_ram = GiB / 4, .staging = 128 << 20, .prefill_rows = 0 };
++}
++
++pub const Input = struct {
++    /// MemAvailable before the weights load (or the budget the operator names).
++    available: u64,
++    /// The rank's weights: load.Plan.slotBytes().
++    weights: u64,
++    terms: Terms,
++    lanes: u32 = 1,
++    lanes_fixed: bool = false,
++    /// Rows past the reply a stream reserves for its last verify window.
++    window: u64 = pool.page_tokens,
++    /// Prompt snapshot slots (null: kv_pool's default).
++    snaps: ?usize = null,
++    /// The model's positions (config.max_positions).
++    max_positions: u64 = 1 << 20,
++};
++
++pub const Capacity = struct {
++    /// Bytes past weights and every term, workspace for `context` included.
++    room: u64,
++    /// The block-score chunk and other workspaces at `context`, bytes.
++    workspace: u64,
++    /// The longest prompt + reply one stream may hold (pages x 128, less the verify window), at most max_positions.
++    context: u64,
++    lanes: u32,
++    snaps: usize,
++    pages: usize,
++    pool_tokens: u64,
++    pool_bytes: u64,
++};
++
++pub const Reason = enum { beyond_model, no_room, too_many_lanes, does_not_fit };
++
++pub const Refusal = struct {
++    reason: Reason,
++    requested: u64,
++    /// The largest context that would fit, and the pool it brings (0: none).
++    largest: u64,
++    largest_pool_tokens: u64,
++    /// What the request's pages cost, and what the budget leaves for KV at that context.
++    need_bytes: u64,
++    room_bytes: u64,
++    weights: u64,
++    available: u64,
++    max_positions: u64,
++    token_bytes: u64,
++    lanes: u32,
++
++    pub fn format(r: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
++        switch (r.reason) {
++            .beyond_model => try w.print("CONTEXT={d} is past the model's {d} positions: use at most {d}", .{ r.requested, r.max_positions, r.max_positions }),
++            .no_room => try w.print("the budget of {d:.2} GiB leaves no KV room beside the weights ({d:.2} GiB), the runtime and the reserve: free memory or lower the reserve", .{ g(r.available), g(r.weights) }),
++            .too_many_lanes => try w.print("--parallel {d} needs a page and a table row for each extra stream, and the budget leaves {d:.2} GiB for KV: serve fewer streams", .{ r.lanes, g(r.room_bytes) }),
++            .does_not_fit => try w.print(
++                "CONTEXT={d} needs {d:.2} GiB of KV a rank ({d} bytes a token) but the budget of {d:.2} GiB leaves {d:.2} GiB after the weights ({d:.2} GiB), runtime, workspaces and reserve; the largest context that fits is {d} tokens (pool {d} tokens): set CONTEXT to at most {d}",
++                .{ r.requested, g(r.need_bytes), r.token_bytes, g(r.available), g(r.room_bytes), g(r.weights), r.largest, r.largest_pool_tokens, r.largest },
++            ),
++        }
++    }
++};
++
++fn g(bytes: u64) f64 {
++    return @as(f64, @floatFromInt(bytes)) / gib_f;
++}
++
++pub const Verdict = union(enum) { ok: Capacity, refused: Refusal };
++
++/// The block-score chunk (fp32 per index head, row and 128-key block) a prefill chunk of the terms' rows needs at `context`.
++pub fn scoreBytes(t: Terms, context: u64) u64 {
++    const rows = @min(@as(u64, t.prefill_rows), context);
++    return rows * t.index_heads * @as(u64, @intCast(pages(context))) * 4;
++}
++
++fn pages(tokens: u64) usize {
++    return @intCast((tokens + pool.page_tokens - 1) / pool.page_tokens);
++}
++
++pub fn workspaceBytes(t: Terms, context: u64) u64 {
++    return t.workspace + scoreBytes(t, context);
++}
++
++/// What the budget leaves for the pool at `context`; null when the fixed terms alone pass it.
++fn roomFor(in: Input, context: u64) ?u64 {
++    const t = in.terms;
++    const spent = std.math.add(u64, in.weights, t.reserve) catch return null;
++    const more = t.runtime + t.session_ram + t.staging + workspaceBytes(t, context);
++    const all = std.math.add(u64, spent, more) catch return null;
++    return if (all > in.available) null else in.available - all;
++}
++
++/// The pool a stream of `p` pages gets, or why not.
++fn grant(d: pool.Dims, in: Input, p: usize) error{ NoRoom, TooMany }!struct { cap: Capacity, plan: kv.Plan } {
++    const context = contextOf(in, p);
++    const room = roomFor(in, context) orelse return error.NoRoom;
++    const l = d.layout(p);
++    const snaps = in.snaps orelse kv.most_snaps;
++    const plan = kv.plan(l, .{ .room = room, .engine = 0, .lanes = in.lanes, .fixed = in.lanes_fixed, .cache = @as(u64, @min(snaps, kv.most_snaps)) * l.snap_bytes, .snaps = in.snaps }) catch |e| return switch (e) {
++        error.NoStream => error.NoRoom,
++        error.TooMany => error.TooMany,
++    };
++    // the stream's own p pages, and a page for each other stream that was granted
++    if (plan.pages < p + (plan.lanes - 1)) return error.NoRoom;
++    return .{ .cap = .{
++        .room = room,
++        .workspace = workspaceBytes(in.terms, context),
++        .context = context,
++        .lanes = plan.lanes,
++        .snaps = plan.snaps,
++        .pages = plan.pages,
++        .pool_tokens = @as(u64, plan.pages) * pool.page_tokens,
++        .pool_bytes = @as(u64, plan.pages) * l.pageBytes(),
++    }, .plan = plan };
++}
++
++/// The context a stream of `p` pages holds: its pages less the verify window, at most max_positions.
++fn contextOf(in: Input, p: usize) u64 {
++    return @min(in.max_positions, (@as(u64, p) * pool.page_tokens) -| in.window);
++}
++
++/// The most pages a stream may have (the model's positions plus the window).
++fn mostPages(in: Input) usize {
++    return pages(in.max_positions + in.window);
++}
++
++/// Binary search for the most pages that fit (monotone: more pages only shrink the room and add need).
++fn largestPages(d: pool.Dims, in: Input) ?usize {
++    var lo: usize = 0; // fits
++    var hi: usize = mostPages(in) + 1; // does not fit
++    if (grant(d, in, 1)) |_| {} else |_| return null;
++    lo = 1;
++    while (hi - lo > 1) {
++        const mid = lo + (hi - lo) / 2;
++        if (grant(d, in, mid)) |_| lo = mid else |_| hi = mid;
++    }
++    return lo;
++}
++
++/// The largest context (explicit `context` null) or the verdict on `context`: its capacity, or a refusal that names
++/// the largest context fitting the same budget.
++pub fn check(d: pool.Dims, in: Input, context: ?u64) Verdict {
++    const best = largestPages(d, in);
++    const largest: u64 = if (best) |p| contextOf(in, p) else 0;
++    var refuse: Refusal = .{
++        .reason = .no_room,
++        .requested = context orelse 0,
++        .largest = largest,
++        .largest_pool_tokens = 0,
++        .need_bytes = 0,
++        .room_bytes = roomFor(in, 0) orelse 0,
++        .weights = in.weights,
++        .available = in.available,
++        .max_positions = in.max_positions,
++        .token_bytes = d.tokenBytes(),
++        .lanes = in.lanes,
++    };
++    if (best) |p| refuse.largest_pool_tokens = (grant(d, in, p) catch unreachable).cap.pool_tokens;
++    const want = context orelse largest;
++    if (context) |c| if (c > in.max_positions) {
++        refuse.reason = .beyond_model;
++        return .{ .refused = refuse };
++    };
++    if (best == null) {
++        refuse.reason = if (in.lanes > 1 and in.lanes_fixed) .too_many_lanes else .no_room;
++        return .{ .refused = refuse };
++    }
++    const p = pages(want + in.window);
++    refuse.need_bytes = @as(u64, p) * d.pageBytes();
++    refuse.room_bytes = roomFor(in, want) orelse 0;
++    if (grant(d, in, p)) |ok| {
++        var cap = ok.cap;
++        cap.context = want;
++        return .{ .ok = cap };
++    } else |e| {
++        refuse.reason = if (e == error.TooMany) .too_many_lanes else .does_not_fit;
++        return .{ .refused = refuse };
++    }
++}
++
++/// The text of a refusal, for the server's startup message.
++pub fn refusalText(a: std.mem.Allocator, r: Refusal) ![]u8 {
++    return std.fmt.allocPrint(a, "{f}", .{r});
++}
+diff --git a/zig/src/families/minimax_m3/pool.zig b/zig/src/families/minimax_m3/pool.zig
+new file mode 100644
+index 0000000..6f84825
+--- /dev/null
++++ b/zig/src/families/minimax_m3/pool.zig
+@@ -0,0 +1,184 @@
++//! MiniMax-M3.1-Flash's paged KV on core/kv_pool.zig: a rank's page geometry, its Layout, and the attention block tables.
++//! One page is one selection block (128 keys), so the kernels address a block by its page id and nothing else.
++const std = @import("std");
++const kv = @import("core").kv_pool;
++const Config = @import("config.zig").Config;
++const shard = @import("shard.zig");
++
++/// Tokens a page holds: the sparse attention's block (`sparse_attention_config` block size, checked in `Dims.of`).
++pub const page_tokens: u32 = 128;
++/// bf16 K, V and IK.
++const elem: u64 = 2;
++/// A kept prompt snapshot is a record of a position (the pages are the store's references): its nominal slot.
++pub const snap_bytes: u64 = 64;
++
++pub const Error = error{ BlockIsNotPage, TableFull, BadSlot };
++
++/// What a rank caches a token and layer: its kv heads' K and V, and the one shared index key head.
++pub const Dims = struct {
++    layers: u32,
++    kv_heads: u32, // this rank's
++    head_dim: u32,
++    index_dim: u32,
++
++    /// Rank `s.rank`'s dims. Index keys are replicated: every rank scores its own index heads over the whole IK.
++    pub fn of(c: *const Config, s: shard.Share) Error!Dims {
++        if (c.index.block != page_tokens) return error.BlockIsNotPage;
++        return .{ .layers = c.layers, .kv_heads = @intCast(s.kv_heads.len()), .head_dim = c.head_dim, .index_dim = c.index.dim };
++    }
++
++    /// Bytes a token adds in one layer: K and V of the rank's heads, then the index key.
++    pub fn layerToken(d: Dims) u64 {
++        return (2 * @as(u64, d.kv_heads) * d.head_dim + d.index_dim) * elem;
++    }
++
++    /// Bytes a token adds across every layer (76,800 for the shipped model at two ranks).
++    pub fn tokenBytes(d: Dims) u64 {
++        return d.layerToken() * d.layers;
++    }
++
++    pub fn pageBytes(d: Dims) u64 {
++        return d.tokenBytes() * page_tokens;
++    }
++
++    /// Bytes of one stream's block-table row of `max_pages` entries.
++    pub fn tableBytes(max_pages: u64) u64 {
++        return max_pages * @sizeOf(i32);
++    }
++
++    /// The pool's layout for streams of at most `max_pages` pages: the table row is their fixed part.
++    pub fn layout(d: Dims, max_pages: u64) kv.Layout {
++        return .{ .fixed_bytes = tableBytes(max_pages), .token_bytes = d.tokenBytes(), .page_tokens = page_tokens, .snap_bytes = snap_bytes };
++    }
++
++    /// Where things sit inside one page, per layer: `K[kvh][128 tok][head_dim]`, `V[kvh][128][head_dim]`, `IK[128][index_dim]`.
++    pub fn map(d: Dims) PageMap {
++        return .{ .d = d };
++    }
++};
++
++pub const PageMap = struct {
++    d: Dims,
++
++    fn layerBytes(m: PageMap) u64 {
++        return m.d.layerToken() * page_tokens;
++    }
++    fn headBytes(m: PageMap) u64 {
++        return @as(u64, page_tokens) * m.d.head_dim * elem;
++    }
++    fn kvBytes(m: PageMap) u64 {
++        return m.d.kv_heads * m.headBytes();
++    }
++
++    /// Byte offset in the page of the first key of kv head `kvh` (rank-local) at `layer`; row `t` adds `t * head_dim * 2`.
++    pub fn k(m: PageMap, layer: u32, kvh: u32) u64 {
++        std.debug.assert(layer < m.d.layers and kvh < m.d.kv_heads);
++        return layer * m.layerBytes() + kvh * m.headBytes();
++    }
++
++    pub fn v(m: PageMap, layer: u32, kvh: u32) u64 {
++        std.debug.assert(layer < m.d.layers and kvh < m.d.kv_heads);
++        return layer * m.layerBytes() + m.kvBytes() + kvh * m.headBytes();
++    }
++
++    /// The block's index keys at `layer`: 128 rows of `index_dim`, contiguous.
++    pub fn ik(m: PageMap, layer: u32) u64 {
++        std.debug.assert(layer < m.d.layers);
++        return layer * m.layerBytes() + 2 * m.kvBytes();
++    }
++
++    /// Byte offset of a page's start in the pool's arena.
++    pub fn page(m: PageMap, id: u32) u64 {
++        return @as(u64, id) * m.d.pageBytes();
++    }
++};
++
++/// Page id and row in it of key position `pos`.
++pub fn locate(pos: u64) struct { block: usize, row: u32 } {
++    return .{ .block = @intCast(pos / page_tokens), .row = @intCast(pos % page_tokens) };
++}
++
++/// Pushes `[from, from + len)` of a slot's row to the device (null: the host mirror is the table, as in tests).
++pub const Upload = struct {
++    ctx: *anyopaque,
++    call: *const fn (ctx: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void,
++};
++
++/// The attention kernels' block tables: int32 page ids, one row of `max_pages` a slot, -1 past the stream's pages.
++/// Block `b` of a stream is page `row[b]`: selection lists (block indices) index straight into it.
++pub const Tables = struct {
++    gpa: std.mem.Allocator,
++    rows: []i32,
++    max_pages: usize,
++    slots: u32,
++    upload: ?Upload = null,
++
++    pub fn init(gpa: std.mem.Allocator, slots: u32, max_pages: usize) !Tables {
++        const rows = try gpa.alloc(i32, @as(usize, slots) * max_pages);
++        @memset(rows, -1);
++        return .{ .gpa = gpa, .rows = rows, .max_pages = max_pages, .slots = slots };
++    }
++
++    pub fn deinit(t: *Tables) void {
++        t.gpa.free(t.rows);
++        t.* = undefined;
++    }
++
++    pub fn row(t: *const Tables, slot: u32) []const i32 {
++        return t.rows[@as(usize, slot) * t.max_pages ..][0..t.max_pages];
++    }
++
++    /// The page holding key block `block` of `slot`; null past the stream's pages.
++    pub fn page(t: *const Tables, slot: u32, block: usize) ?u32 {
++        if (block >= t.max_pages) return null;
++        const id = t.row(slot)[block];
++        return if (id < 0) null else @intCast(id);
++    }
++
++    /// Writes `ids` at entry `from` of `slot`'s row; a failed upload leaves the row as it was.
++    pub fn write(t: *Tables, slot: u32, ids: []const u32, from: usize) anyerror!void {
++        if (slot >= t.slots) return error.BadSlot;
++        if (from + ids.len > t.max_pages) return error.TableFull;
++        const dst = t.rows[@as(usize, slot) * t.max_pages + from ..][0..ids.len];
++        var saved: [64]i32 = undefined;
++        const keep = if (ids.len <= saved.len) saved[0..ids.len] else try t.gpa.alloc(i32, ids.len);
++        defer if (ids.len > saved.len) t.gpa.free(keep);
++        @memcpy(keep, dst);
++        for (dst, ids) |*d, id| d.* = @intCast(id);
++        if (t.upload) |u| u.call(u.ctx, slot, from, dst) catch |e| {
++            @memcpy(dst, keep);
++            return e;
++        };
++    }
++
++    /// The slot's row back to -1 (its stream ended).
++    pub fn clear(t: *Tables, slot: u32) void {
++        @memset(t.rows[@as(usize, slot) * t.max_pages ..][0..t.max_pages], -1);
++    }
++
++    /// `kv.Table` for pool.cover: the slot's entries reach this row as pages are taken.
++    pub fn sink(t: *Tables, slot: u32) Sink {
++        return .{ .t = t, .slot = slot };
++    }
++
++    pub const Sink = struct {
++        t: *Tables,
++        slot: u32,
++
++        pub fn table(s: *Sink) kv.Table {
++            return .{ .ctx = s, .write = put };
++        }
++        fn put(ctx: *anyopaque, ids: []const u32, from: usize) anyerror!void {
++            const s: *Sink = @ptrCast(@alignCast(ctx));
++            // cover passes the whole table and `from`: write only the new entries
++            try s.t.write(s.slot, ids[from..], from);
++        }
++    };
++};
++
++test {
++    _ = @import("pool_test.zig");
++    _ = @import("budget.zig");
++    _ = @import("state.zig");
++    _ = @import("state_test.zig");
++}
+diff --git a/zig/src/families/minimax_m3/pool_test.zig b/zig/src/families/minimax_m3/pool_test.zig
+new file mode 100644
+index 0000000..e2bf565
+--- /dev/null
++++ b/zig/src/families/minimax_m3/pool_test.zig
+@@ -0,0 +1,250 @@
++//! Page geometry, block tables and the memory budget on the shipped model's numbers (plan sections 2 and 5).
++const std = @import("std");
++const kv = @import("core").kv_pool;
++const config = @import("config.zig");
++const shard = @import("shard.zig");
++const pool = @import("pool.zig");
++const budget = @import("budget.zig");
++
++const gpa = std.testing.allocator;
++const expectEqual = std.testing.expectEqual;
++const expect = std.testing.expect;
++const GiB = budget.GiB;
++
++/// The real plan's slotBytes() of rank 0 and 1 (load_test.zig, the full pack's index: 91.0855 GiB and 91.0850 GiB).
++pub const weights_rank0: u64 = 97_801_819_136;
++pub const weights_rank1: u64 = 97_801_229_056;
++
++pub fn dims(rank: usize) !pool.Dims {
++    const c = config.flash;
++    return pool.Dims.of(&c, try shard.Share.of(&c, rank, 2));
++}
++
++test "a rank caches 76,800 bytes a token and a page is 9,830,400" {
++    for ([_]usize{ 0, 1 }) |r| {
++        const d = try dims(r);
++        try expectEqual(@as(u64, 76_800), d.tokenBytes());
++        try expectEqual(@as(u64, 9_830_400), d.pageBytes());
++        try expectEqual(@as(u64, 1280), d.layerToken()); // K 512 + V 512 + IK 256
++        const l = d.layout(1024);
++        try expectEqual(@as(u64, 76_800), l.token_bytes);
++        try expectEqual(@as(u32, 128), l.page_tokens);
++        try expectEqual(@as(u64, 4096), l.fixed_bytes); // the block-table row
++    }
++    // one rank alone caches all four kv heads
++    const c = config.flash;
++    const whole = try pool.Dims.of(&c, try shard.Share.of(&c, 0, 1));
++    try expectEqual(@as(u64, 138_240), whole.tokenBytes());
++}
++
++test "a selection block that is not a page is refused" {
++    var c = config.flash;
++    c.index.block = 64;
++    try std.testing.expectError(error.BlockIsNotPage, pool.Dims.of(&c, try shard.Share.of(&c, 0, 2)));
++}
++
++test "the page map tiles the page: K, V and IK of every layer, head-major, no gap and no overlap" {
++    const d = try dims(0);
++    const m = d.map();
++    const Region = struct { at: u64, len: u64 };
++    var regions: std.ArrayList(Region) = .empty;
++    defer regions.deinit(gpa);
++    const head = @as(u64, pool.page_tokens) * d.head_dim * 2;
++    for (0..d.layers) |layer| {
++        for (0..d.kv_heads) |h| {
++            try regions.append(gpa, .{ .at = m.k(@intCast(layer), @intCast(h)), .len = head });
++            try regions.append(gpa, .{ .at = m.v(@intCast(layer), @intCast(h)), .len = head });
++        }
++        try regions.append(gpa, .{ .at = m.ik(@intCast(layer)), .len = @as(u64, pool.page_tokens) * d.index_dim * 2 });
++    }
++    try expectEqual(@as(usize, 60 * 5), regions.items.len);
++    std.mem.sort(Region, regions.items, {}, struct {
++        fn less(_: void, a: Region, b: Region) bool {
++            return a.at < b.at;
++        }
++    }.less);
++    var end: u64 = 0;
++    for (regions.items) |r| {
++        try expectEqual(end, r.at);
++        end = r.at + r.len;
++    }
++    try expectEqual(d.pageBytes(), end);
++    // one block's keys of a head are contiguous: row t of head h starts t rows after its first
++    try expectEqual(m.k(7, 1) - m.k(7, 0), head);
++    try expectEqual(m.page(3), 3 * d.pageBytes());
++    const at = pool.locate(129);
++    try expectEqual(@as(usize, 1), at.block);
++    try expectEqual(@as(u32, 1), at.row);
++}
++
++test "block tables: page ids by block, -1 past the stream, a failed upload leaves the row as it was" {
++    var t = try pool.Tables.init(gpa, 2, 8);
++    defer t.deinit();
++    for (t.rows) |e| try expectEqual(@as(i32, -1), e);
++    try t.write(1, &.{ 9, 4, 17 }, 0);
++    try t.write(1, &.{5}, 3);
++    try expectEqual(@as(?u32, 9), t.page(1, 0));
++    try expectEqual(@as(?u32, 5), t.page(1, 3));
++    try expectEqual(@as(?u32, null), t.page(1, 4));
++    try expectEqual(@as(?u32, null), t.page(0, 0));
++    try expectEqual(@as(?u32, null), t.page(1, 8)); // past the row
++    try std.testing.expectError(error.TableFull, t.write(1, &.{ 1, 2, 3, 4, 5 }, 4));
++    try std.testing.expectError(error.BadSlot, t.write(2, &.{1}, 0));
++    const Fail = struct {
++        fn call(_: *anyopaque, _: u32, _: usize, _: []const i32) anyerror!void {
++            return error.UploadFailed;
++        }
++    };
++    var dummy: u8 = 0;
++    t.upload = .{ .ctx = &dummy, .call = Fail.call };
++    try std.testing.expectError(error.UploadFailed, t.write(1, &.{ 70, 71 }, 1));
++    try expectEqual(@as(?u32, 4), t.page(1, 1));
++    try expectEqual(@as(?u32, 17), t.page(1, 2));
++    t.clear(1);
++    try expectEqual(@as(?u32, null), t.page(1, 0));
++}
++
++test "the kernel's selection lists index the table: block b of a stream is page row[b]" {
++    var p = try kv.Pool.init(gpa, 16, 9_830_400);
++    defer p.deinit();
++    var t = try pool.Tables.init(gpa, 1, 16);
++    defer t.deinit();
++    var s = t.sink(0);
++    var l: kv.Lease = .{};
++    try p.promise(&l, 5);
++    try p.cover(&l, 3, s.table());
++    try p.cover(&l, 5, s.table()); // the second call writes entries 3 and 4 only
++    for (l.ids.items, 0..) |id, b| try expectEqual(@as(?u32, id), t.page(0, b));
++    try expectEqual(@as(?u32, null), t.page(0, 5));
++    p.finish(&l);
++    try expect(p.idle());
++}
++
++// ---- the budget ----------------------------------------------------------------------------------------------------
++
++fn input(avail_gib: f64, terms: budget.Terms) budget.Input {
++    return .{ .available = @intFromFloat(avail_gib * @as(f64, @floatFromInt(GiB))), .weights = weights_rank0, .terms = terms };
++}
++
++test "119 GiB, TensorFold's reserve: the largest context and pool" {
++    const d = try dims(0);
++    const total: u64 = 119 * GiB;
++    const terms = try budget.tensorfold(total, null);
++    try expectEqual(@as(u64, 119 * GiB / 10), terms.reserve);
++    const in = input(119, terms);
++    const v = budget.check(d, in, null);
++    const cap = v.ok;
++    // 119 - 11.9 - 91.0855 - 4.5 - 1.5 - score chunk (8192 x 2 x 1k blocks x 4 B = 64 MiB) leaves about 9.9 GiB
++    try expect(cap.context > 128 * 1024 and cap.context < 140_000);
++    try expectEqual(@as(u64, 0), (cap.context + in.window) % 128);
++    try expect(cap.pool_tokens >= cap.context + in.window);
++    try expect(cap.pool_bytes <= cap.room);
++    try expect(cap.room - cap.pool_bytes < 2 * d.pageBytes() + 4096); // nothing left on the table but a page
++    // the largest is the largest: one more row needs one more page, which the budget lacks
++    try expect(budget.check(d, in, cap.context).ok.context == cap.context);
++    const over = budget.check(d, in, cap.context + 1);
++    try expectEqual(budget.Reason.does_not_fit, over.refused.reason);
++    try expectEqual(cap.context, over.refused.largest);
++    try expectEqual(cap.pool_tokens, over.refused.largest_pool_tokens);
++    // the whole budget adds up
++    const spent = in.weights + terms.reserve + terms.runtime + cap.workspace + cap.pool_bytes;
++    try expect(spent <= in.available);
++    std.debug.print("\n[119 GiB tensorfold] context {d} pool {d} tokens {d:.3} GiB room {d:.3} GiB workspace {d:.3} GiB\n", .{ cap.context, cap.pool_tokens, @as(f64, @floatFromInt(cap.pool_bytes)) / GiB, @as(f64, @floatFromInt(cap.room)) / GiB, @as(f64, @floatFromInt(cap.workspace)) / GiB });
++}
++
++test "119 GiB under the DeepSeek sibling's floor conventions" {
++    const d = try dims(0);
++    const in = input(119, budget.dsv41());
++    const cap = budget.check(d, in, null).ok;
++    // 119 - 4 floor - 1 runtime - 4 workspace - 0.25 - 0.125 - 91.0855 leaves 18.5 GiB
++    try expect(cap.context > 240_000 and cap.context < 270_000);
++    std.debug.print("[119 GiB dsv41] context {d} pool {d} tokens {d:.3} GiB\n", .{ cap.context, cap.pool_tokens, @as(f64, @floatFromInt(cap.pool_bytes)) / GiB });
++}
++
++test "rank 1 has the same KV and 590 KiB less weights" {
++    const terms = try budget.tensorfold(119 * GiB, null);
++    var in = input(119, terms);
++    const a = budget.check(try dims(0), in, null).ok;
++    in.weights = weights_rank1;
++    const b = budget.check(try dims(1), in, null).ok;
++    try expect(b.pool_tokens >= a.pool_tokens);
++    try expect(b.pool_tokens - a.pool_tokens <= 2 * 128);
++}
++
++test "other budgets: the sizes the plan names, 64 and 128 GiB hosts" {
++    const d = try dims(0);
++    for ([_]f64{ 105, 110, 119, 124 }) |avail| {
++        const terms = try budget.tensorfold(@intFromFloat(avail * @as(f64, @floatFromInt(GiB))), null);
++        const v = budget.check(d, input(avail, terms), null);
++        switch (v) {
++            .ok => |c| std.debug.print("[{d} GiB tensorfold] context {d}\n", .{ avail, c.context }),
++            .refused => |r| std.debug.print("[{d} GiB tensorfold] refused {s}\n", .{ avail, @tagName(r.reason) }),
++        }
++    }
++}
++
++test "a declared 1,048,576 context cannot fit: the refusal names the largest that does" {
++    const d = try dims(0);
++    const in = input(119, try budget.tensorfold(119 * GiB, null));
++    const best = budget.check(d, in, null).ok;
++    const r = budget.check(d, in, 1 << 20).refused;
++    try expectEqual(budget.Reason.does_not_fit, r.reason);
++    try expectEqual(best.context, r.largest);
++    // 1 M rows are 75 GiB of KV (plan section 5): the text says so and what to set
++    try expect(r.need_bytes > 74 * GiB and r.need_bytes < 77 * GiB);
++    const text = try budget.refusalText(gpa, r);
++    defer gpa.free(text);
++    var want: [96]u8 = undefined;
++    try expect(std.mem.indexOf(u8, text, "CONTEXT=1048576") != null);
++    try expect(std.mem.indexOf(u8, text, try std.fmt.bufPrint(&want, "largest context that fits is {d} tokens", .{best.context})) != null);
++    try expect(std.mem.indexOf(u8, text, "76800 bytes a token") != null);
++    try expect(std.mem.indexOf(u8, text, "set CONTEXT to at most") != null);
++    // 65,536 and 131,072 are the contexts the plan advertises: the first fits, the second fits at 119 GiB
++    try expect(budget.check(d, in, 65_536) == .ok);
++    try expect(budget.check(d, in, 131_072) == .ok);
++}
++
++test "refusals: past the model, no room beside the weights, too many streams" {
++    const d = try dims(0);
++    const in = input(119, try budget.tensorfold(119 * GiB, null));
++    const beyond = budget.check(d, in, 2_000_000).refused;
++    try expectEqual(budget.Reason.beyond_model, beyond.reason);
++    {
++        const text = try budget.refusalText(gpa, beyond);
++        defer gpa.free(text);
++        try expect(std.mem.indexOf(u8, text, "past the model's 1048576 positions") != null);
++    }
++    var small = input(95, try budget.tensorfold(95 * GiB, null)); // weights 91.1 + reserve 9.5 > 95
++    const none = budget.check(d, small, null).refused;
++    try expectEqual(budget.Reason.no_room, none.reason);
++    try expectEqual(@as(u64, 0), none.largest);
++    {
++        const text = try budget.refusalText(gpa, budget.check(d, small, 4096).refused);
++        defer gpa.free(text);
++        try expect(std.mem.indexOf(u8, text, "leaves no KV room") != null);
++    }
++    small = input(119, try budget.tensorfold(119 * GiB, null));
++    small.lanes = 5000;
++    small.lanes_fixed = true;
++    try expectEqual(budget.Reason.too_many_lanes, budget.check(d, small, 8192).refused.reason);
++    // unfixed lanes serve fewer: the plan's pool still holds a page for each granted stream
++    small.lanes = 4;
++    small.lanes_fixed = false;
++    const cap = budget.check(d, small, null).ok;
++    try expect(cap.lanes >= 1 and cap.lanes <= 4);
++    try expect(cap.pages >= (cap.context + small.window) / 128 + cap.lanes - 1);
++}
++
++test "the reserve variable: a tenth and a 4 GiB floor, 2 GiB or more, never past the memory" {
++    try expectEqual(@as(u64, 12 * GiB), try budget.reserveBytes("", 120 * GiB));
++    try expectEqual(@as(u64, 4 * GiB), try budget.reserveBytes(null, 24 * GiB));
++    try expectEqual(@as(u64, 3 * GiB), try budget.reserveBytes("3", 120 * GiB));
++    try std.testing.expectError(error.BadReserve, budget.reserveBytes("1", 120 * GiB));
++    try std.testing.expectError(error.BadReserve, budget.reserveBytes("200", 120 * GiB));
++    try std.testing.expectError(error.BadReserve, budget.reserveBytes("x", 120 * GiB));
++    // a smaller reserve buys context
++    const d = try dims(0);
++    const big = budget.check(d, input(119, try budget.tensorfold(119 * GiB, "4")), null).ok;
++    const tenth = budget.check(d, input(119, try budget.tensorfold(119 * GiB, null)), null).ok;
++    try expect(big.context > tenth.context);
++}
+diff --git a/zig/src/families/minimax_m3/state.zig b/zig/src/families/minimax_m3/state.zig
+new file mode 100644
+index 0000000..527fc69
+--- /dev/null
++++ b/zig/src/families/minimax_m3/state.zig
+@@ -0,0 +1,149 @@
++//! MiniMax-M3.1-Flash's stream state and prompt cache on the page pool. Every layer is attention: a stream is its
++//! position and its pages, so a kept prompt snapshot is page references in the radix store plus a record of the
++//! position. Restoring one copies nothing; the resumed stream adopts the store's pages.
++const std = @import("std");
++const api = @import("engine_api");
++const kv = @import("core").kv_pool;
++const pool = @import("pool.zig");
++const radix = api.prompt_radix;
++
++pub const Error = error{ ContextTooLong, LaneMemory };
++
++/// Prompt-cache rules: one page is one block, so marks and resumes sit on 128 rows; a row's bits do not depend on
++/// its chunk (kernels are row-invariant), so the store is not `planned`.
++pub const rules: radix.Rules = .{ .page = pool.page_tokens, .min_gap = 1024, .min_prompt = 2048, .tail = true };
++
++/// A live stream: the lease (its page ids in token order, the block table's entries), its slot and rows filled.
++pub const Stream = struct {
++    lease: kv.Lease = .{},
++    slot: u32 = 0,
++    /// Rows whose K, V and IK are in the pages: the next row written is `pos`.
++    pos: u32 = 0,
++};
++
++/// What a kept snapshot is: the position. No recurrent or convolution state exists to copy.
++const Saved = struct { at: u32 };
++
++/// The prompt cache over a pool: a radix store of page references and the snapshots' records.
++pub const Cache = struct {
++    gpa: std.mem.Allocator,
++    pages: *kv.Pool,
++    layout: kv.Layout,
++    store: radix.Store,
++    /// Snapshot records alive; zero at rest after `clear`.
++    live: usize = 0,
++    /// Fails the next restore or save (tests of the store's fallbacks).
++    fail_restore: bool = false,
++
++    /// `self` must stay where it is: the pool's reclaim and the store's family point into it.
++    pub fn init(c: *Cache, gpa: std.mem.Allocator, pages: *kv.Pool, layout: kv.Layout, r: radix.Rules) !void {
++        c.* = .{ .gpa = gpa, .pages = pages, .layout = layout, .store = undefined };
++        c.store = try radix.Store.init(gpa, c.snapshots(), radix.pagesOf(kv.Pool, pages, pages.page_bytes), r);
++        pages.reclaim = .{ .ctx = &c.store, .call = reclaim };
++    }
++
++    pub fn deinit(c: *Cache) void {
++        c.clear();
++        c.store.deinit();
++        c.pages.reclaim = null;
++    }
++
++    /// The store may hold `pages` pages and `snaps` snapshots; 0 and 0 clears it.
++    pub fn limit(c: *Cache, pages: usize, snaps: usize) void {
++        c.store.limit(.{ .pages = pages, .snaps = snaps });
++    }
++
++    /// A half of the pool's pages and the plan's snapshot slots: kept pages are evicted when a stream asks for them.
++    pub fn limitTo(c: *Cache, snaps: usize) void {
++        c.limit(c.pages.total() / 2, snaps);
++    }
++
++    pub fn clear(c: *Cache) void {
++        c.limit(0, 0);
++    }
++
++    fn reclaim(ctx: *anyopaque, want: usize) bool {
++        const s: *radix.Store = @ptrCast(@alignCast(ctx));
++        return s.reclaim(want);
++    }
++
++    fn of(ptr: *anyopaque) *Cache {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn snapshots(c: *Cache) radix.Snapshots {
++        return .{ .ptr = c, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } };
++    }
++
++    fn bytes(_: *anyopaque, _: u32) u64 {
++        return pool.snap_bytes;
++    }
++
++    fn save(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!radix.Saved {
++        const c = of(ptr);
++        const rec = try c.gpa.create(Saved);
++        rec.* = .{ .at = at };
++        c.live += 1;
++        return rec;
++    }
++
++    /// The stream continues at the snapshot's position; its pages come from the store (`begin` adopts them).
++    fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: radix.Saved) anyerror!void {
++        const c = of(ptr);
++        if (c.fail_restore) return error.RestoreFailed;
++        const rec: *Saved = @ptrCast(@alignCast(saved));
++        if (owner) |o| @as(*Stream, @ptrCast(@alignCast(o))).pos = rec.at;
++    }
++
++    fn drop(ptr: *anyopaque, saved: radix.Saved) void {
++        const c = of(ptr);
++        c.gpa.destroy(@as(*Saved, @ptrCast(@alignCast(saved))));
++        c.live -= 1;
++    }
++
++    /// Pages a request reserves: prompt, reply and one last verify window.
++    pub fn need(c: *const Cache, prompt: usize, max_tokens: u64, window: u64) usize {
++        return c.layout.need(prompt, max_tokens, window);
++    }
++
++    /// Admits `s` as the backend does: resume the longest kept prefix (the stream's pages start as the store's), promise
++    /// the rest of its pages and take them into the block table. Returns the marks (rows, page multiples, ascending, in
++    /// `a`) where the pass should call `keep` as its prefill reaches them.
++    /// `LaneMemory`: the pool cannot promise the pages even after the store gave its idle pages back (the host requeues).
++    /// `ContextTooLong`: the request's pages pass the stream's block-table row or the whole pool (it can never run).
++    pub fn admit(c: *Cache, a: std.mem.Allocator, s: *Stream, prompt: []const u32, history: u32, max_new: u64, window: u64, table: ?kv.Table, max_pages: usize) ![]const u32 {
++        const want = c.need(prompt.len, max_new, window);
++        if (want > max_pages or want > c.pages.total()) return error.ContextTooLong;
++        var adopt: std.ArrayList(u32) = .empty;
++        defer adopt.deinit(c.gpa);
++        const plan = try c.store.begin(a, prompt, history, &.{}, s, &adopt);
++        errdefer a.free(plan.marks);
++        const l = &s.lease;
++        errdefer c.pages.finish(l);
++        try c.pages.adopt(l, adopt.items);
++        try c.pages.promise(l, want -| adopt.items.len);
++        try c.pages.cover(l, want, table);
++        s.pos = plan.from;
++        return plan.marks;
++    }
++
++    /// The pass has filled `at` rows (a mark): the store keeps a snapshot there, and the stream's leading pages become
++    /// the store's copies of the same tokens where it already held them. The block table is rewritten to match.
++    pub fn keep(c: *Cache, s: *Stream, prompt: []const u32, at: u32, table: ?kv.Table) !void {
++        const n = at / pool.page_tokens;
++        if (n == 0 or n > s.lease.ids.items.len) return;
++        const path = try c.gpa.alloc(u32, n);
++        defer c.gpa.free(path);
++        const kept = c.store.keep(prompt, at, s, s.lease.ids.items[0..n], path);
++        for (path[0..kept.shared], 0..) |id, i| c.pages.share(&s.lease, i, id);
++        if (kept.shared > 0) if (table) |t| try t.write(t.ctx, s.lease.ids.items[0..kept.shared], 0);
++    }
++
++    /// The stream ended (finished, cancelled, failed): its pages and promise go back; pages the store kept stay.
++    /// Its block-table row, if given, goes back to -1.
++    pub fn end(c: *Cache, s: *Stream, tables: ?*pool.Tables) void {
++        c.pages.finish(&s.lease);
++        if (tables) |t| t.clear(s.slot);
++        s.pos = 0;
++    }
++};
+diff --git a/zig/src/families/minimax_m3/state_test.zig b/zig/src/families/minimax_m3/state_test.zig
+new file mode 100644
+index 0000000..0bb8b67
+--- /dev/null
++++ b/zig/src/families/minimax_m3/state_test.zig
+@@ -0,0 +1,250 @@
++//! The stream state and prompt cache on pages: admission, eviction, snapshot save and restore, refusals.
++const std = @import("std");
++const kv = @import("core").kv_pool;
++const pool = @import("pool.zig");
++const state = @import("state.zig");
++const pool_test = @import("pool_test.zig");
++
++const gpa = std.testing.allocator;
++const expectEqual = std.testing.expectEqual;
++const expect = std.testing.expect;
++
++const small: @import("engine_api").prompt_radix.Rules = .{ .page = 128, .min_gap = 128, .min_prompt = 0, .tail = true };
++
++/// A pool of `n` pages, its block tables and the cache on both.
++const Rig = struct {
++    pages: kv.Pool,
++    tables: pool.Tables,
++    cache: state.Cache,
++    max_pages: usize,
++
++    fn start(r: *Rig, n: usize, max_pages: usize) !void {
++        const d = try pool_test.dims(0);
++        r.max_pages = max_pages;
++        r.pages = try kv.Pool.init(gpa, n, d.pageBytes());
++        r.tables = try pool.Tables.init(gpa, 4, max_pages);
++        try r.cache.init(gpa, &r.pages, d.layout(max_pages), small);
++    }
++
++    fn stop(r: *Rig) void {
++        r.cache.deinit();
++        r.tables.deinit();
++        r.pages.deinit();
++    }
++
++    fn admit(r: *Rig, s: *state.Stream, prompt: []const u32, history: u32, max_new: u64) !void {
++        var arena: std.heap.ArenaAllocator = .init(gpa);
++        defer arena.deinit();
++        var sink = r.tables.sink(s.slot);
++        const marks = try r.cache.admit(arena.allocator(), s, prompt, history, max_new, 16, sink.table(), r.max_pages);
++        for (marks) |m| try r.cache.keep(s, prompt, m, sink.table()); // the prefill reaching each mark
++    }
++
++    fn end(r: *Rig, s: *state.Stream) void {
++        r.cache.end(s, &r.tables);
++    }
++};
++
++fn tokens(comptime n: usize, seed: u32) [n]u32 {
++    var out: [n]u32 = undefined;
++    for (&out, 0..) |*t, i| t.* = seed * 100_000 + @as(u32, @intCast(i));
++    return out;
++}
++
++test "pages for prompt, reply and the verify window" {
++    var r: Rig = undefined;
++    try r.start(8, 8);
++    defer r.stop();
++    try expectEqual(@as(usize, 1), r.cache.need(100, 12, 16)); // 128 rows exactly
++    try expectEqual(@as(usize, 2), r.cache.need(100, 13, 16));
++    try expectEqual(@as(usize, 3), r.cache.need(300, 50, 16)); // 366 rows
++    try expectEqual(@as(usize, 1024), r.cache.need(131_000, 0, 72)); // 131,072 rows
++    var s: state.Stream = .{};
++    const p = tokens(300, 1);
++    try r.admit(&s, &p, 0, 50);
++    try expectEqual(@as(usize, 3), s.lease.ids.items.len);
++    for (s.lease.ids.items, 0..) |id, b| try expectEqual(@as(?u32, id), r.tables.page(0, b)); // the block table is the lease
++    try expectEqual(@as(?u32, null), r.tables.page(0, 3));
++    try expectEqual(@as(usize, 5), r.pages.available()); // three taken, none promised
++    r.end(&s);
++    try expect(r.pages.idle());
++}
++
++test "a kept prompt resumes from page references: the pages are the first stream's, nothing is copied" {
++    var r: Rig = undefined;
++    try r.start(16, 16);
++    defer r.stop();
++    r.cache.limit(8, 4);
++    var a: state.Stream = .{ .slot = 0 };
++    const p1 = tokens(600, 1);
++    try r.admit(&a, &p1, 0, 40);
++    const first_pages = try gpa.dupe(u32, a.lease.ids.items);
++    defer gpa.free(first_pages);
++    try expect(r.cache.live > 0); // a snapshot record was kept
++    r.end(&a);
++    // the store alone holds the kept prefix now; the rest is free
++    const c = r.pages.census();
++    try expect(c.kept > 0 and c.leased == 0 and c.promised == 0);
++    try expectEqual(c.total, c.free + c.kept);
++    // a later turn of the same conversation: the first 512 rows are the kept pages
++    var p2: [700]u32 = undefined;
++    @memcpy(p2[0..600], &p1);
++    for (p2[600..], 0..) |*t, i| t.* = 777_000 + @as(u32, @intCast(i));
++    var b: state.Stream = .{ .slot = 1 };
++    try r.admit(&b, &p2, 600, 40);
++    try expect(b.pos > 0 and b.pos % 128 == 0 and b.pos <= 600);
++    const shared = b.pos / 128;
++    try expectEqualSlices(first_pages[0..shared], b.lease.ids.items[0..shared]);
++    try expectEqual(@as(usize, 1), r.pages.leased[b.lease.ids.items[0]]);
++    try expect(r.pages.holders(b.lease.ids.items[0]) == 2); // the stream and the store
++    try expect(r.cache.store.tree.counts.hits == 1);
++    // the stream's block table starts with the shared pages
++    for (b.lease.ids.items, 0..) |id, k| try expectEqual(@as(?u32, id), r.tables.page(1, k));
++    r.end(&b);
++    r.cache.clear();
++    try expect(r.pages.idle());
++    try expectEqual(@as(usize, r.pages.total()), r.pages.nfree);
++    try expectEqual(@as(usize, 0), r.cache.live);
++}
++
++fn expectEqualSlices(a: []const u32, b: []const u32) !void {
++    try std.testing.expectEqualSlices(u32, a, b);
++}
++
++test "a restore that fails prefills from the start and drops the snapshot" {
++    var r: Rig = undefined;
++    try r.start(16, 16);
++    defer r.stop();
++    r.cache.limit(8, 4);
++    var a: state.Stream = .{};
++    const p1 = tokens(600, 2);
++    try r.admit(&a, &p1, 0, 8);
++    r.end(&a);
++    const live = r.cache.live;
++    try expect(live > 0);
++    r.cache.fail_restore = true;
++    var b: state.Stream = .{};
++    try r.admit(&b, &p1, 0, 8);
++    try expectEqual(@as(u32, 0), b.pos);
++    try expect(r.cache.store.tree.counts.failed >= 1);
++    try expect(r.cache.live < live + 1);
++    r.end(&b);
++    r.cache.clear();
++    try expect(r.pages.idle());
++    try expectEqual(@as(usize, 0), r.cache.live);
++}
++
++test "eviction: a stream that needs the pool takes the kept pages back" {
++    var r: Rig = undefined;
++    try r.start(8, 8);
++    defer r.stop();
++    r.cache.limit(8, 4);
++    var a: state.Stream = .{};
++    const p1 = tokens(600, 3);
++    try r.admit(&a, &p1, 0, 8); // 5 pages
++    r.end(&a);
++    const kept = r.pages.census().kept;
++    try expect(kept >= 3);
++    try expect(r.pages.available() < 8);
++    // an unrelated prompt of 7 pages: only possible if the store gives pages back
++    var b: state.Stream = .{};
++    const p2 = tokens(850, 4);
++    try r.admit(&b, &p2, 0, 0);
++    try expectEqual(@as(usize, 7), b.lease.ids.items.len);
++    try expect(r.cache.store.tree.counts.evicted > 0);
++    r.end(&b);
++    r.cache.clear();
++    try expect(r.pages.idle());
++    try expectEqual(@as(usize, 8), r.pages.nfree);
++}
++
++test "refusals: past the table row or the pool is final, a full pool is LaneMemory and leaves nothing leased" {
++    var r: Rig = undefined;
++    try r.start(6, 4);
++    defer r.stop();
++    var s: state.Stream = .{};
++    const long = tokens(700, 5); // 6 pages: past the 4-entry table
++    try std.testing.expectError(error.ContextTooLong, r.admit(&s, &long, 0, 0));
++    try expect(r.pages.idle());
++    var big: state.Stream = .{};
++    const four = tokens(480, 6); // 4 pages
++    try r.admit(&big, &four, 0, 0);
++    var t: state.Stream = .{ .slot = 1 };
++    const three = tokens(300, 7); // 3 pages, 2 free
++    try std.testing.expectError(error.LaneMemory, r.admit(&t, &three, 0, 0));
++    try expectEqual(@as(usize, 2), r.pages.available());
++    try expectEqual(@as(usize, 0), r.pages.promised);
++    try expectEqual(@as(usize, 0), t.lease.ids.items.len);
++    // the first stream ends and the second runs
++    r.end(&big);
++    try r.admit(&t, &three, 0, 0);
++    r.end(&t);
++    try expect(r.pages.idle());
++}
++
++test "a failed table upload gives the pages back" {
++    var r: Rig = undefined;
++    try r.start(8, 2); // a 2-entry row
++    defer r.stop();
++    var s: state.Stream = .{};
++    const p = tokens(200, 8); // 2 pages fit the row
++    try r.admit(&s, &p, 0, 0);
++    r.end(&s);
++    r.tables.upload = .{ .ctx = &r, .call = struct {
++        fn call(_: *anyopaque, _: u32, _: usize, _: []const i32) anyerror!void {
++            return error.UploadFailed;
++        }
++    }.call };
++    const q = tokens(200, 9);
++    try std.testing.expectError(error.UploadFailed, r.admit(&s, &q, 0, 0));
++    try expect(r.pages.idle());
++    try expectEqual(@as(?u32, null), r.tables.page(0, 0));
++}
++
++test "random admits, ends and limits leave every page free or the store's" {
++    var prng = std.Random.DefaultPrng.init(7);
++    const rnd = prng.random();
++    for (0..40) |seed| {
++        var r: Rig = undefined;
++        try r.start(12 + seed % 5, 12);
++        defer r.stop();
++        r.cache.limit(6, 4);
++        var live: [4]?state.Stream = @splat(null);
++        var convs: [3][1000]u32 = undefined;
++        for (&convs, 0..) |*c, k| for (c, 0..) |*t, i| {
++            t.* = if (i < 256) @intCast(i) else @intCast(100_000 * (k + 1) + i);
++        };
++        var lens: [3]u32 = @splat(0);
++        for (0..60) |_| {
++            const k = rnd.uintLessThan(usize, 3);
++            const slot = rnd.uintLessThan(usize, 4);
++            if (live[slot]) |*s| {
++                r.end(s);
++                live[slot] = null;
++            } else if (rnd.uintLessThan(u8, 4) != 0) {
++                const hist = lens[k];
++                lens[k] = @min(900, hist + 130 + rnd.uintLessThan(u32, 200));
++                var s: state.Stream = .{ .slot = @intCast(slot) };
++                r.admit(&s, convs[k][0..lens[k]], hist, rnd.uintLessThan(u64, 60)) catch |e| switch (e) {
++                    error.LaneMemory, error.ContextTooLong => continue,
++                    else => return e,
++                };
++                live[slot] = s;
++            }
++            // every page: holders are the live leases and the store; free pages are the rest
++            var refs: [20]u32 = @splat(0);
++            var promised: usize = 0;
++            for (live) |m| if (m) |s| {
++                promised += s.lease.promised;
++                for (s.lease.ids.items) |id| refs[id] += 1;
++            };
++            for (r.pages.leased, 0..) |l, id| try expect(l == refs[id]);
++            try expectEqual(promised, r.pages.promised);
++        }
++        for (&live) |*m| if (m.*) |*s| r.end(s);
++        r.cache.clear();
++        try expect(r.pages.idle());
++        try expectEqual(r.pages.total(), r.pages.nfree);
++        try expectEqual(@as(usize, 0), r.cache.live);
++    }
++}
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# run output
+*.log
+*.out
+results/tmp/
+
+# local config: copy config/prod.env.example to config/prod.env on each node and fill it in
+config/*.env
+.env
+
+# staged model files and packs never live in the checkout
+stage/
+models/
+
+# private names for scripts/check-public.sh
+.check-public.local
+.engine-redact.local
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Mia's recipe: this setup's own values (scripts/config.sh reads them)
+scripts/local.sh

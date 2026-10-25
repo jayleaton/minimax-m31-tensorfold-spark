@@ -1,0 +1,269 @@
+{
+  "label": "",
+  "started": "2026-10-26T02:13:57+0700",
+  "config": {
+    "command": "bench",
+    "base": "http://127.0.0.1:8000",
+    "model": "MiniMax-M3.1-Flash-EXL3",
+    "timeout": 600,
+    "out": "out/windowall2-20261025T172620Z/309-vision/vision-bench.json",
+    "label": "",
+    "max_images": 4,
+    "max_image_mb": 10.0,
+    "vision_urls": false,
+    "reps": 3,
+    "sizes": "small,square,wide",
+    "suites": "timing,vqa",
+    "max_tokens": 256,
+    "min_accuracy": 0.0,
+    "engine_api_tools": null,
+    "api_tools": true
+  },
+  "timing": {
+    "small": {
+      "width": 224,
+      "height": 224,
+      "png_bytes": 1211,
+      "estimated_tokens": 64,
+      "image_tokens": 66,
+      "ttft_s_median": 0.762,
+      "total_s_median": 2.402,
+      "errors": 0,
+      "runs": [
+        {
+          "rep": 0,
+          "ttft_s": 0.762,
+          "total_s": 2.382,
+          "prompt_tokens": 280,
+          "text_prompt_tokens": 214,
+          "image_tokens": 66,
+          "completion_tokens": 35,
+          "content": "The image shows a red semicircle on the left, a blue parallelogram in the middle, and a green triangle on the right, overlapping slightly against a white backgr",
+          "problems": []
+        },
+        {
+          "rep": 1,
+          "ttft_s": 0.778,
+          "total_s": 2.411,
+          "prompt_tokens": 280,
+          "text_prompt_tokens": 214,
+          "image_tokens": 66,
+          "completion_tokens": 35,
+          "content": "The image shows a red semicircle on the left, a blue parallelogram in the middle, and a green triangle on the right, overlapping slightly against a white backgr",
+          "problems": []
+        },
+        {
+          "rep": 2,
+          "ttft_s": 0.754,
+          "total_s": 2.402,
+          "prompt_tokens": 280,
+          "text_prompt_tokens": 214,
+          "image_tokens": 66,
+          "completion_tokens": 35,
+          "content": "The image shows a red semicircle on the left, a blue parallelogram in the middle, and a green triangle on the right, overlapping slightly against a white backgr",
+          "problems": []
+        }
+      ]
+    },
+    "square": {
+      "width": 672,
+      "height": 672,
+      "png_bytes": 6741,
+      "estimated_tokens": 576,
+      "image_tokens": 578,
+      "ttft_s_median": 1.484,
+      "total_s_median": 3.346,
+      "errors": 0,
+      "runs": [
+        {
+          "rep": 0,
+          "ttft_s": 1.486,
+          "total_s": 3.371,
+          "prompt_tokens": 792,
+          "text_prompt_tokens": 214,
+          "image_tokens": 578,
+          "completion_tokens": 36,
+          "content": "The image shows three overlapping basic shapes\u2014a red circle on the left, a blue rectangle in the middle, and a green triangle on the right\u2014drawn on a white back",
+          "problems": []
+        },
+        {
+          "rep": 1,
+          "ttft_s": 1.481,
+          "total_s": 3.321,
+          "prompt_tokens": 792,
+          "text_prompt_tokens": 214,
+          "image_tokens": 578,
+          "completion_tokens": 36,
+          "content": "The image shows three overlapping basic shapes\u2014a red circle on the left, a blue rectangle in the middle, and a green triangle on the right\u2014drawn on a white back",
+          "problems": []
+        },
+        {
+          "rep": 2,
+          "ttft_s": 1.484,
+          "total_s": 3.346,
+          "prompt_tokens": 792,
+          "text_prompt_tokens": 214,
+          "image_tokens": 578,
+          "completion_tokens": 36,
+          "content": "The image shows three overlapping basic shapes\u2014a red circle on the left, a blue rectangle in the middle, and a green triangle on the right\u2014drawn on a white back",
+          "problems": []
+        }
+      ]
+    },
+    "wide": {
+      "width": 2016,
+      "height": 224,
+      "png_bytes": 4387,
+      "estimated_tokens": 576,
+      "image_tokens": 578,
+      "ttft_s_median": 1.485,
+      "total_s_median": 3.299,
+      "errors": 0,
+      "runs": [
+        {
+          "rep": 0,
+          "ttft_s": 1.505,
+          "total_s": 3.299,
+          "prompt_tokens": 792,
+          "text_prompt_tokens": 214,
+          "image_tokens": 578,
+          "completion_tokens": 34,
+          "content": "The image shows three colored shapes on a white background: a red circle on the left, a blue square in the middle, and a green triangle on the right.",
+          "problems": []
+        },
+        {
+          "rep": 1,
+          "ttft_s": 1.485,
+          "total_s": 3.379,
+          "prompt_tokens": 792,
+          "text_prompt_tokens": 214,
+          "image_tokens": 578,
+          "completion_tokens": 36,
+          "content": "The image shows three colored shapes arranged horizontally on a white background: a red circle on the left, a blue square in the middle, and a green triangle on",
+          "problems": []
+        },
+        {
+          "rep": 2,
+          "ttft_s": 1.475,
+          "total_s": 3.234,
+          "prompt_tokens": 792,
+          "text_prompt_tokens": 214,
+          "image_tokens": 578,
+          "completion_tokens": 34,
+          "content": "The image shows three colored shapes on a white background: a red circle on the left, a blue square in the middle, and a green triangle on the right.",
+          "problems": []
+        }
+      ]
+    }
+  },
+  "vqa": {
+    "correct": 10,
+    "total": 10,
+    "accuracy": 1.0,
+    "errors": 0,
+    "items": [
+      {
+        "name": "count-circles",
+        "kind": "number",
+        "expected": "3",
+        "read": "3",
+        "ok": true,
+        "content": "3",
+        "error": null,
+        "seconds": 1.05
+      },
+      {
+        "name": "count-squares",
+        "kind": "number",
+        "expected": "5",
+        "read": "5",
+        "ok": true,
+        "content": "5",
+        "error": null,
+        "seconds": 1.05
+      },
+      {
+        "name": "count-triangles",
+        "kind": "number",
+        "expected": "2",
+        "read": "2",
+        "ok": true,
+        "content": "2",
+        "error": null,
+        "seconds": 1.05
+      },
+      {
+        "name": "count-shapes",
+        "kind": "number",
+        "expected": "4",
+        "read": "4",
+        "ok": true,
+        "content": "4",
+        "error": null,
+        "seconds": 1.04
+      },
+      {
+        "name": "color-circle",
+        "kind": "color",
+        "expected": "yellow",
+        "read": "yellow",
+        "ok": true,
+        "content": "Yellow",
+        "error": null,
+        "seconds": 1.04
+      },
+      {
+        "name": "color-square",
+        "kind": "color",
+        "expected": "green",
+        "read": "green",
+        "ok": true,
+        "content": "Green",
+        "error": null,
+        "seconds": 1.05
+      },
+      {
+        "name": "shape",
+        "kind": "shape",
+        "expected": "triangle",
+        "read": "triangle",
+        "ok": true,
+        "content": "Triangle",
+        "error": null,
+        "seconds": 1.04
+      },
+      {
+        "name": "digit",
+        "kind": "number",
+        "expected": "7",
+        "read": "7",
+        "ok": true,
+        "content": "7",
+        "error": null,
+        "seconds": 1.04
+      },
+      {
+        "name": "number",
+        "kind": "number",
+        "expected": "38",
+        "read": "38",
+        "ok": true,
+        "content": "38",
+        "error": null,
+        "seconds": 1.04
+      },
+      {
+        "name": "word",
+        "kind": "word",
+        "expected": "cat",
+        "read": "cat",
+        "ok": true,
+        "content": "CAT",
+        "error": null,
+        "seconds": 1.05
+      }
+    ]
+  },
+  "errors": 0,
+  "ok": true
+}

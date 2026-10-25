@@ -1,0 +1,2039 @@
+From c259e8840f8f7a77f56525d98d05de194c4d4c28 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 12:13:42 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: qk-norm/RoPE paged writer, fp32 router
+ GEMV and block-table mirror (T8 kernels)
+
+Adds minimax_m3_rows.cu: tf_mm3_rows (per-head Gemma RMSNorm of q, k and the index
+heads, partial RoPE with float64 angles, q and the index query to scratch, k, v and
+the index key straight into paged K/V/IK by block table; decode positions or pos0;
+rope layout, index rope, fp16/bf16 index input, weight offset and norm rounding are
+launch parameters) and tf_mm3_router_bf16/f32 (fp32 router logits, fixed per-output
+reduction order independent of row count, tiling and neighbours).
+
+Zig: cuda/minimax_m3_rows.zig wrapper and the Mirror of the block tables (device copy
+with pool.Upload-compatible call, per-row row_tab offsets for shared windows, single
+stream table pointers), std-only minimax_m3_rows_geom.zig arithmetic, families/
+minimax_m3/rows.zig (Switches -> launch parameters), launch records from nvcc 13.0.88
+for sm_80/86/89/120/121, contract test types with float64 references (compile-checked),
+host twins with planted mutants, and `zig build test-minimax-rows`. No GPU has run any
+kernel; nothing here claims GPU correctness. Written from the plan's formulas.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ zig/build/cuda.zig                            |   1 +
+ zig/build/cuda_kernels.zig                    |   1 +
+ zig/build/cuda_row_contracts.zig              |   2 +-
+ zig/build/minimax_ref_host.zig                |  32 ++
+ zig/kernels/cuda/minimax_m3_rows.cu           | 195 +++++++
+ zig/kernels/cuda/minimax_m3_rows.cuh          |  47 ++
+ .../core/contract/minimax_m3_rows_records.zig |  14 +
+ zig/src/core/contract/registry.zig            |   2 +-
+ zig/src/cuda/kernels.zig                      |   1 +
+ zig/src/cuda/minimax_m3_rows.zig              | 215 +++++++
+ zig/src/cuda/minimax_m3_rows_geom.zig         | 142 +++++
+ zig/src/cuda/root.zig                         |   2 +
+ zig/src/families/minimax_m3/rows.zig          |  54 ++
+ zig/tests/cuda/contract_minimax_rows.zig      | 368 ++++++++++++
+ zig/tests/cuda/contract_tests.zig             |  13 +-
+ zig/tests/minimax_rows_tests.zig              | 544 ++++++++++++++++++
+ zig/tests/minimax_rows_twin.zig               | 191 ++++++
+ 17 files changed, 1821 insertions(+), 3 deletions(-)
+ create mode 100644 zig/kernels/cuda/minimax_m3_rows.cu
+ create mode 100644 zig/kernels/cuda/minimax_m3_rows.cuh
+ create mode 100644 zig/src/core/contract/minimax_m3_rows_records.zig
+ create mode 100644 zig/src/cuda/minimax_m3_rows.zig
+ create mode 100644 zig/src/cuda/minimax_m3_rows_geom.zig
+ create mode 100644 zig/src/families/minimax_m3/rows.zig
+ create mode 100644 zig/tests/cuda/contract_minimax_rows.zig
+ create mode 100644 zig/tests/minimax_rows_tests.zig
+ create mode 100644 zig/tests/minimax_rows_twin.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index a44bf78..a7acb4f 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -275,6 +275,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     _ = @import("minimax_pool.zig").step(b, host, mods.core);
+     _ = @import("minimax_tp.zig").step(b, host, mods.core);
+     @import("minimax_ref_host.zig").ffn(b, host, mods.core, cuda, step);
++    @import("minimax_ref_host.zig").rows(b, host, mods.core, cuda, step);
+     const exl3_host = b.step("test-exl3-cuda-host", "EXL3 loader and CUDA host regressions without a GPU");
+     const exl3_compile = b.addObject(.{ .name = "exl3_host_compile", .root_module = b.createModule(.{
+         .root_source_file = b.path("zig/tests/exl3_compile.zig"),
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 79aeb9e..86e89aa 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -109,6 +109,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "minimax_m3_index", .flags = glue }, // ours: MiniMax-M3.1-Flash index scores and per-128-key block maxima (cuda/minimax_m3_sparse.zig)
+     .{ .name = "minimax_m3_select", .flags = glue }, // ours: forced-block top-16 with the tie and forcing rules as launch parameters
+     .{ .name = "minimax_m3_attn", .flags = glue }, // ours: selected-block GQA attention over paged K/V, 16 q heads a K/V stream
++    .{ .name = "minimax_m3_rows", .flags = glue }, // ours: MiniMax-M3.1-Flash per-head norm, partial RoPE, paged K/V/IK writes and the fp32 router GEMV
+     .{ .name = "drama3_staged_gemv", .flags = glue },
+     .{ .name = "drama3", .flags = &.{"-O3"} },
+     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+diff --git a/zig/build/cuda_row_contracts.zig b/zig/build/cuda_row_contracts.zig
+index da02ebd..f3b37bc 100644
+--- a/zig/build/cuda_row_contracts.zig
++++ b/zig/build/cuda_row_contracts.zig
+@@ -2,7 +2,7 @@
+ const std = @import("std");
+ 
+ pub fn host(b: *std.Build, target: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, step: *std.Build.Step) void {
+-    for ([_][]const u8{ "contract_norms_tail.zig", "contract_act_round.zig", "contract_embed.zig", "contract_qk_round.zig", "contract_minimax_act.zig" }) |name| {
++    for ([_][]const u8{ "contract_norms_tail.zig", "contract_act_round.zig", "contract_embed.zig", "contract_qk_round.zig", "contract_minimax_act.zig", "contract_minimax_rows.zig" }) |name| {
+         const m = b.createModule(.{
+             .root_source_file = b.path(b.pathJoin(&.{ "zig/tests/cuda", name })),
+             .target = target,
+diff --git a/zig/build/minimax_ref_host.zig b/zig/build/minimax_ref_host.zig
+index 1048b46..604ccb0 100644
+--- a/zig/build/minimax_ref_host.zig
++++ b/zig/build/minimax_ref_host.zig
+@@ -42,3 +42,35 @@ pub fn ffn(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Modul
+     b.step("test-minimax-ffn", "MiniMax-M3.1-Flash FFN wiring (swigluoai switches, router plan) without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
+ }
++
++/// The row kernels' host tests: norm and RoPE writer, fp32 router, block-table mirror arithmetic, launch records.
++pub fn rows(b: *std.Build, host: std.Build.ResolvedTarget, core: *std.Build.Module, cuda: *std.Build.Module, umbrella: *std.Build.Step) void {
++    const pool = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/pool.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .imports = &.{.{ .name = "core", .module = core }},
++    });
++    const plan = b.createModule(.{
++        .root_source_file = b.path("zig/src/families/minimax_m3/rows.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda } },
++    });
++    const m = b.createModule(.{
++        .root_source_file = b.path("zig/tests/minimax_rows_tests.zig"),
++        .target = host,
++        .optimize = .ReleaseSafe,
++        .link_libc = true,
++        .imports = &.{
++            .{ .name = "core", .module = core },
++            .{ .name = "cuda", .module = cuda },
++            .{ .name = "mm3_pool", .module = pool },
++            .{ .name = "mm3_plan", .module = plan },
++        },
++    });
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
++    b.step("test-minimax-rows", "MiniMax-M3.1-Flash qk-norm/RoPE writer, fp32 router and block-table mirror without a GPU").dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++}
+diff --git a/zig/kernels/cuda/minimax_m3_rows.cu b/zig/kernels/cuda/minimax_m3_rows.cu
+new file mode 100644
+index 0000000..6d0d899
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_rows.cu
+@@ -0,0 +1,195 @@
++// MiniMax-M3.1-Flash row kernels from the engine-port plan (section 2, steps 3-6 and 11a); no third-party code.
++
++// tf_mm3_rows: per-head Gemma RMSNorm of q, k and index heads, partial RoPE; q, iq to scratch, k, v, ik to pages.
++
++// Reference: core/minimax_ref.zig gemmaNorm then rope. A CTA is a row, a head a warp: 4 values a lane, xor tree.
++
++// Rotation angles are float64 (pos * theta^(-2i/rot), sincos) rounded once to fp32: fp32 angles are off by 1e-2 at 1e6.
++
++// tf_mm3_router_*: fp32 logits[r][e] = sum_k w[e][k] * x[r][k]; a warp owns one expert and up to 4 rows.
++
++// Lane l sums chunks l, l + 32, ... in four fp32 fma chains, then (a0 + a1) + (a2 + a3), then a fixed xor tree 16 .. 1.
++
++// That order never looks at the row count, the tile or the neighbours: a row's logits are the same bits at any width.
++
++// NaN rule: none stated, arithmetic propagates NaN and infinities as the float64 reference does.
++#include "minimax_m3_rows.cuh"
++
++using namespace tf_mm3;
++
++namespace {
++
++__device__ __forceinline__ float tree32(float a) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, o));
++    return a;
++}
++
++// Output dim d of the rotated head: stage holds the normed head, c and s the pair table.
++__device__ __forceinline__ float rotated(const float* stage, const float (*cs)[MAX_ROT_PAIRS], int d, int rot, bool gptj) {
++    const int half = rot >> 1;
++    int i, ia, ib;
++    if (gptj) {
++        i = d >> 1;
++        ia = 2 * i;
++        ib = ia + 1;
++    } else {
++        i = d < half ? d : d - half;
++        ia = i;
++        ib = i + half;
++    }
++    const float a = stage[ia], b = stage[ib], c = cs[0][i], s = cs[1][i];
++    const bool first = gptj ? (d & 1) == 0 : d < half;
++    return first ? __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)) : __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
++}
++
++} // namespace
++
++extern "C" __global__ void __launch_bounds__(ROWS_THREADS) tf_mm3_rows(
++    const bf16* __restrict__ q_in, long long q_ld,         // [rows, nq * 128]
++    const bf16* __restrict__ k_in, long long k_ld,         // [rows, kvh * 128]
++    const bf16* __restrict__ v_in, long long v_ld,         // [rows, kvh * 128]
++    const unsigned short* __restrict__ iq_in, long long iq_ld,  // [rows, niq * 128], fp16 or bf16 bits
++    const unsigned short* __restrict__ ik_in, long long ik_ld,  // [rows, 128], fp16 or bf16 bits
++    const float* __restrict__ q_w, const float* __restrict__ k_w, const float* __restrict__ iq_w,
++    const float* __restrict__ ik_w,                        // [128] each, null when that norm is off
++    bf16* __restrict__ q_out, long long q_out_ld, bf16* __restrict__ iq_out, long long iq_out_ld,
++    const int* __restrict__ pos, int pos0,                 // [rows] or null (pos0 + r)
++    const int* __restrict__ row_tab, const int* __restrict__ tables, int max_pages,
++    char* pool, long long page_bytes, long long layer_off,
++    int rows, int nq, int niq, int kvh, int has_ik, int flags, int rot, float eps, float w_add, float w_add_index, double theta,
++    int* status) {
++    const int r = blockIdx.x;
++    if (r >= rows) return;
++    const int p = row_pos(pos, pos0, r);
++    if (p < 0) return;
++    __shared__ float cs[2][MAX_ROT_PAIRS];
++    __shared__ float stage[ROWS_WARPS][D];
++    const int half = rot >> 1;
++    const int blk = p / BLOCK;
++    const int page = blk < max_pages ? __ldg(tables + row_table(row_tab, r) + blk) : -1;
++    if (threadIdx.x == 0 && status != nullptr && page < 0) atomicOr(status, blk < max_pages ? ROWS_STATUS_NO_PAGE : ROWS_STATUS_PAST_TABLE);
++    if (threadIdx.x < half) {
++        double sn, cn;
++        sincos((double)p * pow(theta, -2.0 * (double)threadIdx.x / (double)rot), &sn, &cn);
++        cs[0][threadIdx.x] = (float)cn;
++        cs[1][threadIdx.x] = (float)sn;
++    }
++    __syncthreads();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int t = p % BLOCK;
++    const bool gptj = (flags & ROWS_GPTJ) != 0;
++    const int total = nq + niq + 2 * kvh + (has_ik ? 1 : 0);
++    char* layer = page >= 0 ? pool + (long long)page * page_bytes + layer_off : nullptr;
++    for (int s = warp; s < total; s += ROWS_WARPS) {
++        int kind = 0, h = s;  // 0 q, 1 index q, 2 k, 3 v, 4 index key
++        if (s >= nq) { kind = 1; h = s - nq; }
++        if (s >= nq + niq) { kind = 2; h = s - nq - niq; }
++        if (s >= nq + niq + kvh) { kind = 3; h = s - nq - niq - kvh; }
++        if (s >= nq + niq + 2 * kvh) { kind = 4; h = 0; }
++        const unsigned short* src;
++        const float* w;
++        bool norm, rope, fp16 = false;
++        switch (kind) {
++        case 0: src = reinterpret_cast<const unsigned short*>(q_in + r * q_ld + h * D); w = q_w; norm = flags & ROWS_NORM_QK; rope = true; break;
++        case 1: src = iq_in + r * iq_ld + h * D; w = iq_w; norm = flags & ROWS_NORM_INDEX; rope = flags & ROWS_INDEX_ROPE; fp16 = flags & ROWS_INDEX_FP16; break;
++        case 2: src = reinterpret_cast<const unsigned short*>(k_in + r * k_ld + h * D); w = k_w; norm = flags & ROWS_NORM_QK; rope = true; break;
++        case 3: src = reinterpret_cast<const unsigned short*>(v_in + r * v_ld + h * D); w = nullptr; norm = false; rope = false; break;
++        default: src = ik_in + r * ik_ld; w = ik_w; norm = flags & ROWS_NORM_INDEX; rope = flags & ROWS_INDEX_ROPE; fp16 = flags & ROWS_INDEX_FP16; break;
++        }
++        const uint2 raw = __ldg(reinterpret_cast<const uint2*>(src) + lane);
++        if (kind == 3) {  // v is stored as it came
++            if (layer != nullptr) reinterpret_cast<uint2*>(layer + kv_elem(kvh, 1, h, t) * 2)[lane] = raw;
++            continue;
++        }
++        float4 x = fp16 ? widen4_half(raw) : widen4(raw);
++        if (norm) {
++            float ss = __fmul_rn(x.x, x.x);
++            ss = __fadd_rn(ss, __fmul_rn(x.y, x.y));
++            ss = __fadd_rn(ss, __fmul_rn(x.z, x.z));
++            ss = __fadd_rn(ss, __fmul_rn(x.w, x.w));
++            ss = tree32(ss);
++            const float inv = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, 128.f), eps)));
++            const float4 wv = __ldg(reinterpret_cast<const float4*>(w) + lane);
++            const float wa = (kind == 1 || kind == 4) ? w_add_index : w_add;
++            x.x = __fmul_rn(__fmul_rn(x.x, inv), __fadd_rn(wv.x, wa));
++            x.y = __fmul_rn(__fmul_rn(x.y, inv), __fadd_rn(wv.y, wa));
++            x.z = __fmul_rn(__fmul_rn(x.z, inv), __fadd_rn(wv.z, wa));
++            x.w = __fmul_rn(__fmul_rn(x.w, inv), __fadd_rn(wv.w, wa));
++            if (flags & ROWS_ROUND_NORM) x = make_float4(rn_bf16(x.x), rn_bf16(x.y), rn_bf16(x.z), rn_bf16(x.w));
++        }
++        float* st = stage[warp];
++        st[4 * lane] = x.x;
++        st[4 * lane + 1] = x.y;
++        st[4 * lane + 2] = x.z;
++        st[4 * lane + 3] = x.w;
++        __syncwarp();
++        float o[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int d = 4 * lane + i;
++            o[i] = (rope && d < rot) ? rotated(st, cs, d, rot, gptj) : st[d];
++        }
++        __syncwarp();
++        const uint2 packed = pack4(o[0], o[1], o[2], o[3]);
++        if (kind == 0) {
++            reinterpret_cast<uint2*>(q_out + r * q_out_ld + h * D)[lane] = packed;
++        } else if (kind == 1) {
++            reinterpret_cast<uint2*>(iq_out + r * iq_out_ld + h * D)[lane] = packed;
++        } else if (layer != nullptr) {
++            const long long e = kind == 2 ? kv_elem(kvh, 0, h, t) : ik_elem(kvh, t);
++            reinterpret_cast<uint2*>(layer + e * 2)[lane] = packed;
++        }
++    }
++}
++
++namespace {
++
++__device__ __forceinline__ float4 load_x(const bf16* p) { return widen4(__ldg(reinterpret_cast<const uint2*>(p))); }
++__device__ __forceinline__ float4 load_x(const float* p) { return __ldg(reinterpret_cast<const float4*>(p)); }
++
++template <typename X>
++__device__ __forceinline__ void router_body(const X* __restrict__ x, long long x_ld, const float* __restrict__ w,
++                                            float* __restrict__ out, int rows, int ne, int k) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int e = blockIdx.x * ROUTER_WARPS + warp;
++    if (e >= ne) return;
++    const long long r0 = (long long)blockIdx.y * ROUTER_ROWS;
++    float acc[ROUTER_ROWS][4];
++#pragma unroll
++    for (int i = 0; i < ROUTER_ROWS; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
++    const float* we = w + (long long)e * k;
++#pragma unroll 4
++    for (int j = 0; j < k / ROUTER_CHUNK; ++j) {
++        const int c = 4 * (lane + 32 * j);
++        const float4 wv = __ldg(reinterpret_cast<const float4*>(we + c));
++#pragma unroll
++        for (int i = 0; i < ROUTER_ROWS; ++i) {
++            if (r0 + i >= rows) continue;
++            const float4 xv = load_x(x + (r0 + i) * x_ld + c);
++            acc[i][0] = __fmaf_rn(xv.x, wv.x, acc[i][0]);
++            acc[i][1] = __fmaf_rn(xv.y, wv.y, acc[i][1]);
++            acc[i][2] = __fmaf_rn(xv.z, wv.z, acc[i][2]);
++            acc[i][3] = __fmaf_rn(xv.w, wv.w, acc[i][3]);
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < ROUTER_ROWS; ++i) {
++        const float sum = tree32(__fadd_rn(__fadd_rn(acc[i][0], acc[i][1]), __fadd_rn(acc[i][2], acc[i][3])));
++        if (lane == 0 && r0 + i < rows) out[(r0 + i) * ne + e] = sum;
++    }
++}
++
++} // namespace
++
++// x bf16 [rows, k] at x_ld elements a row, w fp32 [ne, k], out fp32 [rows, ne]; k a multiple of 128, x_ld of 4.
++extern "C" __global__ void __launch_bounds__(ROUTER_WARPS * 32) tf_mm3_router_bf16(
++    const bf16* __restrict__ x, long long x_ld, const float* __restrict__ w, float* __restrict__ out, int rows, int ne, int k) {
++    router_body<bf16>(x, x_ld, w, out, rows, ne, k);
++}
++
++// The same with an fp32 input: a bf16 hidden cast to fp32 gives the same bits as the bf16 form.
++extern "C" __global__ void __launch_bounds__(ROUTER_WARPS * 32) tf_mm3_router_f32(
++    const float* __restrict__ x, long long x_ld, const float* __restrict__ w, float* __restrict__ out, int rows, int ne, int k) {
++    router_body<float>(x, x_ld, w, out, rows, ne, k);
++}
+diff --git a/zig/kernels/cuda/minimax_m3_rows.cuh b/zig/kernels/cuda/minimax_m3_rows.cuh
+new file mode 100644
+index 0000000..42ff5a6
+--- /dev/null
++++ b/zig/kernels/cuda/minimax_m3_rows.cuh
+@@ -0,0 +1,47 @@
++// MiniMax-M3.1-Flash row kernels: launch flags and helpers of minimax_m3_rows.cu, written from the engine-port plan.
++#pragma once
++
++#include "minimax_m3_sparse.cuh"
++
++#include <cuda_fp16.h>
++
++namespace tf_mm3 {
++
++// Bits of the flags argument of tf_mm3_rows: each unverified semantic of core/minimax_ref.zig Switches is one.
++constexpr int ROWS_NORM_QK = 1;      // Gemma-norm q and k per head (use_qk_norm, qk_norm_type per_head)
++constexpr int ROWS_NORM_INDEX = 2;   // Gemma-norm the index query heads and the index key
++constexpr int ROWS_INDEX_ROPE = 4;   // rotate the index query and key (Switches.index_rope)
++constexpr int ROWS_INDEX_FP16 = 8;   // the index projections' outputs are fp16 (else bf16)
++constexpr int ROWS_ROUND_NORM = 16;  // round the norm output to bf16 before the rotation (Switches.bf16_norm_out)
++constexpr int ROWS_GPTJ = 32;        // rotate (2i, 2i + 1) pairs (Switches.rope_layout gptj_interleaved); else (i, i + rot/2)
++
++// Bits kernels may set in the optional status word.
++constexpr int ROWS_STATUS_NO_PAGE = 1;    // a row's block table entry was negative: its K/V/IK were not written
++constexpr int ROWS_STATUS_PAST_TABLE = 2; // a row's position is past its block table row
++
++constexpr int ROWS_WARPS = 8;
++constexpr int ROWS_THREADS = ROWS_WARPS * 32;
++constexpr int MAX_ROT_PAIRS = 64;
++
++constexpr int ROUTER_WARPS = 4;    // experts a block
++constexpr int ROUTER_ROWS = 4;     // rows a warp; a row's bits do not depend on how many share the warp
++constexpr int ROUTER_CHUNK = 128;  // k is a multiple: 32 lanes x 4 values a step
++
++__device__ __forceinline__ float rn_bf16(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
++
++__device__ __forceinline__ float4 widen4(uint2 w) { return make_float4(lo(w.x), hi(w.x), lo(w.y), hi(w.y)); }
++
++__device__ __forceinline__ float4 widen4_half(uint2 w) {
++    return make_float4(__half2float(__ushort_as_half(w.x & 0xffffu)), __half2float(__ushort_as_half(w.x >> 16)),
++                       __half2float(__ushort_as_half(w.y & 0xffffu)), __half2float(__ushort_as_half(w.y >> 16)));
++}
++
++__device__ __forceinline__ uint2 pack4(float a, float b, float c, float d) {
++    const unsigned x = (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(a)) |
++                       ((unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(b)) << 16);
++    const unsigned y = (unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(c)) |
++                       ((unsigned)__bfloat16_as_ushort(__float2bfloat16_rn(d)) << 16);
++    return make_uint2(x, y);
++}
++
++} // namespace tf_mm3
+diff --git a/zig/src/core/contract/minimax_m3_rows_records.zig b/zig/src/core/contract/minimax_m3_rows_records.zig
+new file mode 100644
+index 0000000..fc1e339
+--- /dev/null
++++ b/zig/src/core/contract/minimax_m3_rows_records.zig
+@@ -0,0 +1,14 @@
++//! MiniMax-M3.1-Flash row kernels' launch records: nvcc 13.0.88 cuobjdump, sm_80, 86, 89, 120, 121.
++const L = @import("limits.zig");
++
++fn u(regs: u32, static: u32, bound: u32) L.Usage {
++    return .{ .regs = regs, .static = static, .bound = bound };
++}
++
++pub fn records(comptime Record: type) [3]Record {
++    return .{
++        .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_rows", .symbol = "tf_mm3_rows", .image = "minimax_m3_rows", .threads = 256 }, .usage = .{ u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256), u(48, 4608, 256) } },
++        .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_router_bf16", .symbol = "tf_mm3_router_bf16", .image = "minimax_m3_rows", .threads = 128 }, .usage = .{ u(48, 0, 128), u(48, 0, 128), u(48, 0, 128), u(48, 0, 128), u(48, 0, 128) } },
++        .{ .launch = .{ .name = "minimax_m3_rows tf_mm3_router_f32", .symbol = "tf_mm3_router_f32", .image = "minimax_m3_rows", .threads = 128 }, .usage = .{ u(56, 0, 128), u(56, 0, 128), u(56, 0, 128), u(51, 0, 128), u(51, 0, 128) } },
++    };
++}
+diff --git a/zig/src/core/contract/registry.zig b/zig/src/core/contract/registry.zig
+index 6820ab3..6adc669 100644
+--- a/zig/src/core/contract/registry.zig
++++ b/zig/src/core/contract/registry.zig
+@@ -192,7 +192,7 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
+     .{ .launch = .{ .name = "experts3_prefill down", .symbol = "_ZN19tf_experts3_prefill14prefill_kernelILi1ELi3ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3_prefill", .threads = 256, .dynamic = 47104, .opt_in = true }, .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_widen", .symbol = "tf_experts3_widen", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 } } },
+     .{ .launch = .{ .name = "experts3 tf_experts3_planes", .symbol = "tf_experts3_planes", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 } } },
+-} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("registry_minimax.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("minimax_m3_records.zig").records(CudaRecord);
++} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("registry_minimax.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("minimax_m3_records.zig").records(CudaRecord) ++ @import("minimax_m3_rows_records.zig").records(CudaRecord);
+ 
+ /// The nvcc release `cuda`'s usage records come from: the compiler that builds the release fatbins.
+ pub const cuda_release: limits.Nvcc = .{ .major = 13, .minor = 0 };
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 2377128..b73ad1f 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -57,6 +57,7 @@ pub const moe_glue: []const u8 = if (available) &Blob("fatbin_moe_glue").bytes e
+ pub const minimax_m3_index: []const u8 = if (available) &Blob("fatbin_minimax_m3_index").bytes else &.{};
+ pub const minimax_m3_select: []const u8 = if (available) &Blob("fatbin_minimax_m3_select").bytes else &.{};
+ pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_attn").bytes else &.{};
++pub const minimax_m3_rows: []const u8 = if (available) &Blob("fatbin_minimax_m3_rows").bytes else &.{};
+ pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
+ pub const minimax_m3_act: []const u8 = if (available) &Blob("fatbin_minimax_m3_act").bytes else &.{};
+ pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
+diff --git a/zig/src/cuda/minimax_m3_rows.zig b/zig/src/cuda/minimax_m3_rows.zig
+new file mode 100644
+index 0000000..fcd5f0e
+--- /dev/null
++++ b/zig/src/cuda/minimax_m3_rows.zig
+@@ -0,0 +1,215 @@
++//! MiniMax-M3.1-Flash row kernels (minimax_m3_rows.cu): norm and RoPE into paged K/V/IK, fp32 router, table mirror.
++const std = @import("std");
++const kernels = @import("kernels.zig");
++const module = @import("module.zig");
++const launch_ = @import("launch.zig");
++const stream_ = @import("stream.zig");
++const memory = @import("memory.zig");
++const sp = @import("minimax_m3_sparse.zig");
++pub const geom = @import("minimax_m3_rows_geom.zig");
++
++const Driver = @import("driver.zig").Driver;
++const Module = module.Module;
++const Function = module.Function;
++const Stream = stream_.Stream;
++
++/// Local head counts of a rank: query heads, index query heads, kv heads, and whether the index key is written.
++pub const Heads = struct { nq: u32 = 32, niq: u32 = 2, kvh: u32 = 2, index_key: bool = true };
++
++/// Norm and rotation arguments; `w_add` (q, k) and `w_add_index` are 1 for raw Gemma weights, 0 for the folded `1 + w`.
++pub const Opts = struct {
++    rot: u32 = 64,
++    theta: f64 = 1e7,
++    eps: f32 = 1e-6,
++    w_add: f32 = 0,
++    w_add_index: f32 = 0,
++    flags: geom.Flags = .{},
++};
++
++/// Device inputs: row-major projections at element strides; the index inputs are fp16 (or bf16 per `flags.index_fp16`).
++pub const Inputs = struct {
++    q: u64,
++    q_ld: usize,
++    k: u64,
++    k_ld: usize,
++    v: u64,
++    v_ld: usize,
++    iq: u64 = 0,
++    iq_ld: usize = 0,
++    ik: u64 = 0,
++    ik_ld: usize = 0,
++};
++
++/// fp32 [128] norm weights on the device; 0 when that norm is off.
++pub const Norms = struct { q: u64 = 0, k: u64 = 0, iq: u64 = 0, ik: u64 = 0 };
++
++/// bf16 scratch rows for q [rows, nq * 128] and the index query [rows, niq * 128].
++pub const Outputs = struct { q: u64, q_ld: usize, iq: u64 = 0, iq_ld: usize = 0 };
++
++pub const Router = struct { experts: u32 = 128, k: u32 = 6144 };
++
++pub const Rows = struct {
++    mod: Module,
++    rows_fn: Function,
++    bf16_fn: Function,
++    f32_fn: Function,
++
++    pub fn load(d: *const Driver) !Rows {
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var m = try Module.load(d, kernels.minimax_m3_rows);
++        errdefer m.unload();
++        return .{
++            .mod = m,
++            .rows_fn = try m.function("tf_mm3_rows"),
++            .bf16_fn = try m.function("tf_mm3_router_bf16"),
++            .f32_fn = try m.function("tf_mm3_router_f32"),
++        };
++    }
++
++    pub fn unload(g: *Rows) void {
++        g.mod.unload();
++    }
++
++    fn cfg(l: geom.Launch) launch_.Config {
++        return .{ .grid = .{ .x = l.grid[0], .y = l.grid[1], .z = l.grid[2] }, .block = .{ .x = l.block } };
++    }
++
++    /// Norm and rotate the heads of `rows` into scratch and the pages `p` names; `status` (int32 or 0) gets bits.
++    pub fn qkRope(g: *const Rows, st: Stream, h: Heads, o: Opts, in: Inputs, nm: Norms, out: Outputs, rows: sp.Rows, p: sp.Paged, max_pages: u32, status: u64) !void {
++        const launch = try geom.rowsLaunch(rows.n);
++        if (p.kvh != h.kvh or h.nq == 0 or h.nq % h.kvh != 0) return error.Heads;
++        try geom.checkRows(o.rot, h.nq * geom.d, in.q_ld);
++        try geom.checkRows(o.rot, h.nq * geom.d, out.q_ld);
++        try geom.checkRows(o.rot, h.kvh * geom.d, in.k_ld);
++        try geom.checkRows(o.rot, h.kvh * geom.d, in.v_ld);
++        if (h.niq > 0) {
++            try geom.checkRows(o.rot, h.niq * geom.d, in.iq_ld);
++            try geom.checkRows(o.rot, h.niq * geom.d, out.iq_ld);
++            if (in.iq == 0 or out.iq == 0) return error.Heads;
++        }
++        if (h.index_key) try geom.checkRows(o.rot, geom.d, in.ik_ld);
++        if (h.index_key and in.ik == 0) return error.Heads;
++        const f = o.flags;
++        if ((f.norm_qk and (nm.q == 0 or nm.k == 0)) or (f.norm_index and ((h.niq > 0 and nm.iq == 0) or (h.index_key and nm.ik == 0)))) return error.Heads;
++        if (p.tables == 0 or p.pool == 0 or max_pages == 0) return error.Heads;
++        var a: launch_.Args = .{};
++        a.add(in.q);
++        a.add(@as(i64, @intCast(in.q_ld)));
++        a.add(in.k);
++        a.add(@as(i64, @intCast(in.k_ld)));
++        a.add(in.v);
++        a.add(@as(i64, @intCast(in.v_ld)));
++        a.add(in.iq);
++        a.add(@as(i64, @intCast(in.iq_ld)));
++        a.add(in.ik);
++        a.add(@as(i64, @intCast(in.ik_ld)));
++        for ([_]u64{ nm.q, nm.k, nm.iq, nm.ik }) |w| a.add(w);
++        a.add(out.q);
++        a.add(@as(i64, @intCast(out.q_ld)));
++        a.add(out.iq);
++        a.add(@as(i64, @intCast(out.iq_ld)));
++        a.add(rows.pos);
++        a.add(rows.pos0);
++        a.add(p.row_tab);
++        a.add(p.tables);
++        a.add(@as(i32, @intCast(max_pages)));
++        a.add(p.pool);
++        a.add(@as(i64, @intCast(p.page_bytes)));
++        a.add(@as(i64, @intCast(p.layer_off)));
++        a.add(@as(i32, @intCast(rows.n)));
++        a.add(@as(i32, @intCast(h.nq)));
++        a.add(@as(i32, @intCast(h.niq)));
++        a.add(@as(i32, @intCast(h.kvh)));
++        a.add(@as(i32, @intFromBool(h.index_key)));
++        a.add(f.bits());
++        a.add(@as(i32, @intCast(o.rot)));
++        a.add(o.eps);
++        a.add(o.w_add);
++        a.add(o.w_add_index);
++        a.add(o.theta);
++        a.add(status);
++        try launch_.launch(g.rows_fn, cfg(launch), st, &a);
++    }
++
++    /// logits [rows, experts] fp32 = x [rows, k] times w [experts, k] fp32; x bf16, or fp32 when `x_f32`.
++    pub fn routerLogits(g: *const Rows, st: Stream, r: Router, x: u64, x_ld: usize, x_f32: bool, w: u64, out: u64, rows: usize) !void {
++        const launch = try geom.routerLaunch(rows, r.experts);
++        try geom.checkRouter(r.k, x_ld);
++        if (x % 16 != 0 or w % 16 != 0 or x_ld % 4 != 0) return error.Heads;
++        var a: launch_.Args = .{};
++        a.add(x);
++        a.add(@as(i64, @intCast(x_ld)));
++        a.add(w);
++        a.add(out);
++        a.add(@as(i32, @intCast(rows)));
++        a.add(@as(i32, @intCast(r.experts)));
++        a.add(@as(i32, @intCast(r.k)));
++        try launch_.launch(if (x_f32) g.f32_fn else g.bf16_fn, cfg(launch), st, &a);
++    }
++};
++
++/// The pool the paged kernels address: base, page and layer strides, local kv heads.
++pub const Cache = struct { pool: u64, page_bytes: u64, layer_off: u64, kvh: u32 };
++
++/// Device copy of the block tables (int32 page ids, -1 padded, `max_pages` a slot) and the per-row offsets T5 reads.
++pub const Mirror = struct {
++    tables: memory.DeviceBuffer,
++    row_tab: memory.DeviceBuffer,
++    slots: usize,
++    max_pages: usize,
++    max_rows: usize,
++
++    pub fn init(d: *const Driver, slots: usize, max_pages: usize, max_rows: usize) !Mirror {
++        _ = try geom.entryOffset(slots, max_pages);
++        var t = try memory.DeviceBuffer.alloc(d, slots * max_pages * @sizeOf(i32));
++        errdefer t.free();
++        try t.fill32(0xffffffff, null);
++        const rt = try memory.DeviceBuffer.alloc(d, max_rows * @sizeOf(i32));
++        return .{ .tables = t, .row_tab = rt, .slots = slots, .max_pages = max_pages, .max_rows = max_rows };
++    }
++
++    pub fn deinit(m: *Mirror) void {
++        m.tables.free();
++        m.row_tab.free();
++    }
++
++    /// Entries [from, from + entries.len) of `slot`'s row, copied to the device once they have landed.
++    pub fn put(m: *Mirror, slot: usize, from: usize, entries: []const i32) !void {
++        const r = try geom.entryBytes(m.slots, m.max_pages, slot, from, entries.len);
++        try m.tables.upload(r.off, std.mem.sliceAsBytes(entries));
++    }
++
++    /// kv pool Tables' `Upload.call`: pass the Mirror as its ctx.
++    pub fn call(ctx: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void {
++        const m: *Mirror = @ptrCast(@alignCast(ctx));
++        try m.put(slot, from, entries);
++    }
++
++    /// The whole host table (`slots * max_pages` entries) in one copy, e.g. after a restore.
++    pub fn putAll(m: *Mirror, rows: []const i32) !void {
++        if (rows.len != m.slots * m.max_pages) return error.TableFull;
++        try m.tables.upload(0, std.mem.sliceAsBytes(rows));
++    }
++
++    /// The window's per-row offsets: `host` (one entry a row) is filled from `segs` and queued on `st`.
++    pub fn setRows(m: *Mirror, st: Stream, host: []i32, segs: []const geom.Seg) !void {
++        if (host.len == 0 or host.len > m.max_rows) return error.TooManyRows;
++        try geom.fillRowTab(host, segs, m.slots, m.max_pages);
++        try m.row_tab.uploadAsync(0, std.mem.sliceAsBytes(host), st.handle);
++    }
++
++    /// Several streams' rows in one call: every row reads the table at its own `row_tab` offset.
++    pub fn shared(m: *const Mirror, c: Cache) sp.Paged {
++        return .{ .pool = c.pool, .page_bytes = c.page_bytes, .layer_off = c.layer_off, .kvh = c.kvh, .tables = m.tables.ptr, .row_tab = m.row_tab.ptr };
++    }
++
++    /// One stream's rows (a prompt chunk): the table pointer is the slot's row and `row_tab` is 0.
++    pub fn single(m: *const Mirror, c: Cache, slot: usize) !sp.Paged {
++        const r = try geom.entryBytes(m.slots, m.max_pages, slot, 0, 0);
++        return .{ .pool = c.pool, .page_bytes = c.page_bytes, .layer_off = c.layer_off, .kvh = c.kvh, .tables = m.tables.ptr + r.off };
++    }
++};
++
++test {
++    _ = geom;
++}
+diff --git a/zig/src/cuda/minimax_m3_rows_geom.zig b/zig/src/cuda/minimax_m3_rows_geom.zig
+new file mode 100644
+index 0000000..5115b47
+--- /dev/null
++++ b/zig/src/cuda/minimax_m3_rows_geom.zig
+@@ -0,0 +1,142 @@
++//! MiniMax-M3.1-Flash row kernels: launch geometry, flag bits and block-table arithmetic (std only, host-testable).
++const std = @import("std");
++
++pub const d = 128; // head_dim and index_head_dim
++pub const block = 128; // tokens a page
++pub const rows_threads = 256; // 8 warps, a warp a head
++pub const rows_warps = 8;
++pub const router_warps = 4; // experts a block
++pub const router_rows = 4; // rows a warp
++pub const router_chunk = 128; // reduction length is a multiple: 32 lanes of 4 values
++pub const router_threads = router_warps * 32;
++pub const max_rot = 128;
++pub const max_rot_pairs = 64;
++pub const max_grid_y = 65535;
++
++/// Bits of the kernel's `flags` argument; the defaults are core/minimax_ref.zig's Switches defaults.
++pub const Flags = struct {
++    norm_qk: bool = true,
++    norm_index: bool = true,
++    index_rope: bool = true,
++    index_fp16: bool = true,
++    round_norm: bool = false,
++    gptj: bool = false,
++
++    pub fn bits(f: Flags) i32 {
++        var b: i32 = 0;
++        if (f.norm_qk) b |= 1;
++        if (f.norm_index) b |= 2;
++        if (f.index_rope) b |= 4;
++        if (f.index_fp16) b |= 8;
++        if (f.round_norm) b |= 16;
++        if (f.gptj) b |= 32;
++        return b;
++    }
++};
++
++/// Bits the kernel ORs into its status word.
++pub const status_no_page: i32 = 1;
++pub const status_past_table: i32 = 2;
++
++pub const Launch = struct { grid: [3]u32, block: u32 };
++
++pub const RowsError = error{ Empty, TooManyRows, BadRot, BadStride, Heads };
++
++/// Head slots a row works through: q, index q, k, v and the index key.
++pub fn slots(nq: usize, niq: usize, kvh: usize, has_ik: bool) usize {
++    return nq + niq + 2 * kvh + @intFromBool(has_ik);
++}
++
++/// One CTA a row; its warps take the slots in order.
++pub fn rowsLaunch(rows: usize) RowsError!Launch {
++    if (rows == 0) return error.Empty;
++    if (rows > std.math.maxInt(i32)) return error.TooManyRows;
++    return .{ .grid = .{ @intCast(rows), 1, 1 }, .block = rows_threads };
++}
++
++/// Rotation width must be even and fit the head; strides keep 8-byte vector loads and stores aligned.
++pub fn checkRows(rot: usize, width: usize, ld: usize) RowsError!void {
++    if (rot == 0 or rot % 2 != 0 or rot > max_rot) return error.BadRot;
++    if (width == 0 or width % d != 0 or ld < width or ld % 4 != 0) return error.BadStride;
++}
++
++pub fn routerLaunch(rows: usize, experts: usize) RowsError!Launch {
++    if (rows == 0 or experts == 0) return error.Empty;
++    const gy = (rows + router_rows - 1) / router_rows;
++    if (gy > max_grid_y) return error.TooManyRows;
++    return .{ .grid = .{ @intCast((experts + router_warps - 1) / router_warps), @intCast(gy), 1 }, .block = router_threads };
++}
++
++pub fn checkRouter(k: usize, x_ld: usize) RowsError!void {
++    if (k == 0 or k % router_chunk != 0 or x_ld < k or x_ld % 4 != 0) return error.BadStride;
++}
++
++pub const TableError = error{ BadSlot, TableFull, Overflow, NoPage, PastTable, Gap };
++
++/// Entry offset of a slot's table row inside the device copy: slot * max_pages, which must fit an int32.
++pub fn entryOffset(slot: usize, max_pages: usize) TableError!i32 {
++    const v = std.math.mul(usize, slot, max_pages) catch return error.Overflow;
++    if (v > std.math.maxInt(i32)) return error.Overflow;
++    return @intCast(v);
++}
++
++/// Byte range of entries [from, from + n) of a slot's row in the device copy.
++pub fn entryBytes(slots_n: usize, max_pages: usize, slot: usize, from: usize, n: usize) TableError!struct { off: usize, len: usize } {
++    if (slot >= slots_n) return error.BadSlot;
++    if (from > max_pages or n > max_pages - from) return error.TableFull;
++    _ = try entryOffset(slots_n, max_pages);
++    return .{ .off = (slot * max_pages + from) * @sizeOf(i32), .len = n * @sizeOf(i32) };
++}
++
++/// A stream's rows in a call: rows [row0, row0 + rows) belong to slot `slot`.
++pub const Seg = struct { slot: u32, rows: usize };
++
++/// row_tab for consecutive segments covering every row: each row's entry is its slot's offset.
++pub fn fillRowTab(out: []i32, segs: []const Seg, slots_n: usize, max_pages: usize) TableError!void {
++    var at: usize = 0;
++    for (segs) |s| {
++        if (s.slot >= slots_n) return error.BadSlot;
++        if (s.rows > out.len - at) return error.Gap;
++        const off = try entryOffset(s.slot, max_pages);
++        @memset(out[at..][0..s.rows], off);
++        at += s.rows;
++    }
++    if (at != out.len) return error.Gap;
++}
++
++/// The page the kernels read for position `pos` of the row whose table starts at entry `off` (the kernel's own lookup).
++pub fn pageOf(tables: []const i32, max_pages: usize, off: usize, pos: usize) TableError!u32 {
++    const b = pos / block;
++    if (b >= max_pages) return error.PastTable;
++    if (off + max_pages > tables.len) return error.TableFull;
++    const id = tables[off + b];
++    return if (id < 0) error.NoPage else @intCast(id);
++}
++
++/// Checks every row of a call before it launches: a page for the row's position. `row_tab` null: one table at entry 0.
++pub fn checkCall(tables: []const i32, max_pages: usize, row_tab: ?[]const i32, pos: ?[]const i32, pos0: i32, rows: usize) TableError!void {
++    for (0..rows) |r| {
++        const p: i32 = if (pos) |a| a[r] else pos0 + @as(i32, @intCast(r));
++        if (p < 0) continue;
++        const off: usize = if (row_tab) |t| @intCast(t[r]) else 0;
++        _ = try pageOf(tables, max_pages, off, @intCast(p));
++    }
++}
++
++/// Blocks (= pages) a stream with positions up to `pos` needs.
++pub fn pagesNeeded(pos: usize) usize {
++    return pos / block + 1;
++}
++
++test "launch geometry and flag bits" {
++    const l = try rowsLaunch(300);
++    try std.testing.expectEqual([3]u32{ 300, 1, 1 }, l.grid);
++    try std.testing.expectEqual(@as(u32, 256), l.block);
++    try std.testing.expectError(error.Empty, rowsLaunch(0));
++    const r = try routerLaunch(5, 128);
++    try std.testing.expectEqual([3]u32{ 32, 2, 1 }, r.grid);
++    try std.testing.expectEqual(@as(u32, 128), r.block);
++    try std.testing.expectEqual(@as(usize, 32 + 2 + 4 + 1), slots(32, 2, 2, true));
++    try std.testing.expectEqual(@as(i32, 1 | 2 | 4 | 8), (Flags{}).bits());
++    try std.testing.expectEqual(@as(i32, 16 | 32), (Flags{ .norm_qk = false, .norm_index = false, .index_rope = false, .index_fp16 = false, .round_norm = true, .gptj = true }).bits());
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index bc82947..0e99408 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -60,6 +60,7 @@ pub const block_attention = @import("block_attention.zig");
+ pub const window_attention = @import("window_attention.zig");
+ pub const moe_glue = @import("moe_glue.zig");
+ pub const minimax_m3_sparse = @import("minimax_m3_sparse.zig");
++pub const minimax_m3_rows = @import("minimax_m3_rows.zig");
+ pub const dense_rows = @import("dense_rows.zig");
+ pub const exl3 = @import("exl3.zig");
+ pub const exl3_experts = @import("exl3_experts.zig");
+@@ -118,6 +119,7 @@ test {
+     _ = @import("window_attention.zig");
+     _ = @import("moe_glue.zig");
+     _ = @import("minimax_m3_sparse.zig");
++    _ = @import("minimax_m3_rows.zig");
+     _ = @import("dense_rows.zig");
+ }
+ 
+diff --git a/zig/src/families/minimax_m3/rows.zig b/zig/src/families/minimax_m3/rows.zig
+new file mode 100644
+index 0000000..ea5149d
+--- /dev/null
++++ b/zig/src/families/minimax_m3/rows.zig
+@@ -0,0 +1,54 @@
++//! MiniMax-M3.1-Flash row kernels' wiring: the launch parameters the unverified T0 switches become. Host-testable.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++const mr = core.minimax_ref;
++const rows = cuda.minimax_m3_rows;
++
++pub const Switches = mr.Switches;
++
++/// What the loader left in a norm tensor: raw Gemma `w` or the folded fp32 `1 + w` (Streamer.fold does the latter).
++pub const Stored = enum { raw, folded };
++
++pub const Rope = struct { rot: u32 = 64, theta: f64 = 1e7, eps: f32 = 1e-6 };
++
++pub const Error = error{FoldedPlain};
++
++fn add(gemma: bool, stored: Stored) Error!f32 {
++    if (gemma) return if (stored == .raw) 1 else 0;
++    return if (stored == .raw) 0 else error.FoldedPlain;
++}
++
++/// The kernel's arguments for a set of switches. Folded weights cannot give a plain (non-Gemma) norm back.
++pub fn opts(sw: Switches, r: Rope, qk: Stored, index: Stored, index_fp16: bool) Error!rows.Opts {
++    return .{
++        .rot = r.rot,
++        .theta = r.theta,
++        .eps = r.eps,
++        .w_add = try add(sw.gemma_qk_norms, qk),
++        .w_add_index = try add(sw.gemma_index_norms, index),
++        .flags = .{
++            .norm_qk = true,
++            .norm_index = true,
++            .index_rope = sw.index_rope,
++            .index_fp16 = index_fp16,
++            .round_norm = sw.bf16_norm_out,
++            .gptj = sw.rope_layout == .gptj_interleaved,
++        },
++    };
++}
++
++/// The router: 128 experts over the 6144 hidden values, fp32 weights, x bf16 (the fp32 form takes the cast hidden).
++pub const router: rows.Router = .{ .experts = 128, .k = 6144 };
++
++test "switches become flags and weight offsets" {
++    const o = try opts(.{}, .{}, .folded, .folded, true);
++    try std.testing.expectEqual(@as(f32, 0), o.w_add);
++    try std.testing.expectEqual(@as(i32, 1 | 2 | 4 | 8), o.flags.bits());
++    const raw = try opts(.{ .rope_layout = .gptj_interleaved, .index_rope = false, .bf16_norm_out = true }, .{}, .raw, .raw, false);
++    try std.testing.expectEqual(@as(f32, 1), raw.w_add_index);
++    try std.testing.expectEqual(@as(i32, 1 | 2 | 16 | 32), raw.flags.bits());
++    try std.testing.expectError(error.FoldedPlain, opts(.{ .gemma_qk_norms = false }, .{}, .folded, .folded, true));
++    const plain = try opts(.{ .gemma_index_norms = false }, .{}, .folded, .raw, true);
++    try std.testing.expectEqual(@as(f32, 0), plain.w_add_index);
++}
+diff --git a/zig/tests/cuda/contract_minimax_rows.zig b/zig/tests/cuda/contract_minimax_rows.zig
+new file mode 100644
+index 0000000..ace2d1f
+--- /dev/null
++++ b/zig/tests/cuda/contract_minimax_rows.zig
+@@ -0,0 +1,368 @@
++//! MiniMax-M3.1-Flash row kernels under the contract on CUDA (compile-checked only: no GPU has run these).
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const rig_ = @import("contract_rig.zig");
++
++const contract = core.contract;
++const c = contract.spec;
++const g = contract.gates;
++const Dense = contract.dense.Dense;
++const mr = core.minimax_ref;
++const rk = cuda.minimax_m3_rows;
++const geom = rk.geom;
++
++const experts = 128;
++const hidden = 6144;
++
++fn chain(s: c.Shape) usize {
++    return s.k / 128 + 3 + 5;
++}
++
++pub const Form = enum { bf16, f32 };
++
++pub fn routerSpec(f: Form) c.Spec {
++    return .{
++        .name = if (f == .bf16) "cuda minimax_m3_rows tf_mm3_router_bf16" else "cuda minimax_m3_rows tf_mm3_router_f32",
++        .accum = .f32,
++        .depth = chain,
++        .out = .f32,
++        .replaces = if (f == .f32) "tf_mm3_router_bf16" else null,
++        // 4 rows a warp, 4 experts a block, 128 values a step of the reduction
++        .tiles = .{ .{ .size = geom.router_rows }, .{ .size = geom.router_warps, .step = 1, .min = 1 }, .{ .size = geom.router_chunk, .step = geom.router_chunk, .min = geom.router_chunk } },
++        .served = &.{ .{ .rows = 1, .n = experts, .k = hidden }, .{ .rows = 5, .n = experts, .k = hidden }, .{ .rows = 17, .n = experts, .k = hidden }, .{ .rows = 64, .n = experts, .k = hidden } },
++    };
++}
++
++pub const Logits = struct {
++    rig: rig_.Rig,
++    form: Form,
++    k: *const rk.Rows,
++    d: ?Dense = null,
++    x: u64 = 0,
++    w: u64 = 0,
++    base: u64 = 0,
++    out: u64 = 0,
++
++    pub fn deinit(self: *Logits) void {
++        if (self.d) |d| d.deinit();
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Logits) g.Kernel {
++        return .{ .spec = routerSpec(self.form), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Logits);
++
++    pub fn prepare(self: *Logits, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (self.d) |d| d.deinit();
++        self.d = null;
++        self.rig.reset();
++        if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.k % geom.router_chunk != 0) return false;
++        const a = self.rig.gpu.gpa;
++        const d = try Dense.init(a, shape, 1);
++        self.d = d;
++        d.fillX(fill, seed, 1);
++        const w = try a.alloc(f32, shape.n * shape.k);
++        defer a.free(w);
++        var prng = std.Random.DefaultPrng.init(seed ^ 0x6d6d3372);
++        const rng = prng.random();
++        const k = shape.k;
++        for (0..shape.n) |j| for (0..k) |i| {
++            // gate 4: integers mirrored into the second half, so fp32 sums are exact in any order
++            const v: f32 = if (fill != .stress) (rng.float(f32) - 0.5) * 0.1 else if (i < k / 2) @floatFromInt(1 + rng.uintLessThan(u32, 7)) else -w[j * k + i - k / 2];
++            w[j * k + i] = v;
++            d.w[j * k + i] = v;
++        };
++        if (self.form == .f32) {
++            const xf = try a.alloc(f32, d.x.len);
++            defer a.free(xf);
++            for (xf, d.x) |*o, h| o.* = c.fromBf16(h);
++            self.x = try self.rig.input(std.mem.sliceAsBytes(xf));
++        } else self.x = try self.rig.input(std.mem.sliceAsBytes(d.x));
++        self.w = try self.rig.input(std.mem.sliceAsBytes(w));
++        self.out = try self.rig.output(shape.rows * shape.n * 4);
++        if (self.form == .f32) self.base = try self.rig.scratch(shape.rows * shape.n * 4);
++        return true;
++    }
++
++    fn launch(self: *Logits, x_f32: bool, x: u64, out: u64) !void {
++        const sh = self.d.?.shape;
++        try self.k.routerLogits(self.rig.s, .{ .experts = @intCast(sh.n), .k = @intCast(sh.k) }, x, sh.k, x_f32, self.w, out, sh.rows);
++    }
++
++    pub fn run(self: *Logits) !void {
++        try self.launch(self.form == .f32, self.x, self.out);
++        try self.rig.s.synchronize();
++    }
++
++    /// The bf16 form on the same values.
++    pub fn replaced(self: *Logits) ![]const u8 {
++        const d = self.d.?;
++        const xb = try self.rig.gpu.gpa.alloc(u8, d.x.len * 2);
++        defer self.rig.gpu.gpa.free(xb);
++        @memcpy(xb, std.mem.sliceAsBytes(d.x));
++        const dev = try self.rig.scratch(xb.len);
++        const b: cuda.DeviceBuffer = .{ .d = self.rig.gpu.d, .ptr = dev, .len = xb.len };
++        try b.upload(0, xb);
++        try self.launch(false, dev, self.base);
++        return self.rig.bytes(self.base, self.count() * 4);
++    }
++
++    pub fn count(self: *Logits) usize {
++        return self.d.?.outputs();
++    }
++
++    pub fn reference(self: *Logits, want: []f64, mag: []f64) !void {
++        return self.d.?.reference(want, mag);
++    }
++
++    pub fn simulate(self: *Logits, acc: c.Accum, order: g.Order, out: []f64) !void {
++        return self.d.?.simulate(acc, order, out);
++    }
++};
++
++const nq = 32;
++const niq = 2;
++const kvh = 2;
++const pool: cuda.minimax_m3_sparse.geom.Pool = .{ .kvh = kvh, .layers = 1 };
++
++/// A decode window (positions given) or a prompt chunk (positions k, k + 1, ...).
++pub const Cfg = struct { name: []const u8, prompt: bool };
++
++pub const cfgs = [_]Cfg{
++    .{ .name = "cuda minimax_m3_rows tf_mm3_rows decode, 32 q + 2 index heads, 2 kv heads, paged", .prompt = false },
++    .{ .name = "cuda minimax_m3_rows tf_mm3_rows prompt chunk, 32 q + 2 index heads, 2 kv heads, paged", .prompt = true },
++};
++
++fn normDepth(_: c.Shape) usize {
++    return 4 + 5 + 3;
++}
++
++pub fn rowsSpec(f: Cfg) c.Spec {
++    return .{
++        .name = f.name,
++        .accum = .f32,
++        .depth = normDepth,
++        // div, sqrt, add, div, two products, the rotation's three, the weight add
++        .ops = 14,
++        .out = .bf16,
++        // rows, q heads, and the positions' bound (the last row's position + 1): edges at a page boundary
++        .tiles = .{ .{}, .{}, .{ .size = geom.block, .min = 1 } },
++        .served = &.{ .{ .rows = 8, .n = nq, .k = 3000 }, .{ .rows = 5, .n = nq, .k = 129 }, .{ .rows = 16, .n = nq, .k = 128 }, .{ .rows = 6, .n = nq, .k = 1_000_003 } },
++        .sums = .{ .f16 = 0, .bf16 = 0, .why = "a norm's sum of squares is not a dot the fp16 and bf16 accumulators can be made to miss" },
++    };
++}
++
++pub const Writer = struct {
++    rig: rig_.Rig,
++    f: Cfg,
++    k: *const rk.Rows,
++    shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
++    arena: std.heap.ArenaAllocator,
++    pos: []i32 = &.{},
++    table: []i32 = &.{},
++    q: []u16 = &.{},
++    kk: []u16 = &.{},
++    vv: []u16 = &.{},
++    iq: []u16 = &.{},
++    ik: []u16 = &.{},
++    w: [4][128]f32 = undefined,
++    dev: [12]u64 = @splat(0),
++    pages: usize = 0,
++
++    pub fn deinit(self: *Writer) void {
++        self.arena.deinit();
++        self.rig.deinit();
++    }
++
++    pub fn kernel(self: *Writer) g.Kernel {
++        return .{ .spec = rowsSpec(self.f), .ctx = self, .vt = &vt };
++    }
++
++    const vt = g.hooks(Writer);
++
++    fn fp16(v: f32) u16 {
++        const h: f16 = @floatCast(v);
++        return @bitCast(h);
++    }
++
++    fn fp16v(h: u16) f32 {
++        const x: f16 = @bitCast(h);
++        return x;
++    }
++
++    pub fn prepare(self: *Writer, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
++        if (shape.n != nq or shape.rows == 0 or shape.k == 0 or shape.k + shape.rows > 1_100_000) return false;
++        self.rig.reset();
++        _ = self.arena.reset(.retain_capacity);
++        const a = self.arena.allocator();
++        var prng = std.Random.DefaultPrng.init(seed);
++        const rng = prng.random();
++        self.shape = shape;
++        const n = shape.rows;
++        self.pos = try a.alloc(i32, n);
++        for (self.pos, 0..) |*p, i| p.* = @intCast(if (self.f.prompt) shape.k + i else if (i == n - 1) shape.k - 1 else (i * 7919) % shape.k);
++        // blocks the rows touch, as a compact table of shuffled page ids
++        var lo: usize = std.math.maxInt(usize);
++        var hi: usize = 0;
++        for (self.pos) |p| {
++            lo = @min(lo, @as(usize, @intCast(p)) / geom.block);
++            hi = @max(hi, @as(usize, @intCast(p)) / geom.block);
++        }
++        const blocks = hi + 1;
++        self.pages = (hi - lo + 1) + 2;
++        self.table = try a.alloc(i32, blocks);
++        @memset(self.table, -1);
++        const perm = try a.alloc(i32, self.pages);
++        for (perm, 0..) |*x, i| x.* = @intCast(i);
++        rng.shuffle(i32, perm);
++        for (lo..blocks) |b| self.table[b] = perm[b - lo];
++        // x in [-4, 4); gate 4 (stress) uses small integers so the sum of squares is exact
++        inline for (.{ .{ "q", n * nq * 128 }, .{ "kk", n * kvh * 128 }, .{ "vv", n * kvh * 128 } }) |p| {
++            @field(self, p[0]) = try a.alloc(u16, p[1]);
++            for (@field(self, p[0])) |*e| e.* = c.toBf16(if (fill == .stress) @as(f32, @floatFromInt(rng.intRangeAtMost(i32, -3, 3))) else (rng.float(f32) - 0.5) * 8);
++        }
++        self.iq = try a.alloc(u16, n * niq * 128);
++        self.ik = try a.alloc(u16, n * 128);
++        for (self.iq) |*e| e.* = fp16(if (fill == .stress) @as(f32, @floatFromInt(rng.intRangeAtMost(i32, -3, 3))) else (rng.float(f32) - 0.5) * 8);
++        for (self.ik) |*e| e.* = fp16(if (fill == .stress) @as(f32, @floatFromInt(rng.intRangeAtMost(i32, -3, 3))) else (rng.float(f32) - 0.5) * 8);
++        for (&self.w) |*row| {
++            for (row) |*e| e.* = 1 + (rng.float(f32) - 0.5);
++        }
++        if (fill == .nonfinite) {
++            self.q[5] = c.toBf16(std.math.nan(f32));
++            if (n > 1) self.q[(1 * nq + 3) * 128 + 70] = c.toBf16(std.math.inf(f32));
++            if (n > 2) self.iq[(2 * niq + 1) * 128 + 9] = 0x7c00;
++        }
++        const lay = pool.pageBytes();
++        self.dev[0] = try self.rig.input(std.mem.sliceAsBytes(self.q));
++        self.dev[1] = try self.rig.input(std.mem.sliceAsBytes(self.kk));
++        self.dev[2] = try self.rig.input(std.mem.sliceAsBytes(self.vv));
++        self.dev[3] = try self.rig.input(std.mem.sliceAsBytes(self.iq));
++        self.dev[4] = try self.rig.input(std.mem.sliceAsBytes(self.ik));
++        self.dev[5] = try self.rig.input(std.mem.sliceAsBytes(self.w[0..]));
++        self.dev[6] = try self.rig.input(std.mem.sliceAsBytes(self.table));
++        self.dev[7] = try self.rig.input(std.mem.sliceAsBytes(self.pos));
++        self.dev[8] = try self.rig.output(self.q.len * 2);
++        self.dev[9] = try self.rig.output(self.iq.len * 2);
++        self.dev[10] = try self.rig.scratch(self.pages * lay);
++        self.dev[11] = try self.rig.scratch(4);
++        return true;
++    }
++
++    fn opts(_: *const Writer) rk.Opts {
++        return .{};
++    }
++
++    pub fn run(self: *Writer) !void {
++        const n = self.shape.rows;
++        const rows: cuda.minimax_m3_sparse.Rows = if (self.f.prompt) .{ .n = n, .pos0 = self.pos[0] } else .{ .n = n, .pos = self.dev[7] };
++        const p: cuda.minimax_m3_sparse.Paged = .{ .pool = self.dev[10], .page_bytes = pool.pageBytes(), .layer_off = 0, .kvh = kvh, .tables = self.dev[6] };
++        const status = self.dev[11];
++        const in: rk.Inputs = .{ .q = self.dev[0], .q_ld = nq * 128, .k = self.dev[1], .k_ld = kvh * 128, .v = self.dev[2], .v_ld = kvh * 128, .iq = self.dev[3], .iq_ld = niq * 128, .ik = self.dev[4], .ik_ld = 128 };
++        const nm: rk.Norms = .{ .q = self.dev[5], .k = self.dev[5] + 512, .iq = self.dev[5] + 1024, .ik = self.dev[5] + 1536 };
++        const out: rk.Outputs = .{ .q = self.dev[8], .q_ld = nq * 128, .iq = self.dev[9], .iq_ld = niq * 128 };
++        try self.k.qkRope(self.rig.s, .{}, self.opts(), in, nm, out, rows, p, @intCast(self.table.len), status);
++        try self.rig.s.synchronize();
++    }
++
++    pub fn count(self: *Writer) usize {
++        return self.q.len + self.iq.len;
++    }
++
++    /// Row r's head i of the q scratch (kind 0) or the index query (kind 1): float64 norm, rotation, terms' magnitude.
++    fn head(self: *const Writer, kind: usize, r: usize, i: usize, y: *[128]f64, m: *[128]f64) void {
++        const p: usize = @intCast(self.pos[r]);
++        const src = if (kind == 0) self.q[(r * nq + i) * 128 ..][0..128] else self.iq[(r * niq + i) * 128 ..][0..128];
++        var x: [128]f64 = undefined;
++        var w: [128]f64 = undefined;
++        for (&x, &w, src, self.w[kind * 2][0..]) |*o, *ww, s, wv| {
++            o.* = if (kind == 0) c.fromBf16(s) else fp16v(s);
++            ww.* = wv;
++        }
++        var n: [128]f64 = undefined;
++        mr.gemmaNorm(&x, &w, 1e-6, false, &n);
++        y.* = n;
++        mr.rope(y, 64, p, 1e7, .neox_half);
++        for (m, n, 0..) |*o, v, d| o.* = if (d < 32) @abs(n[d]) + @abs(n[d + 32]) else if (d < 64) @abs(n[d]) + @abs(n[d - 32]) else @abs(v);
++    }
++
++    pub fn reference(self: *Writer, want: []f64, mag: []f64) !void {
++        var y: [128]f64 = undefined;
++        var m: [128]f64 = undefined;
++        for (0..self.shape.rows) |r| {
++            for (0..nq) |i| {
++                self.head(0, r, i, &y, &m);
++                @memcpy(want[(r * nq + i) * 128 ..][0..128], &y);
++                @memcpy(mag[(r * nq + i) * 128 ..][0..128], &m);
++            }
++            for (0..niq) |i| {
++                self.head(1, r, i, &y, &m);
++                @memcpy(want[self.q.len + (r * niq + i) * 128 ..][0..128], &y);
++                @memcpy(mag[self.q.len + (r * niq + i) * 128 ..][0..128], &m);
++            }
++        }
++    }
++
++    /// The pool holds each row's K, V (exactly) and IK in its page, every other byte zero, and no status bit is set.
++    pub fn check(self: *Writer, at: g.Gate) !?[]const u8 {
++        _ = at;
++        if (!try self.rig.intact()) return "the writer changed a buffer guard";
++        const st = try self.rig.bytes(self.dev[11], 4);
++        if (std.mem.readInt(u32, st[0..4], .little) != 0) return "the writer reported a missing page";
++        const bytes = try self.rig.bytes(self.dev[10], self.pages * pool.pageBytes());
++        const cells = try self.arena.allocator().alloc(u16, bytes.len / 2);
++        @memcpy(std.mem.sliceAsBytes(cells), bytes);
++        var touched = try self.arena.allocator().alloc(bool, cells.len);
++        @memset(touched, false);
++        for (0..self.shape.rows) |r| {
++            const p: usize = @intCast(self.pos[r]);
++            const page: usize = @intCast(self.table[p / geom.block]);
++            const t = p % geom.block;
++            for (0..kvh) |h| {
++                const k0 = pool.kv(page, 0, 0, h, t) / 2;
++                const v0 = pool.kv(page, 0, 1, h, t) / 2;
++                @memset(touched[k0..][0..128], true);
++                @memset(touched[v0..][0..128], true);
++                if (!std.mem.eql(u16, cells[v0..][0..128], self.vv[(r * kvh + h) * 128 ..][0..128])) return "v was not stored as it came";
++                if (!self.rowNear(cells[k0..][0..128], self.kk[(r * kvh + h) * 128 ..][0..128], false, 1, p)) return "k differs from the float64 norm and rotation";
++            }
++            const ik0 = pool.ik(page, 0, t) / 2;
++            @memset(touched[ik0..][0..128], true);
++            if (!self.rowNear(cells[ik0..][0..128], self.ik[r * 128 ..][0..128], true, 3, p)) return "the index key differs from the float64 norm and rotation";
++        }
++        for (cells, touched) |v, t| if (!t and v != 0) return "the writer wrote outside the rows' token slots";
++        return null;
++    }
++
++    fn rowNear(self: *const Writer, got: []const u16, src: []const u16, fp: bool, wi: usize, p: usize) bool {
++        var x: [128]f64 = undefined;
++        var w: [128]f64 = undefined;
++        for (&x, &w, src, self.w[wi][0..]) |*o, *ww, s, wv| {
++            o.* = if (fp) fp16v(s) else c.fromBf16(s);
++            ww.* = wv;
++        }
++        var y: [128]f64 = undefined;
++        mr.gemmaNorm(&x, &w, 1e-6, false, &y);
++        mr.rope(&y, 64, p, 1e7, .neox_half);
++        for (got, y) |h, want| {
++            const v: f64 = c.fromBf16(h);
++            if (!(@abs(v - want) <= @abs(want) * 0x1p-7 + 1e-4)) return false;
++        }
++        return true;
++    }
++};
++
++test "the writer's served shapes fit the launch and the router's are multiples of its chunk" {
++    for (rowsSpec(cfgs[0]).served) |s| {
++        _ = try geom.rowsLaunch(s.rows);
++        try geom.checkRows(64, s.n * 128, s.n * 128);
++    }
++    for (routerSpec(.bf16).served) |s| {
++        _ = try geom.routerLaunch(s.rows, s.n);
++        try geom.checkRouter(s.k, s.k);
++    }
++    try std.testing.expectEqual(@as(?[]const u8, "tf_mm3_router_bf16"), routerSpec(.f32).replaces);
++}
+diff --git a/zig/tests/cuda/contract_tests.zig b/zig/tests/cuda/contract_tests.zig
+index ca916cd..eb3ba08 100644
+--- a/zig/tests/cuda/contract_tests.zig
++++ b/zig/tests/cuda/contract_tests.zig
+@@ -41,6 +41,7 @@ const block_k = @import("contract_block_attn.zig");
+ const window_k = @import("contract_window.zig");
+ const moe_k = @import("contract_moe.zig");
+ const mm3_k = @import("contract_minimax_sparse.zig");
++const mm3_rows_k = @import("contract_minimax_rows.zig");
+ const qkr_k = @import("contract_qk_round.zig");
+ const fact_k = @import("contract_flashnext_fact.zig");
+ const route_k = @import("contract_route_rows.zig");
+@@ -65,7 +66,7 @@ const h3_image = struct {
+ pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
+     if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
+     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
+-    inline for (.{ "tree_round", "act_rows", "minimax_m3_act", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "minimax_m3_index", "minimax_m3_select", "minimax_m3_attn", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
++    inline for (.{ "tree_round", "act_rows", "minimax_m3_act", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "minimax_m3_index", "minimax_m3_select", "minimax_m3_attn", "minimax_m3_rows", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+     if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
+     std.debug.print("FAIL kernel-contract: unknown image name: {s}\n", .{name});
+     return error.UnknownContractImage;
+@@ -337,6 +338,16 @@ pub fn run(gpu: check.Gpu) !void {
+     for (mm3_k.cfgs, &mm3_attns) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .s = &mm3 };
+     defer for (&mm3_attns) |*x| x.deinit();
+     for (&mm3_attns) |*x| try kernels.append(a, x.kernel());
++    var mm3_rows = try cuda.minimax_m3_rows.Rows.load(gpu.d);
++    defer mm3_rows.unload();
++    var mm3_logits: [2]mm3_rows_k.Logits = undefined;
++    for (std.enums.values(mm3_rows_k.Form), &mm3_logits) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .k = &mm3_rows };
++    defer for (&mm3_logits) |*x| x.deinit();
++    for (&mm3_logits) |*x| try kernels.append(a, x.kernel());
++    var mm3_writers: [mm3_rows_k.cfgs.len]mm3_rows_k.Writer = undefined;
++    for (mm3_rows_k.cfgs, &mm3_writers) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .k = &mm3_rows, .arena = .init(a) };
++    defer for (&mm3_writers) |*x| x.deinit();
++    for (&mm3_writers) |*x| try kernels.append(a, x.kernel());
+     var moe_fns = try cuda.moe_glue.MoeGlue.load(gpu.d);
+     defer moe_fns.unload();
+     var topks: [moe_k.routes.len]moe_k.TopK = undefined;
+diff --git a/zig/tests/minimax_rows_tests.zig b/zig/tests/minimax_rows_tests.zig
+new file mode 100644
+index 0000000..04dce98
+--- /dev/null
++++ b/zig/tests/minimax_rows_tests.zig
+@@ -0,0 +1,544 @@
++//! MiniMax-M3.1-Flash row kernels, host only: table mirror arithmetic, paged addressing, host twins, mutants, records.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++const pool_mod = @import("mm3_pool");
++const plan = @import("mm3_plan");
++const twin = @import("minimax_rows_twin.zig");
++
++const mr = core.minimax_ref;
++const c = core.contract.spec;
++const g = cuda.minimax_m3_rows.geom;
++const geom = cuda.minimax_m3_sparse.geom;
++const testing = std.testing;
++const registry = core.contract.registry;
++
++test {
++    _ = plan;
++    _ = cuda.minimax_m3_rows;
++}
++
++fn must(ok: bool, src: std.builtin.SourceLocation) !void {
++    if (!ok) {
++        std.debug.print("expected true at line {d}\n", .{src.line});
++        return error.TestExpectedTrue;
++    }
++}
++
++fn bf16v(rng: std.Random, n: usize, sd: f32) ![]f32 {
++    const v = try testing.allocator.alloc(f32, n);
++    for (v) |*x| x.* = c.fromBf16(c.toBf16(rng.floatNorm(f32) * sd));
++    return v;
++}
++
++fn fp16v(rng: std.Random, n: usize, sd: f32) ![]f32 {
++    const v = try testing.allocator.alloc(f32, n);
++    for (v) |*x| {
++        const h: f16 = @floatCast(rng.floatNorm(f32) * sd);
++        x.* = h;
++    }
++    return v;
++}
++
++fn weights(rng: std.Random) [128]f32 {
++    var w: [128]f32 = undefined;
++    for (&w) |*x| x.* = 1 + rng.floatNorm(f32) * 0.3;
++    return w;
++}
++
++test "block table offsets: slot * max_pages entries, int32 overflow refused" {
++    try testing.expectEqual(@as(i32, 0), try g.entryOffset(0, 1024));
++    try testing.expectEqual(@as(i32, 3 * 1024), try g.entryOffset(3, 1024));
++    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), try g.entryOffset(std.math.maxInt(i32), 1));
++    try testing.expectError(error.Overflow, g.entryOffset(1 << 20, 1 << 12));
++    try testing.expectError(error.Overflow, g.entryOffset(std.math.maxInt(usize), 2));
++    const r = try g.entryBytes(4, 1024, 2, 10, 5);
++    try testing.expectEqual(@as(usize, (2 * 1024 + 10) * 4), r.off);
++    try testing.expectEqual(@as(usize, 20), r.len);
++    try testing.expectError(error.BadSlot, g.entryBytes(4, 1024, 4, 0, 1));
++    try testing.expectError(error.TableFull, g.entryBytes(4, 1024, 0, 1020, 5));
++    _ = try g.entryBytes(4, 1024, 3, 1020, 4);
++}
++
++test "row_tab: segments tile the rows, gaps and bad slots are refused" {
++    var out: [7]i32 = undefined;
++    try g.fillRowTab(&out, &.{ .{ .slot = 2, .rows = 3 }, .{ .slot = 0, .rows = 1 }, .{ .slot = 1, .rows = 3 } }, 3, 64);
++    try testing.expectEqualSlices(i32, &.{ 128, 128, 128, 0, 64, 64, 64 }, &out);
++    try testing.expectError(error.Gap, g.fillRowTab(&out, &.{.{ .slot = 0, .rows = 6 }}, 3, 64));
++    try testing.expectError(error.Gap, g.fillRowTab(&out, &.{ .{ .slot = 0, .rows = 4 }, .{ .slot = 1, .rows = 4 } }, 3, 64));
++    try testing.expectError(error.BadSlot, g.fillRowTab(&out, &.{.{ .slot = 3, .rows = 7 }}, 3, 64));
++}
++
++/// A device copy kept as bytes, written through the same ranges Mirror.put uses.
++const FakeDevice = struct {
++    bytes: []u8,
++    slots: usize,
++    max_pages: usize,
++    fail: bool = false,
++
++    fn call(ctx: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void {
++        const self: *FakeDevice = @ptrCast(@alignCast(ctx));
++        const r = try g.entryBytes(self.slots, self.max_pages, slot, from, entries.len);
++        if (self.fail) return error.UploadFailed;
++        @memcpy(self.bytes[r.off..][0..r.len], std.mem.sliceAsBytes(entries));
++    }
++};
++
++test "the byte ranges keep a device copy equal to the host Tables, through writes, a failed upload and a clear" {
++    const slots = 3;
++    const max_pages = 40;
++    var t = try pool_mod.Tables.init(testing.allocator, slots, max_pages);
++    defer t.deinit();
++    const bytes = try testing.allocator.alloc(u8, slots * max_pages * 4);
++    defer testing.allocator.free(bytes);
++    @memset(bytes, 0xff);
++    var dev: FakeDevice = .{ .bytes = bytes, .slots = slots, .max_pages = max_pages };
++    t.upload = .{ .ctx = &dev, .call = FakeDevice.call };
++    try t.write(1, &.{ 70, 71, 72 }, 0);
++    try t.write(2, &.{ 5, 9 }, 0);
++    try t.write(1, &.{ 73, 74 }, 3);
++    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(t.rows), bytes);
++    dev.fail = true;
++    try testing.expectError(error.UploadFailed, t.write(2, &.{ 11, 12 }, 2));
++    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(t.rows), bytes);
++    dev.fail = false;
++    try testing.expectError(error.TableFull, t.write(0, &.{ 1, 2 }, 39));
++    // a restore pushes whole rows, then the device agrees with every slot's entries
++    for (0..slots) |s| try FakeDevice.call(&dev, @intCast(s), 0, t.row(@intCast(s)));
++    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(t.rows), bytes);
++}
++
++test "row_tab offsets index the real Tables: tables[row_tab[r] + pos / 128] is the page Tables.page names" {
++    const max_pages = 40;
++    var t = try pool_mod.Tables.init(testing.allocator, 4, max_pages);
++    defer t.deinit();
++    try t.write(0, &.{ 4, 5, 6 }, 0);
++    try t.write(1, &.{ 20, 21 }, 0);
++    try t.write(3, &.{ 31, 30, 29, 28 }, 0);
++    var rt: [9]i32 = undefined;
++    try g.fillRowTab(&rt, &.{ .{ .slot = 3, .rows = 4 }, .{ .slot = 0, .rows = 2 }, .{ .slot = 1, .rows = 3 } }, 4, max_pages);
++    const pos = [_]i32{ 0, 127, 128, 511, 300, 5, 255, 200, 129 };
++    try g.checkCall(t.rows, max_pages, &rt, &pos, 0, 9);
++    for (rt, pos, 0..) |off, p, r| {
++        const slot: u32 = @intCast(@divExact(off, max_pages));
++        const want = t.page(slot, @intCast(@divTrunc(p, 128))).?;
++        try testing.expectEqual(want, try g.pageOf(t.rows, max_pages, @intCast(off), @intCast(p)));
++        _ = r;
++    }
++    // slot 1 owns two pages: its row at position 256 has no page, and positions past the row are another error
++    try testing.expectError(error.NoPage, g.checkCall(t.rows, max_pages, &rt, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 256 }, 0, 9));
++    try testing.expectError(error.PastTable, g.pageOf(t.rows, max_pages, 0, max_pages * 128));
++    // a prompt chunk of one stream: no row_tab, the table pointer is the slot's row (entry offset slot * max_pages)
++    const slot3 = t.rows[3 * max_pages ..];
++    try g.checkCall(slot3, max_pages, null, null, 384, 100);
++    try testing.expectError(error.NoPage, g.checkCall(slot3, max_pages, null, null, 384, 129));
++    // padded rows (negative positions) are skipped
++    try g.checkCall(t.rows, max_pages, null, &.{ -1, 5 }, 0, 2);
++    try testing.expectEqual(@as(usize, 1), g.pagesNeeded(127));
++    try testing.expectEqual(@as(usize, 2), g.pagesNeeded(128));
++}
++
++test "kernel addressing equals the pool's page map and the T5 geometry for every (page, layer, K/V/IK, head, token)" {
++    const kvh = 2;
++    const layers = 3;
++    const gp: geom.Pool = .{ .kvh = kvh, .layers = layers };
++    const dims: pool_mod.Dims = .{ .layers = layers, .kv_heads = kvh, .head_dim = 128, .index_dim = 128 };
++    const map = dims.map();
++    try testing.expectEqual(@as(u64, gp.pageBytes()), dims.pageBytes());
++    for ([_]usize{ 0, 1, 6 }) |page| for (0..layers) |ly| for ([_]usize{ 0, 1, 77, 127 }) |t| {
++        for (0..kvh) |h| {
++            const k = page * gp.pageBytes() + gp.layerOff(ly) + twin.elem(kvh, 0, h, t) * 2;
++            const v = page * gp.pageBytes() + gp.layerOff(ly) + twin.elem(kvh, 1, h, t) * 2;
++            try testing.expectEqual(gp.kv(page, ly, 0, h, t), k);
++            try testing.expectEqual(gp.kv(page, ly, 1, h, t), v);
++            try testing.expectEqual(map.page(@intCast(page)) + map.k(@intCast(ly), @intCast(h)) + t * 256, k);
++            try testing.expectEqual(map.page(@intCast(page)) + map.v(@intCast(ly), @intCast(h)) + t * 256, v);
++        }
++        const ik = page * gp.pageBytes() + gp.layerOff(ly) + twin.ikElem(kvh, t) * 2;
++        try testing.expectEqual(gp.ik(page, ly, t), ik);
++        try testing.expectEqual(map.page(@intCast(page)) + map.ik(@intCast(ly)) + t * 256, ik);
++    };
++}
++
++var tol_rel: f64 = 0x1p-8;
++
++fn near(got: u16, want: f64) bool {
++    const v: f64 = c.fromBf16(got);
++    return @abs(v - want) <= @abs(want) * tol_rel + 2e-5;
++}
++
++/// The float64 reference of one head: Gemma norm with weight w + add (if on), bf16 rounding (if asked), partial RoPE.
++fn refHead(x: []const f32, w: []const f32, norm_on: bool, add: f64, rope_on: bool, pos: usize, o: twin.Opts) [128]f64 {
++    var xs: [128]f64 = undefined;
++    for (&xs, x[0..128]) |*d, s| d.* = s;
++    if (norm_on) {
++        var ws: [128]f64 = undefined;
++        for (&ws, w[0..128]) |*d, v| d.* = v + add;
++        mr.gemmaNorm(&xs, &ws, o.eps, false, &xs);
++        mr.roundAll(o.flags.round_norm, &xs);
++    }
++    if (rope_on) mr.rope(&xs, o.rot, pos, o.theta, if (o.flags.gptj) .gptj_interleaved else .neox_half);
++    return xs;
++}
++
++const fx_kvh = 2;
++const fx_pages = 6;
++const n_pages = 9;
++const fx_layers = 2;
++const layer = 1;
++const pool_geom: geom.Pool = .{ .kvh = fx_kvh, .layers = fx_layers };
++
++/// Random inputs for `rows` rows of a rank (32 q, 2 index, 2 kv heads), a shuffled table and a NaN-poisoned pool.
++const Fix = struct {
++    rows: usize,
++    h: twin.Heads = .{},
++    q: []f32,
++    k: []f32,
++    v: []f32,
++    iq: []f32,
++    ik: []f32,
++    nm: twin.Norms,
++    pool: []u16,
++    tables: []i32,
++    q_out: []u16,
++    iq_out: []u16,
++
++    fn init(rng: std.Random, rows: usize, index_fp16: bool) !Fix {
++        const a = testing.allocator;
++        const h: twin.Heads = .{};
++        const pool = try a.alloc(u16, n_pages * pool_geom.pageBytes() / 2);
++        @memset(pool, c.toBf16(std.math.nan(f32)));
++        const tables = try a.alloc(i32, 2 * fx_pages);
++        @memset(tables, -1);
++        var perm: [n_pages]i32 = undefined;
++        for (&perm, 0..) |*x, i| x.* = @intCast(i);
++        rng.shuffle(i32, &perm);
++        @memcpy(tables[fx_pages .. fx_pages + 5], perm[0..5]);
++        @memcpy(tables[0..3], perm[5..8]);
++        const mk = if (index_fp16) &fp16v else &bf16v;
++        return .{
++            .rows = rows,
++            .q = try bf16v(rng, rows * h.nq * 128, 2),
++            .k = try bf16v(rng, rows * fx_kvh * 128, 2),
++            .v = try bf16v(rng, rows * fx_kvh * 128, 2),
++            .iq = try mk(rng, rows * h.niq * 128, 2),
++            .ik = try mk(rng, rows * 128, 2),
++            .nm = .{ .q = weights(rng), .k = weights(rng), .iq = weights(rng), .ik = weights(rng) },
++            .pool = pool,
++            .tables = tables,
++            .q_out = try a.alloc(u16, rows * h.nq * 128),
++            .iq_out = try a.alloc(u16, rows * h.niq * 128),
++        };
++    }
++
++    fn deinit(f: *Fix) void {
++        inline for (.{ "q", "k", "v", "iq", "ik", "pool", "tables", "q_out", "iq_out" }) |n| testing.allocator.free(@field(f, n));
++    }
++
++    fn target(f: *Fix, row_tab: ?[]const i32, pos: ?[]const i32, pos0: i32) twin.Target {
++        return .{ .q = f.q_out, .iq = f.iq_out, .pool = f.pool, .tables = f.tables, .max_pages = fx_pages, .row_tab = row_tab, .pos = pos, .pos0 = pos0, .page_bytes = pool_geom.pageBytes(), .layer_off = pool_geom.layerOff(layer) };
++    }
++
++    fn inputs(f: *const Fix) twin.Inputs {
++        return .{ .q = f.q, .k = f.k, .v = f.v, .iq = f.iq, .ik = f.ik };
++    }
++
++    /// The pool's row for (page id, K/V, head, token).
++    fn cell(f: *const Fix, page: usize, which: usize, head: usize, t: usize) []const u16 {
++        return f.pool[pool_geom.kv(page, layer, which, head, t) / 2 ..][0..128];
++    }
++
++    fn ikCell(f: *const Fix, page: usize, t: usize) []const u16 {
++        return f.pool[pool_geom.ik(page, layer, t) / 2 ..][0..128];
++    }
++};
++
++fn expectRow(got: []const u16, want: [128]f64) !void {
++    for (got, want) |x, y| try testing.expect(near(x, y));
++}
++
++/// Every output of a call against the float64 reference: scratch q and iq, and K, V and IK in their pages.
++fn checkCall(f: *const Fix, o: twin.Opts, pos: []const i32, row_tab: ?[]const i32) !void {
++    const fl = o.flags;
++    tol_rel = if (fl.round_norm) 0x1p-6 else 0x1p-8; // a value near a bf16 rounding boundary may round either way in the middle
++    defer tol_rel = 0x1p-8;
++    for (0..f.rows) |r| {
++        const p: usize = @intCast(pos[r]);
++        const off: usize = if (row_tab) |t| @intCast(t[r]) else 0;
++        const page: usize = @intCast(f.tables[off + p / 128]);
++        for (0..f.h.nq) |i| try expectRow(f.q_out[(r * f.h.nq + i) * 128 ..][0..128], refHead(f.q[(r * f.h.nq + i) * 128 ..], &f.nm.q, fl.norm_qk, o.w_add, true, p, o));
++        for (0..f.h.niq) |i| try expectRow(f.iq_out[(r * f.h.niq + i) * 128 ..][0..128], refHead(f.iq[(r * f.h.niq + i) * 128 ..], &f.nm.iq, fl.norm_index, o.w_add_index, fl.index_rope, p, o));
++        for (0..fx_kvh) |i| {
++            try expectRow(f.cell(page, 0, i, p % 128), refHead(f.k[(r * fx_kvh + i) * 128 ..], &f.nm.k, fl.norm_qk, o.w_add, true, p, o));
++            for (f.cell(page, 1, i, p % 128), f.v[(r * fx_kvh + i) * 128 ..][0..128]) |x, y| try testing.expectEqual(c.toBf16(y), x);
++        }
++        try expectRow(f.ikCell(page, p % 128), refHead(f.ik[r * 128 ..], &f.nm.ik, fl.norm_index, o.w_add_index, fl.index_rope, p, o));
++    }
++}
++
++fn okCall(f: *const Fix, o: twin.Opts, pos: []const i32, row_tab: ?[]const i32) bool {
++    checkCall(f, o, pos, row_tab) catch return false;
++    return true;
++}
++
++test "a decode window across a page edge and a prompt chunk: every output matches the float64 reference" {
++    var prng = std.Random.DefaultPrng.init(21);
++    const rng = prng.random();
++    // slot 0 (table row 0) holds 3 pages, slot 1 (row at entry 6) holds 5; the window mixes both streams
++    var f = try Fix.init(rng, 5, true);
++    defer f.deinit();
++    const pos = [_]i32{ 126, 127, 128, 129, 300 };
++    const row_tab = [_]i32{ 0, 0, 0, 0, fx_pages };
++    const o: twin.Opts = .{};
++    try testing.expectEqual(@as(i32, 0), twin.call(5, f.h, o, f.inputs(), &f.nm, f.target(&row_tab, &pos, 0), .none));
++    try checkCall(&f, o, &pos, &row_tab);
++    // a prompt chunk of slot 1: positions pos0 + r, one table, the same rows' bits as the window gave
++    var p = try Fix.init(rng, 5, true);
++    defer p.deinit();
++    try testing.expectEqual(@as(i32, 0), twin.call(5, p.h, o, p.inputs(), &p.nm, p.target(null, null, 125), .none));
++    try checkCall(&p, o, &.{ 125, 126, 127, 128, 129 }, null);
++}
++
++/// The weights as the loader would store them raw: the folded 1 + w minus 1, for a kernel that adds 1 itself.
++fn rawNorms(f: *Fix) void {
++    for (&f.nm.q, &f.nm.k, &f.nm.iq, &f.nm.ik) |*a, *b, *cc, *d| {
++        a.* -= 1;
++        b.* -= 1;
++        cc.* -= 1;
++        d.* -= 1;
++    }
++}
++
++test "the switches: GPT-J layout, no index rope, bf16 norm rounding, raw weights with the offset, bf16 index inputs" {
++    var prng = std.Random.DefaultPrng.init(22);
++    const rng = prng.random();
++    const variants = [_]twin.Opts{
++        .{ .flags = .{ .gptj = true } },
++        .{ .flags = .{ .index_rope = false } },
++        .{ .flags = .{ .round_norm = true } },
++        .{ .w_add = 1, .w_add_index = 1 },
++        .{ .flags = .{ .index_fp16 = false } },
++        .{ .flags = .{ .norm_qk = false, .norm_index = false } },
++    };
++    for (variants) |o| {
++        var f = try Fix.init(rng, 3, o.flags.index_fp16);
++        defer f.deinit();
++        if (o.w_add == 1) rawNorms(&f);
++        const pos = [_]i32{ 3, 130, 4 * 128 + 127 };
++        const rt = [_]i32{ fx_pages, fx_pages, fx_pages };
++        try testing.expectEqual(@as(i32, 0), twin.call(3, f.h, o, f.inputs(), &f.nm, f.target(&rt, &pos, 0), .none));
++        try checkCall(&f, o, &pos, &rt);
++    }
++}
++
++test "a row's bits do not depend on the window: alone, with neighbours, or at another row index" {
++    var prng = std.Random.DefaultPrng.init(23);
++    const rng = prng.random();
++    var f = try Fix.init(rng, 4, true);
++    defer f.deinit();
++    const o: twin.Opts = .{};
++    const pos = [_]i32{ 200, 7, 515, 129 };
++    const rt = [_]i32{ fx_pages, fx_pages, fx_pages, fx_pages };
++    _ = twin.call(4, f.h, o, f.inputs(), &f.nm, f.target(&rt, &pos, 0), .none);
++    const whole_q = try testing.allocator.dupe(u16, f.q_out);
++    defer testing.allocator.free(whole_q);
++    const whole_pool = try testing.allocator.dupe(u16, f.pool);
++    defer testing.allocator.free(whole_pool);
++    // row 2 alone: its inputs moved to row 0 of a one-row call
++    var one = f;
++    one.rows = 1;
++    one.q = f.q[2 * 32 * 128 ..][0 .. 32 * 128];
++    one.k = f.k[2 * fx_kvh * 128 ..][0 .. fx_kvh * 128];
++    one.v = f.v[2 * fx_kvh * 128 ..][0 .. fx_kvh * 128];
++    one.iq = f.iq[2 * 2 * 128 ..][0 .. 2 * 128];
++    one.ik = f.ik[2 * 128 ..][0..128];
++    one.q_out = try testing.allocator.alloc(u16, 32 * 128);
++    defer testing.allocator.free(one.q_out);
++    one.iq_out = try testing.allocator.alloc(u16, 2 * 128);
++    defer testing.allocator.free(one.iq_out);
++    one.pool = try testing.allocator.dupe(u16, f.pool);
++    defer testing.allocator.free(one.pool);
++    _ = twin.call(1, one.h, o, one.inputs(), &one.nm, one.target(&.{fx_pages}, &.{515}, 0), .none);
++    try testing.expectEqualSlices(u16, whole_q[2 * 32 * 128 ..][0 .. 32 * 128], one.q_out);
++    try testing.expectEqualSlices(u16, whole_pool, one.pool);
++}
++
++test "pages: a missing page or a position past the table sets the status bit and writes nothing to the pool" {
++    var prng = std.Random.DefaultPrng.init(24);
++    const rng = prng.random();
++    var f = try Fix.init(rng, 3, true);
++    defer f.deinit();
++    const poison = try testing.allocator.dupe(u16, f.pool);
++    defer testing.allocator.free(poison);
++    // slot 0 has pages for blocks 0..2: block 3 has none; block 6 is past the 6-entry row
++    const rt = [_]i32{ 0, 0, 0 };
++    const st = twin.call(3, f.h, .{}, f.inputs(), &f.nm, f.target(&rt, &.{ 3 * 128, 6 * 128, -1 }, 0), .none);
++    try testing.expectEqual(g.status_no_page | g.status_past_table, st);
++    try testing.expectEqualSlices(u16, poison, f.pool);
++    // q still lands for the rows with a position, and a padded row (-1) writes nothing at all
++    try expectRow(f.q_out[0..128], refHead(f.q[0..128], &f.nm.q, true, 0, true, 3 * 128, .{}));
++}
++
++test "writer mutants: each planted fault fails the reference check the real twin passes" {
++    var prng = std.Random.DefaultPrng.init(25);
++    const rng = prng.random();
++    const pos = [_]i32{ 1_000_003 % 640, 640 - 1, 130 };
++    const rt = [_]i32{ fx_pages, fx_pages, fx_pages };
++    for (std.enums.values(twin.Mutant)) |m| {
++        if (m == .split_by_rows or m == .reorder_chains or m == .f32_angle) continue;
++        var f = try Fix.init(rng, 3, true);
++        defer f.deinit();
++        var o: twin.Opts = .{};
++        if (m == .no_plus_one) {
++            o.w_add = 1;
++            o.w_add_index = 1;
++            rawNorms(&f);
++        }
++        _ = twin.call(3, f.h, o, f.inputs(), &f.nm, f.target(&rt, &pos, 0), m);
++        try testing.expectEqual(m == .none, okCall(&f, o, &pos, &rt));
++    }
++}
++
++test "angles: float64 sincos rounded once; an fp32 angle is off by whole bf16 steps at a million positions" {
++    const pos = 1_048_573;
++    var worst: f64 = 0;
++    var worst_bad: f64 = 0;
++    for (0..32) |i| {
++        const inv = std.math.pow(f64, 1e7, -2 * @as(f64, @floatFromInt(i)) / 64);
++        const ang = @as(f64, pos) * inv;
++        const good = twin.angle(pos, i, 64, 1e7, .none);
++        const bad = twin.angle(pos, i, 64, 1e7, .f32_angle);
++        worst = @max(worst, @abs(@as(f64, good[0]) - @cos(ang)), @abs(@as(f64, good[1]) - @sin(ang)));
++        worst_bad = @max(worst_bad, @abs(@as(f64, bad[0]) - @cos(ang)), @abs(@as(f64, bad[1]) - @sin(ang)));
++    }
++    try testing.expect(worst < 1e-7);
++    try testing.expect(worst_bad > 1e-3);
++}
++
++const hidden = 6144;
++const experts = 128;
++
++/// tf_mm3_router_* over a call: every (row, expert) is its own fixed-order dot, whichever tile it falls in.
++fn routerCall(x: []const f32, w: []const f32, rows: usize, m: twin.Mutant, out: []f32) void {
++    for (0..rows) |r| for (0..experts) |e| {
++        out[r * experts + e] = twin.router(x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden], hidden, rows, m);
++    };
++}
++
++fn wide(a: std.mem.Allocator, v: []const f32) ![]f64 {
++    const o = try a.alloc(f64, v.len);
++    for (o, v) |*d, s| d.* = s;
++    return o;
++}
++
++test "router: fp32 logits track the float64 dot within the fp32 chain bound, for 1 to 17 rows" {
++    var prng = std.Random.DefaultPrng.init(31);
++    const rng = prng.random();
++    const x = try bf16v(rng, 17 * hidden, 1.5);
++    defer testing.allocator.free(x);
++    const w = try testing.allocator.alloc(f32, experts * hidden);
++    defer testing.allocator.free(w);
++    for (w) |*v| v.* = rng.floatNorm(f32) * 0.03;
++    const out = try testing.allocator.alloc(f32, 17 * experts);
++    defer testing.allocator.free(out);
++    routerCall(x, w, 17, .none, out);
++    // depth: 48 fma steps a lane chain, the 4-chain sum and the 5-level tree
++    const u: f64 = 0x1p-24;
++    for (0..17) |r| for (0..experts) |e| {
++        var sum: f64 = 0;
++        var mag: f64 = 0;
++        for (x[r * hidden ..][0..hidden], w[e * hidden ..][0..hidden]) |a, b| {
++            sum += @as(f64, a) * b;
++            mag += @abs(@as(f64, a) * b);
++        }
++        try testing.expect(@abs(out[r * experts + e] - sum) <= c.gamma(48 + 3 + 5, u) * mag);
++    };
++}
++
++test "router: a row's bits are the same in a call of 1, 3, 4, 5 or 17 rows; a split-K by row count is caught" {
++    var prng = std.Random.DefaultPrng.init(32);
++    const rng = prng.random();
++    const x = try bf16v(rng, 17 * hidden, 2);
++    defer testing.allocator.free(x);
++    const w = try testing.allocator.alloc(f32, experts * hidden);
++    defer testing.allocator.free(w);
++    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
++    const full = try testing.allocator.alloc(f32, 17 * experts);
++    defer testing.allocator.free(full);
++    routerCall(x, w, 17, .none, full);
++    var part: [17 * experts]f32 = undefined;
++    for ([_]usize{ 1, 3, 4, 5 }) |n| {
++        routerCall(x[0 .. n * hidden], w, n, .none, part[0 .. n * experts]);
++        try testing.expectEqualSlices(f32, full[0 .. n * experts], part[0 .. n * experts]);
++    }
++    // the same rows through a tail window: row 16 alone equals row 16 of 17
++    routerCall(x[16 * hidden ..], w, 1, .none, part[0..experts]);
++    try testing.expectEqualSlices(f32, full[16 * experts ..][0..experts], part[0..experts]);
++    // the planted faults: a depth that follows the row count, and another order of the lane chains
++    routerCall(x, w, 17, .split_by_rows, &part);
++    var one: [experts]f32 = undefined;
++    routerCall(x[0..hidden], w, 1, .split_by_rows, &one);
++    try testing.expect(!std.mem.eql(f32, part[0..experts], one[0..]));
++    routerCall(x, w, 17, .reorder_chains, &part);
++    try testing.expect(!std.mem.eql(f32, full[0 .. 17 * experts], part[0 .. 17 * experts]));
++}
++
++test "router: NaN and infinities reach the logit as float64 arithmetic gives them" {
++    var prng = std.Random.DefaultPrng.init(33);
++    const rng = prng.random();
++    const x = try bf16v(rng, 4 * hidden, 1);
++    defer testing.allocator.free(x);
++    const w = try testing.allocator.alloc(f32, experts * hidden);
++    defer testing.allocator.free(w);
++    for (w) |*v| v.* = rng.floatNorm(f32) * 0.05;
++    x[0 * hidden + 77] = std.math.nan(f32);
++    x[1 * hidden + 5000] = std.math.inf(f32);
++    x[2 * hidden + 6143] = -std.math.inf(f32);
++    x[2 * hidden + 3] = std.math.inf(f32);
++    const out = try testing.allocator.alloc(f32, 4 * experts);
++    defer testing.allocator.free(out);
++    routerCall(x, w, 4, .none, out);
++    for (0..4) |r| {
++        const xr = try wide(testing.allocator, x[r * hidden ..][0..hidden]);
++        defer testing.allocator.free(xr);
++        for (0..experts) |e| {
++            var sum: f64 = 0;
++            for (xr, w[e * hidden ..][0..hidden]) |a, b| sum += a * b;
++            try testing.expectEqual(c.classOf(sum), c.classOf(out[r * experts + e]));
++        }
++    }
++}
++
++test "gate 5: the three launches are registered, match the geometry, and fit every chip" {
++    const want = [_]struct { sym: []const u8, threads: u32, static: u32 }{
++        .{ .sym = "tf_mm3_rows", .threads = g.rows_threads, .static = 4608 },
++        .{ .sym = "tf_mm3_router_bf16", .threads = g.router_threads, .static = 0 },
++        .{ .sym = "tf_mm3_router_f32", .threads = g.router_threads, .static = 0 },
++    };
++    var mine: [3]registry.CudaRecord = undefined;
++    for (want, &mine) |w, *m| {
++        const rec = for (registry.cuda) |r| {
++            if (std.mem.eql(u8, r.launch.symbol, w.sym)) break r;
++        } else return error.RecordMissing;
++        try testing.expectEqualStrings("minimax_m3_rows", rec.launch.image);
++        try testing.expectEqual(w.threads, rec.launch.threads);
++        try testing.expectEqual(@as(u32, 0), rec.launch.dynamic);
++        for (rec.usage) |u| {
++            try testing.expectEqual(w.static, u.static);
++            try testing.expectEqual(w.threads, u.bound);
++            try testing.expect(u.regs * w.threads <= 65536);
++        }
++        m.* = rec;
++    }
++    try testing.expectEqual(@as(usize, 0), try registry.checkCuda(testing.allocator, &mine, true));
++    // shared bytes the writer declares: 64 cos/sin pairs of fp32 plus 8 staged heads of 128 fp32
++    try testing.expectEqual(@as(u32, 2 * 64 * 4 + 8 * 128 * 4), mine_static());
++    // a planted control: the same launch asking for more threads than its bound must be reported
++    var over = mine[0];
++    over.launch.threads = 512;
++    try testing.expect(try registry.checkCuda(testing.allocator, &.{over}, true) > 0);
++}
++
++fn mine_static() u32 {
++    return 2 * g.max_rot_pairs * 4 + g.rows_warps * g.d * 4;
++}
+diff --git a/zig/tests/minimax_rows_twin.zig b/zig/tests/minimax_rows_twin.zig
+new file mode 100644
+index 0000000..0b0b8a7
+--- /dev/null
++++ b/zig/tests/minimax_rows_twin.zig
+@@ -0,0 +1,191 @@
++//! Host twins of minimax_m3_rows.cu: the same fp32 operation order (fma only in the router) and planted mutants.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++
++const geom = cuda.minimax_m3_rows.geom;
++const c = core.contract.spec;
++
++pub const Mutant = enum {
++    none,
++    /// The weight offset is ignored: raw weights are used as if they were the folded 1 + w.
++    no_plus_one,
++    /// RoPE pairs (2i, 2i + 1) where the switch says (i, i + rot/2).
++    wrong_layout,
++    /// RoPE covers all 128 dims instead of the first 64.
++    rope_all_dims,
++    /// The rotation runs before the norm.
++    rope_first,
++    /// The angle is computed in fp32.
++    f32_angle,
++    /// K goes to the next token slot of its page.
++    next_slot,
++    /// The router's chunk count follows the row count (a split-K whose depth depends on the call).
++    split_by_rows,
++    /// The router's four lane chains are summed in a different order.
++    reorder_chains,
++};
++
++pub const Opts = struct {
++    rot: usize = 64,
++    theta: f64 = 1e7,
++    eps: f32 = 1e-6,
++    w_add: f32 = 0,
++    w_add_index: f32 = 0,
++    flags: geom.Flags = .{},
++};
++
++fn tree(v: *[32]f32) f32 {
++    var o: usize = 16;
++    while (o > 0) : (o >>= 1) {
++        var next: [32]f32 = undefined;
++        for (&next, 0..) |*n, l| n.* = v[l] + v[l ^ o];
++        v.* = next;
++    }
++    return v[0];
++}
++
++/// The kernel's norm of one head: lane l squares its 4 values in order, then the xor tree; y = (x * inv) * (w + add).
++pub fn norm(x: *[128]f32, w: *const [128]f32, o: Opts, add: f32) void {
++    var lane: [32]f32 = undefined;
++    for (&lane, 0..) |*s, l| {
++        var a = x[4 * l] * x[4 * l];
++        a = a + x[4 * l + 1] * x[4 * l + 1];
++        a = a + x[4 * l + 2] * x[4 * l + 2];
++        a = a + x[4 * l + 3] * x[4 * l + 3];
++        s.* = a;
++    }
++    const ss = tree(&lane);
++    const inv: f32 = 1.0 / @sqrt(ss / 128.0 + o.eps);
++    for (x, w) |*v, wv| v.* = v.* * inv * (wv + add);
++    if (o.flags.round_norm) for (x) |*v| {
++        v.* = c.fromBf16(c.toBf16(v.*));
++    };
++}
++
++/// The cos and sin of pair i at `pos`: float64 angle and sincos rounded once to fp32 (the mutant rounds the angle).
++pub fn angle(pos: i32, i: usize, rot: usize, theta: f64, m: Mutant) [2]f32 {
++    const inv = std.math.pow(f64, theta, -2 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(rot)));
++    var ang: f64 = @as(f64, @floatFromInt(pos)) * inv;
++    if (m == .f32_angle) ang = @as(f32, @floatCast(ang));
++    return .{ @floatCast(@cos(ang)), @floatCast(@sin(ang)) };
++}
++
++/// The kernel's `rotated` for every dim of a staged head.
++pub fn rope(x: *[128]f32, pos: i32, rot: usize, theta: f64, gptj: bool, m: Mutant) void {
++    var out = x.*;
++    const r = if (m == .rope_all_dims) 128 else rot;
++    const g = if (m == .wrong_layout) !gptj else gptj;
++    const half = r / 2;
++    for (0..r) |d| {
++        const i = if (g) d >> 1 else if (d < half) d else d - half;
++        const ia = if (g) 2 * i else i;
++        const ib = if (g) ia + 1 else i + half;
++        const cs = angle(pos, i, r, theta, m);
++        const a = x[ia];
++        const b = x[ib];
++        const first = if (g) d & 1 == 0 else d < half;
++        out[d] = if (first) a * cs[0] - b * cs[1] else b * cs[0] + a * cs[1];
++    }
++    x.* = out;
++}
++
++pub const Heads = struct { nq: usize = 32, niq: usize = 2, kvh: usize = 2, ik: bool = true };
++
++/// Per-head weights, fp32 [128] each.
++pub const Norms = struct { q: [128]f32, k: [128]f32, iq: [128]f32, ik: [128]f32 };
++
++/// The projections of the rows of a call as exact fp32 values (bf16, or fp16 for the index heads), [rows][width].
++pub const Inputs = struct { q: []const f32, k: []const f32, v: []const f32, iq: []const f32, ik: []const f32 };
++
++/// Where a call writes: bf16 bit scratch for q and iq, the pool as bf16 bits, and the tables.
++pub const Target = struct {
++    q: []u16,
++    iq: []u16,
++    pool: []u16,
++    tables: []const i32,
++    max_pages: usize,
++    row_tab: ?[]const i32,
++    pos: ?[]const i32,
++    pos0: i32,
++    page_bytes: usize,
++    layer_off: usize,
++};
++
++/// One head: norm (if on), rotation (if on), bf16 bits out.
++fn head(src: []const f32, w: *const [128]f32, on_norm: bool, add: f32, on_rope: bool, pos: i32, o: Opts, m: Mutant, out: *[128]u16) void {
++    var x: [128]f32 = undefined;
++    @memcpy(&x, src[0..128]);
++    if (m == .rope_first and on_rope) rope(&x, pos, o.rot, o.theta, o.flags.gptj, .none);
++    if (on_norm) norm(&x, w, o, if (m == .no_plus_one) 0 else add);
++    if (m != .rope_first and on_rope) rope(&x, pos, o.rot, o.theta, o.flags.gptj, m);
++    for (out, x) |*b, v| b.* = c.toBf16(v);
++}
++
++/// tf_mm3_rows over `rows` rows; returns the status word.
++pub fn call(rows: usize, h: Heads, o: Opts, in: Inputs, nm: *const Norms, t: Target, m: Mutant) i32 {
++    var status: i32 = 0;
++    const f = o.flags;
++    for (0..rows) |r| {
++        const p: i32 = if (t.pos) |a| a[r] else t.pos0 + @as(i32, @intCast(r));
++        if (p < 0) continue;
++        const blk: usize = @intCast(@divTrunc(p, 128));
++        const tok: usize = @intCast(@mod(p, 128));
++        const off: usize = if (t.row_tab) |a| @intCast(a[r]) else 0;
++        var page: i64 = -1;
++        if (blk < t.max_pages) page = t.tables[off + blk] else status |= geom.status_past_table;
++        if (blk < t.max_pages and page < 0) status |= geom.status_no_page;
++        const base: usize = if (page >= 0) (@as(usize, @intCast(page)) * t.page_bytes + t.layer_off) / 2 else 0;
++        var buf: [128]u16 = undefined;
++        for (0..h.nq) |i| {
++            head(in.q[(r * h.nq + i) * 128 ..], &nm.q, f.norm_qk, o.w_add, true, p, o, m, &buf);
++            @memcpy(t.q[(r * h.nq + i) * 128 ..][0..128], &buf);
++        }
++        for (0..h.niq) |i| {
++            head(in.iq[(r * h.niq + i) * 128 ..], &nm.iq, f.norm_index, o.w_add_index, f.index_rope, p, o, m, &buf);
++            @memcpy(t.iq[(r * h.niq + i) * 128 ..][0..128], &buf);
++        }
++        if (page < 0) continue;
++        const kvh = h.kvh;
++        for (0..kvh) |i| {
++            head(in.k[(r * kvh + i) * 128 ..], &nm.k, f.norm_qk, o.w_add, true, p, o, m, &buf);
++            const tk = if (m == .next_slot) (tok + 1) % 128 else tok;
++            @memcpy(t.pool[base + elem(kvh, 0, i, tk) ..][0..128], &buf);
++            for (0..128) |e| buf[e] = c.toBf16(in.v[(r * kvh + i) * 128 + e]);
++            @memcpy(t.pool[base + elem(kvh, 1, i, tok) ..][0..128], &buf);
++        }
++        if (h.ik) {
++            head(in.ik[r * 128 ..], &nm.ik, f.norm_index, o.w_add_index, f.index_rope, p, o, m, &buf);
++            @memcpy(t.pool[base + ikElem(kvh, tok) ..][0..128], &buf);
++        }
++    }
++    return status;
++}
++
++/// minimax_m3_sparse.cuh kv_elem and ik_elem, in bf16 elements.
++pub fn elem(kvh: usize, which: usize, h: usize, t: usize) usize {
++    return (which * kvh + h) * 128 * 128 + t * 128;
++}
++
++pub fn ikElem(kvh: usize, t: usize) usize {
++    return 2 * kvh * 128 * 128 + t * 128;
++}
++
++/// One router output as the kernel sums it: lane fma chains over chunks l + 32 j, then the 4 chains, then the tree.
++pub fn router(x: []const f32, w: []const f32, k: usize, rows_in_call: usize, m: Mutant) f32 {
++    var lane: [32]f32 = undefined;
++    const slices: usize = if (m == .split_by_rows) @max(1, @min(rows_in_call, 4)) else 1;
++    for (&lane, 0..) |*s, l| {
++        var acc: [4]f32 = @splat(0);
++        var j: usize = 0;
++        while (j < k / 128) : (j += 1) {
++            const at = 4 * (l + 32 * j);
++            for (0..4) |i| {
++                const slot = if (slices > 1) (j % slices) % 4 else i;
++                acc[slot] = @mulAdd(f32, x[at + i], w[at + i], acc[slot]);
++            }
++        }
++        s.* = if (m == .reorder_chains) (acc[0] + acc[2]) + (acc[1] + acc[3]) else (acc[0] + acc[1]) + (acc[2] + acc[3]);
++    }
++    return tree(&lane);
++}
+-- 
+2.43.0
+

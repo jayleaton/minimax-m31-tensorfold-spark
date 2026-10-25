@@ -1,0 +1,78 @@
+{
+ "about": "bench/drafts.py's fixed prompts: four workload classes, written for this recipe (public, no outside text). The same file on both runs of a comparison; bench/drafts.py records its sha256 and compare refuses runs whose sets differ. The first prompt of each class is also sent keyed-sampled.",
+ "classes": {
+  "code": [
+   {
+    "id": "code-lru",
+    "messages": [
+     {"role": "user", "content": "Write a Python class LRUCache with get(key) and put(key, value) in O(1) time using collections.OrderedDict. Use type hints and a one-line docstring per method, then write three pytest tests for it: eviction order, updating an existing key, and a capacity of one."}
+    ]
+   },
+   {
+    "id": "code-refactor",
+    "messages": [
+     {"role": "user", "content": "Refactor this function so that it reads the file once, handles a missing file by returning an empty dict, and has type hints. Show only the new code.\n\n```python\ndef load(path):\n    counts = {}\n    for line in open(path).readlines():\n        line = line.strip()\n        if line == '':\n            continue\n        word = line.split(',')[0]\n        if word in counts:\n            counts[word] = counts[word] + 1\n        else:\n            counts[word] = 1\n    for line in open(path).readlines():\n        if line.startswith('#'):\n            print('comment', line)\n    return counts\n```"}
+    ]
+   }
+  ],
+  "prose": [
+   {
+    "id": "prose-tides",
+    "messages": [
+     {"role": "user", "content": "Explain to a curious twelve-year-old why most coasts have two high tides a day and not one. Use plain words and four short paragraphs, and end with one simple experiment they could do at home."}
+    ]
+   },
+   {
+    "id": "prose-letter",
+    "messages": [
+     {"role": "user", "content": "Write a friendly letter from a small town library to its readers announcing that it will open on Sunday afternoons from next month. Mention the new reading corner for children, the quiet study room, and that volunteers are welcome. About 200 words."}
+    ]
+   }
+  ],
+  "structured": [
+   {
+    "id": "json-inventory",
+    "messages": [
+     {"role": "user", "content": "Return only a JSON array of 12 objects for a hardware store's inventory, with the keys sku (a string such as \"HW-0001\"), name, category, price (a number) and in_stock (a boolean). No prose, no code fence."}
+    ]
+   },
+   {
+    "id": "table-planets",
+    "messages": [
+     {"role": "user", "content": "Make a Markdown table of the eight planets of the solar system with the columns: name, order from the sun, type (rocky or giant), and a one-line note. The table only, no text before or after it."}
+    ]
+   }
+  ],
+  "agent": [
+   {
+    "id": "agent-call",
+    "tools": [
+     {"type": "function", "function": {"name": "search_flights", "description": "Find direct and one-stop flights between two cities on a date.", "parameters": {"type": "object", "properties": {"origin": {"type": "string", "description": "departure city"}, "destination": {"type": "string", "description": "arrival city"}, "date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["origin", "destination", "date"]}}},
+     {"type": "function", "function": {"name": "get_weather", "description": "The weather forecast for a city on a date.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["city", "date"]}}}
+    ],
+    "messages": [
+     {"role": "system", "content": "You are a travel assistant. Use the tools to look things up; never guess flight times or forecasts."},
+     {"role": "user", "content": "Find me flights from Lisbon to Oslo on 2026-11-14 and tell me what the weather in Oslo will be that day."}
+    ]
+   },
+   {
+    "id": "agent-result",
+    "tools": [
+     {"type": "function", "function": {"name": "search_flights", "description": "Find direct and one-stop flights between two cities on a date.", "parameters": {"type": "object", "properties": {"origin": {"type": "string", "description": "departure city"}, "destination": {"type": "string", "description": "arrival city"}, "date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["origin", "destination", "date"]}}},
+     {"type": "function", "function": {"name": "get_weather", "description": "The weather forecast for a city on a date.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["city", "date"]}}}
+    ],
+    "messages": [
+     {"role": "system", "content": "You are a travel assistant. Use the tools to look things up; never guess flight times or forecasts."},
+     {"role": "user", "content": "Find me flights from Lisbon to Oslo on 2026-11-14 and tell me what the weather in Oslo will be that day."},
+     {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_0", "type": "function", "function": {"name": "search_flights", "arguments": "{\"origin\": \"Lisbon\", \"destination\": \"Oslo\", \"date\": \"2026-11-14\"}"}},
+      {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Oslo\", \"date\": \"2026-11-14\"}"}}
+     ]},
+     {"role": "tool", "tool_call_id": "call_0", "content": "{\"flights\": [{\"number\": \"XA 241\", \"depart\": \"07:10\", \"arrive\": \"12:05\", \"stops\": 0, \"price_eur\": 214}, {\"number\": \"XB 908\", \"depart\": \"10:45\", \"arrive\": \"17:30\", \"stops\": 1, \"via\": \"Copenhagen\", \"price_eur\": 168}, {\"number\": \"XA 245\", \"depart\": \"16:20\", \"arrive\": \"21:15\", \"stops\": 0, \"price_eur\": 239}]}"},
+     {"role": "tool", "tool_call_id": "call_1", "content": "{\"city\": \"Oslo\", \"date\": \"2026-11-14\", \"summary\": \"cloudy, light rain in the afternoon\", \"high_c\": 6, \"low_c\": 1, \"wind_kmh\": 18}"}
+    ]
+   }
+  ]
+ },
+ "sampled": {"temperature": 0.7, "top_p": 0.95, "seed": 4242}
+}

@@ -1,0 +1,2978 @@
+From 25494f4f609b126fa1eb1b820a896515df6eada5 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 12:50:53 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: engine loop, NCCL control link, lanes
+ backend and the open() path (T8b)
+
+engine.zig: slots over the pooled KV pages, chunked prompts that resume from adopted pages and cut at the
+radix cache's marks, windows, shared windows, commit, a cancellation gate across ranks.
+follow.zig: rank 0's Leader and rank 1's follow loop on the ncclBroadcast control link (the 64-byte header
+of iface.zig); a lost rank ends rank 0 with RankLost, a failed follower tells the others.
+backend.zig: the lanes.backend vtable (stepped prefill, copy drafts only, no vision, radix keep and restore).
+draw.zig: rank 0 draws on its host from the forward's gathered fp32 logits (lane core's keyed rule, bounded heap).
+engine_dev.zig: NCCL collectives, arena and block table, fingerprint byte gather, NCCL defaults (compile-checked).
+engine_ops.zig is the seam to forward.zig and prefill.zig (mm3-t8a); openOps is the merge point.
+native.open() joins the ranks and returns Loaded; until the merge it stops at ForwardNotBuilt.
+Host tests on recording fakes: test-minimax-engine. Nothing ran on a GPU.
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/interface-decisions.md                  |  81 +++-
+ zig/build/minimax_family.zig                 |  10 +-
+ zig/src/families/minimax_m3/backend.zig      | 318 +++++++++++++++
+ zig/src/families/minimax_m3/backend_test.zig | 229 +++++++++++
+ zig/src/families/minimax_m3/cuda.zig         |  12 +
+ zig/src/families/minimax_m3/draw.zig         | 267 +++++++++++++
+ zig/src/families/minimax_m3/engine.zig       | 317 +++++++++++++++
+ zig/src/families/minimax_m3/engine_dev.zig   | 388 +++++++++++++++++++
+ zig/src/families/minimax_m3/engine_fake.zig  | 291 ++++++++++++++
+ zig/src/families/minimax_m3/engine_ops.zig   | 139 +++++++
+ zig/src/families/minimax_m3/engine_test.zig  | 275 +++++++++++++
+ zig/src/families/minimax_m3/engine_tests.zig |  12 +
+ zig/src/families/minimax_m3/follow.zig       | 302 +++++++++++++++
+ zig/src/families/minimax_m3/native.zig       | 124 +++++-
+ 14 files changed, 2747 insertions(+), 18 deletions(-)
+ create mode 100644 zig/src/families/minimax_m3/backend.zig
+ create mode 100644 zig/src/families/minimax_m3/backend_test.zig
+ create mode 100644 zig/src/families/minimax_m3/draw.zig
+ create mode 100644 zig/src/families/minimax_m3/engine.zig
+ create mode 100644 zig/src/families/minimax_m3/engine_dev.zig
+ create mode 100644 zig/src/families/minimax_m3/engine_fake.zig
+ create mode 100644 zig/src/families/minimax_m3/engine_ops.zig
+ create mode 100644 zig/src/families/minimax_m3/engine_test.zig
+ create mode 100644 zig/src/families/minimax_m3/engine_tests.zig
+ create mode 100644 zig/src/families/minimax_m3/follow.zig
+
+diff --git a/docs/interface-decisions.md b/docs/interface-decisions.md
+index 076c66d..456eb0d 100644
+--- a/docs/interface-decisions.md
++++ b/docs/interface-decisions.md
+@@ -28,15 +28,78 @@ was built and tested on a machine without one.
+ `grant`), `open`, `explain` with `explains_open`, `weightShare`, `attach`, `fits`, `cache_limit` and `owns_prompt_cache`;
+ `iface.conformsNative` lists them and fails the build when one is missing.
+ 
+-## `open` today
+-
+-`native.open` does the host half and then stops with `error.EngineNotBuilt`, which `explain` words: the rank place and
+-`NCCL_COMM_ID` (`ranks.admit`), `Settings`, `config.json`, the shard headers and this rank's `load.Plan`, the weights
+-digest from headers and sizes, and the budget. What is not written, and is marked `UNEXERCISED` in the code: NCCL and the
+-engine (`weights_device.loadWeights` is written and compile-checked, never run), the forward pass, prefill, the lanes
+-backend and the follower, the rank fingerprint exchange, and the `Loaded` that carries them. `tensorfold-native
+-capabilities --json` lists `minimax_m3_vl` with the format `exl3`, so the recipe's family gate passes; a serve then fails at
+-the open with the sentence above, on every rank.
++## `open` today (T8b)
++
++`native.open` does the host half as before (rank place and `NCCL_COMM_ID`, `Settings`, `config.json`, shard headers, this
++rank's plan, the weights digest, the budget: each refusal is precise and comes first), then joins the ranks: `tp_watch.start`,
++the NCCL defaults GLM sets (`NCCL_RUNTIME_CONNECT`, `NCCL_CUMEM_HOST_ENABLE`, `NCCL_CUMEM_ENABLE` = 0 unless set),
++`ncclCommInitRank`, `warmPeers`, `Engine.init` (config, quantization and executable hashes plus the header digest go into
++the `Fingerprint`, all-gathered as bytes through `ranks.agree`; a difference is `RankMismatch` on every rank), the weights,
++the RoCE small gather, the control link, the rooms gather, `tp_watch.ready`. Rank 1 then follows and exits; rank 0 returns
++`Loaded` (`stream_bytes` 0, `free_streams` 0, `layout` the pool's, `peer_room`). Until forward.zig and prefill.zig are merged
++`engine_ops.available()` is false and `open` stops after the fingerprint with `error.ForwardNotBuilt` (explained) before any
++weight is read. Nothing below ran on a GPU: `engine_dev.zig`, `draw.zig` and `native.openRank` are compile-checked only.
++
++### The engine loop (T8b): files and protocol
++
++`engine.zig` (slots, chunked prompts, windows, draws; logic over `engine_ops` seams, host-tested), `engine_dev.zig` (NCCL
++`Comm`, device arena and block table, `NcclWire`, `Engine.init`), `draw.zig` (rank 0 draws on its host from the forward's
++gathered fp32 logits with the lane core's keyed rule; the other ranks draw nothing), `follow.zig` (`Leader`, `follow`, `Link` over a `Wire`), `backend.zig` (`Lanes`).
++`engine_fake.zig`, `engine_test.zig`, `backend_test.zig` are the recording fakes and tests (`zig build test-minimax-engine`).
++
++The control link is `ncclBroadcast` of the 64-byte `iface.Header` then `n` ids (never a TCP mirror). Uses of the contract's
++kinds, with the fields it left free:
++
++| Kind | Header | ids | Rank 1 does |
++| --- | --- | --- | --- |
++| begin | slot, `flags` 1: sampled, seed, temperature, top_p, min_p, top_k | the stream's block-table row (lease page ids) | writes the row, starts the sequence |
++| chunk | `a` rows resumed, `depth` start, `top_k` prompt length | the chunk's ids (a chunk ends at a page multiple, a mark or the prompt) | one prompt forward, gate first |
++| prefill | as chunk, ids are the whole prompt | all ids | reserved: rank 0 sends chunks, never this |
++| verify | slot | the window | one forward, sends its logits span |
++| shared | `depth` parts | per part slot, rows; then every part's ids | one shared forward |
++| keep | `a` rows (flags 0) | none | commits `a` rows |
++| keep, flags 1 | `depth` first table entry | the new page ids | writes them (the radix store swapped pages at a mark) |
++| release | slot | none | clears the slot's row |
++| idle, flags 0 | none | none | sleeps on its liveness line (`tp_watch.sleep`) |
++| idle, flags 1 | `depth` streams, `a` pages | none | makes the arena and tables (rank 0's `attach`) |
++| end | none | none | leaves |
++
++Deviations from the contract text, all in code and tests: (1) `flags` of verify and shared are 0, because only rank 0 draws,
++so a grammar's masks (host words, `bits` is their address) stay on rank 0; (2) draws run on rank 0's host over the gathered
++fp32 rows `[rank][row][slot]` the head leaves on every rank (no fp32 draw kernel and no per-rank pick kernel exist): argmax
++takes the lowest id on ties, a sampled row uses `lanes.gpu_rule`'s rule through a bounded candidate heap (tested equal to
++`gpu_rule.sample` on random rows, ties and masked tokens), costing one device-to-host copy of the rows per step (a device
++kernel is a later saving, `mergePicks` stays for it); (3) a prompt chunk is `part = ids[start..end]` without the next id (no draft
++head), and marks cut chunks, so every rank sees the same chunk grid; (4) a mark's page swap goes out before the chunk
++step that follows it; (5) there is no `first_masked`: a grammar that constrains the first token is `StructuresUnsupported`
++(later tokens are masked on rank 0); (6) `T6 state.Cache.admit` writes only the pages it takes into the table, so the
++backend writes the whole lease row after it (adopted pages included), on rank 0's device and, through `begin`, on rank 1.
++
++### T8b needs (from forward.zig / prefill.zig, branch mm3-t8a)
++
++The engine calls them through `engine_ops.zig`; nothing else of theirs is used.
++
++1. `engine_ops.Ops` over their buffers, returned by one function: `forward.open(args: engine_ops.OpenArgs) !engine_ops.Ops`.
++   `OpenArgs` carries the driver and context, the engine's stream (every forward is enqueued on it), the config, the rank's
++   `Share`, `*const weights.Weights` (already loaded by `weights_device.loadWeights`), `Settings`, `Place`, `capacity`, the
++   NCCL library and communicator, and `group: *const ?*const tp_group.Group` (read at each exchange; set after open).
++2. `Ops.attach(PoolView)`: the page arena (`arena + id * page_bytes`) and the int32 block table (`table`, `max_pages` entries
++   a slot, -1 past a stream's pages; `iface.tableOffset`). Called at `Engine.attach`, again if the pool is remade.
++3. `Ops.run(Forward{kind, ids, segs, starts})`: ids of all segments in order, segment `i` is slot `segs[i].slot` with rows
++   `row0 .. row0 + rows` whose first key position is `starts[i]`. KV rows are written at their positions. Kinds: `prompt`
++   (one segment, 128-multiple rows unless it ends the prompt; `head` false for a chunk that does not end it, and only its
++   LAST row's logits are kept), `window` (one segment, all rows' logits), `shared` (up to 16 segments, 64 rows, all rows'
++   logits in segment order). Both ranks get identical `ids`, `segs`, `starts`, so their collectives match call for call.
++4. `Ops.logits(kind)`: device address of the fp32 logits of the last pass of that kind as every rank holds them after the
++   head's gather, `[rank][row][slot]` (slot: the largest vocabulary share; world 1: `[row][slot]`), valid until the next
++   `run` of that kind. `Ops.sync()` waits for every enqueued forward; `Ops.deinit()` frees their buffers.
++5. Merge: T8a's actual API is `Forward.run(Call) -> Out` over `Modules`, `Buffers`, `Pages{cache, layer_bytes, mirror}` and
++   `Link{group, lib, comm}`; it is not `Ops`. `patches/tasks/0011b-minimax-m3-engine-glue.patch` (on top of 0010 and 0011)
++   is the adapter `forward_ops.zig` (about 110 lines), the three-line `engine_ops.zig` switch (`available()` true, `openOps`
++   calls it) and the family `cuda.zig` lines; it was built and tested on a scratch merge of both branches
++   (test-minimax-engine, -engine-host, -forward, check-native-cuda-host, compile-cuda-tests -Dsm=121 all pass there).
++   Without it `open` stops at `ForwardNotBuilt` after the fingerprint. The kernels T8a lists as missing (fp16 index
++   projection, `NoIndexProjKernel`) still stop the first forward on a GPU.
+ 
+ ## NFS and the page cache
+ 
+diff --git a/zig/build/minimax_family.zig b/zig/build/minimax_family.zig
+index cd0bdb7..447c190 100644
+--- a/zig/build/minimax_family.zig
++++ b/zig/build/minimax_family.zig
+@@ -10,8 +10,13 @@ pub fn canonModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
+ 
+ /// The family over the runtime, the core, the lane core and the engine API, as native/cuda.zig registers it.
+ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: Mod, core: Mod, lanes: Mod, api: Mod, canon: Mod) Mod {
++    return moduleAt(b, target, optimize, cuda, core, lanes, api, canon, "zig/src/families/minimax_m3/cuda.zig");
++}
++
++/// The same module rooted at another file of the family (a test step's root).
++fn moduleAt(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: Mod, core: Mod, lanes: Mod, api: Mod, canon: Mod, root: []const u8) Mod {
+     return b.createModule(.{
+-        .root_source_file = b.path("zig/src/families/minimax_m3/cuda.zig"),
++        .root_source_file = b.path(root),
+         .target = target,
+         .optimize = optimize,
+         .link_libc = true,
+@@ -37,4 +42,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug)) }));
+     b.step("test-minimax-engine-host", "MiniMax-M3.1-Flash interface, weights descriptors, page state and native host half without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
++    const engine = b.addRunArtifact(b.addTest(.{ .root_module = moduleAt(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug), "zig/src/families/minimax_m3/engine_tests.zig") }));
++    b.step("test-minimax-engine", "MiniMax-M3.1-Flash engine loop, follower, lanes backend and radix cache flow on recording fakes, no GPU").dependOn(&engine.step);
++    umbrella.dependOn(&engine.step);
+ }
+diff --git a/zig/src/families/minimax_m3/backend.zig b/zig/src/families/minimax_m3/backend.zig
+new file mode 100644
+index 0000000..16527ef
+--- /dev/null
++++ b/zig/src/families/minimax_m3/backend.zig
+@@ -0,0 +1,318 @@
++//! MiniMax-M3.1-Flash's lane backend: slots over pooled pages, radix-cache resume, copy drafts, no vision.
++const std = @import("std");
++const lanes = @import("lanes");
++const iface = @import("iface.zig");
++const engine = @import("engine.zig");
++const follow = @import("follow.zig");
++const pages_mod = @import("pages.zig");
++const state = @import("state.zig");
++const pool = @import("pool.zig");
++
++const be = lanes.backend;
++
++/// First tokens a handle names.
++const ring = 1024;
++pub const window_rows = iface.window_rows;
++pub const max_rows = iface.window_rows;
++
++/// A stream's place in the backend: its slot, the pages and position of its lease, its prompt pass.
++pub const Lane = struct {
++    slot: u32,
++    st: state.Stream,
++    marks: []const u32 = &.{}, // where the pass keeps the prompt cache's prefix (rows, pages), from admit
++    adopted: ?iface.Resume = null, // rows already in adopted pages: only the pass's first chunk says so
++    pending_rows: ?usize = null, // the rows of the last verify, not yet committed
++    first: ?u64 = null,
++    fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
++    owner: *Lanes,
++    stream: *lanes.Stream,
++};
++
++/// Grammar words of a round's windows on the device, where rank 0's draw reads them; the host supplies the buffer.
++pub const Masks = struct {
++    ptr: *anyopaque,
++    put: *const fn (ptr: *anyopaque, row: usize, rows: usize, words: []const u32) anyerror!u64,
++};
++
++pub const Lanes = struct {
++    gpa: std.mem.Allocator,
++    x: follow.Leader,
++    pages: ?*pages_mod.Pages = null, // made by `attach`, after open
++    masks: ?Masks = null,
++    lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
++    drawn: [ring]u32 = undefined,
++    next: u64 = 0,
++    shared: u64 = 0, // forwards that held several streams' windows
++    resumed: u64 = 0, // prompt passes that started past row 0, from the prompt cache
++
++    pub fn deinit(self: *Lanes) void {
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| self.free(l.*);
++        self.lanes.deinit(self.gpa);
++    }
++
++    pub fn backend(self: *Lanes) be.Backend {
++        return .{ .ptr = self, .vtable = &vt };
++    }
++
++    const vt: be.Backend.VTable = .{
++        .prefill = prefillFn,
++        .prefill_step = prefillStepFn,
++        .first = firstFn,
++        .queue = queueFn,
++        .read = readFn,
++        .verify = verifyFn,
++        .keep = keepFn,
++        .draft = draftFn,
++        .release = releaseFn,
++        .reports_fill = true,
++    };
++
++    /// Round loop facts: copies up to the window and shared exact windows (Qwen3.5's facts for a model without a head).
++    pub fn facts(_: *const Lanes) lanes.Model {
++        return iface.laneFacts(window_rows, iface.shared_rows);
++    }
++
++    fn of(ptr: *anyopaque) *Lanes {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn take(self: *Lanes, token: u32) u64 {
++        const h = self.next;
++        self.drawn[h % ring] = token;
++        self.next += 1;
++        return h;
++    }
++
++    fn free(self: *Lanes, l: *Lane) void {
++        if (l.marks.len > 0) self.gpa.free(l.marks);
++        if (self.pages) |pg| pg.cache.end(&l.st, &pg.tables);
++        self.gpa.destroy(l);
++    }
++
++    /// The lowest slot no stream holds, within the block table's rows.
++    fn freeSlot(self: *const Lanes, slots: u32) ?u32 {
++        var slot: u32 = 0;
++        while (slot < slots) : (slot += 1) {
++            var it = self.lanes.valueIterator();
++            const taken = while (it.next()) |l| {
++                if (l.*.slot == slot) break true;
++            } else false;
++            if (!taken) return slot;
++        }
++        return null;
++    }
++
++    fn cancelled(ptr: ?*anyopaque) bool {
++        return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
++    }
++
++    fn cancelOf(s: *lanes.Stream) ?iface.Cancel {
++        return if (s.cancel_check == null) null else .{ .ptr = s, .check = cancelled };
++    }
++
++    /// The pass's marks for the leader: the prompt cache keeps the prefix at each (`keptAt`).
++    fn marksOf(l: *Lane) ?iface.Marks {
++        return if (l.marks.len == 0) null else .{ .at = l.marks, .ctx = l, .call = keptAt };
++    }
++
++    /// The pass stands at `at` (a page multiple): the store keeps the prefix, the stream swaps pages, all ranks hear.
++    fn keptAt(ctx: *anyopaque, at: u32) void {
++        const l: *Lane = @ptrCast(@alignCast(ctx));
++        const self = l.owner;
++        const pg = self.pages orelse return;
++        var sink = pg.tables.sink(l.slot);
++        pg.cache.keep(&l.st, l.stream.prompt(), at, sink.table()) catch |err| return std.log.warn("prompt prefix not kept at {d}: {s}", .{ at, @errorName(err) });
++        const n = at / pool.page_tokens;
++        self.x.sendPages(0, l.st.lease.ids.items[0..n]) catch |err| std.log.warn("the other ranks' pages at {d}: {s}", .{ at, @errorName(err) });
++    }
++
++    // -- the vtable ---------------------------------------------------------------------------------------------
++
++    /// A request's admission and its lane: refusals come before any page or step is taken.
++    fn begin(self: *Lanes, s: *lanes.Stream) !*Lane {
++        if (s.images.len > 0) return error.VisionUnsupported;
++        const pg = self.pages orelse return error.NoPool;
++        const e = self.x.e;
++        const ids = s.prompt();
++        if (ids.len == 0 or ids.len + s.max_new + window_rows >= e.capacity) return error.PromptTooLong;
++        if (self.lanes.get(s)) |old| { // a second pass of the same stream starts over
++            self.release(s, old);
++        }
++        const slot = self.freeSlot(@intCast(pg.tables.slots)) orelse return error.LaneMemory;
++        const l = try self.gpa.create(Lane);
++        errdefer self.gpa.destroy(l);
++        l.* = .{ .slot = slot, .st = .{ .slot = slot }, .owner = self, .stream = s };
++        var sink = pg.tables.sink(slot);
++        l.marks = try pg.cache.admit(self.gpa, &l.st, ids, s.history_len, s.max_new, pg.window, sink.table(), pg.max_pages);
++        errdefer {
++            self.gpa.free(l.marks);
++            pg.cache.end(&l.st, &pg.tables);
++        }
++        // the resumed prefix is the lease's first pages and admit writes only the pages it took: write the whole row
++        try pg.tables.write(slot, l.st.lease.ids.items, 0);
++        try self.x.bind(slot);
++        try self.x.begin(s.sampling, l.st.lease.ids.items);
++        s.cached = l.st.pos;
++        l.fill = l.st.pos;
++        if (l.st.pos > 0) {
++            l.adopted = .{ .at = l.st.pos };
++            self.resumed += 1;
++        }
++        try self.lanes.put(self.gpa, s, l);
++        return l;
++    }
++
++    fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++        while (!try prefillStepFn(ptr, s)) {}
++    }
++
++    /// One chunk of the stream's prompt pass; true once the first token is drawn. A chunk ends at a mark or its rows.
++    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
++        const self = of(ptr);
++        if (s.isCancelled()) return error.Cancelled;
++        const l = if (self.lanes.get(s)) |l| (if (l.fill != null) l else try self.begin(s)) else try self.begin(s);
++        try self.x.bind(l.slot);
++        const ids = s.prompt();
++        const at = l.fill.?;
++        const marks = marksOf(l);
++        const first = self.x.chunk(ids, at, l.adopted, cancelOf(s), marks) catch |err| {
++            l.fill = null; // the pass is over; the host releases the stream
++            return err;
++        };
++        l.adopted = null;
++        if (first) |t| {
++            l.first = self.take(t);
++            l.fill = null;
++            s.fill_at.store(@intCast(ids.len), .monotonic);
++            return true;
++        }
++        const to = engine.chunkEnd(at, ids.len, marks);
++        l.fill = to;
++        s.fill_at.store(@intCast(to), .monotonic);
++        return false;
++    }
++
++    fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++        const self = of(ptr);
++        if (position != s.prompt_len) return error.PositionMismatch;
++        const l = self.lanes.get(s) orelse return error.UnknownStream;
++        return l.first orelse error.NoFirstToken;
++    }
++
++    fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
++        return error.NotPipelined;
++    }
++
++    fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
++        const self = of(ptr);
++        if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
++        return self.drawn[handle % ring];
++    }
++
++    /// The stream's sequence bound, its last verify committed (`kept` rows, else all of them).
++    fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
++        const l = self.lanes.get(s) orelse return error.UnknownStream;
++        try self.x.bind(l.slot);
++        if (l.pending_rows) |rows| try self.x.keep(kept orelse rows);
++        l.pending_rows = null;
++        return l;
++    }
++
++    /// Grammar words of rows [row, row + rows) of the round on the device; 0 for no grammar.
++    fn putBits(self: *Lanes, row: usize, rows: usize, words: []const u32) !u64 {
++        if (words.len == 0) return 0;
++        const m = self.masks orelse return error.StructuresUnsupported;
++        return m.put(m.ptr, row, rows, words);
++    }
++
++    /// A window's checks against the lane's position, and its ids: the pending token, then the host's drafts.
++    fn window(self: *Lanes, w: be.Window, ids: []u32) !struct { l: *Lane, rows: usize } {
++        if (w.parents != null) return error.TreesNotBuilt;
++        if (w.held > 0) return error.NoHeldDrafts; // no head holds drafts
++        const l = try self.bind(w.stream, null);
++        const rows = w.rows();
++        if (rows > max_rows) return error.WindowTooWide;
++        const pos = self.x.e.pos();
++        for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
++        ids[0] = w.pending;
++        @memcpy(ids[1..][0..w.tokens.len], w.tokens);
++        return .{ .l = l, .rows = rows };
++    }
++
++    /// Each window in its own forward on its stream's pages (the core sends one when no forward is shared).
++    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++        const self = of(ptr);
++        if (windows.len > 1) return self.verifyShared(windows, out);
++        for (windows, out) |w, *o| {
++            var ids: [max_rows]u32 = undefined;
++            const got = try self.window(w, &ids);
++            var sampled: [max_rows]u32 = undefined;
++            const bits = try self.putBits(0, got.rows, w.masks); // before the step goes out: a refusal after it strands the ranks
++            try self.x.verify(ids[0..got.rows], sampled[0..got.rows], bits);
++            @memcpy(o.sampled[0..got.rows], sampled[0..got.rows]);
++            @memcpy(o.drafts[0..w.tokens.len], w.tokens);
++            got.l.pending_rows = got.rows;
++        }
++    }
++
++    /// A round's windows in one forward (Engine.verifyShared), each stream's rows on its own pages.
++    fn verifyShared(self: *Lanes, windows: []const be.Window, out: []be.Verified) !void {
++        if (windows.len > iface.max_shared) return error.WindowTooWide;
++        var parts: [iface.max_shared]iface.Part = undefined;
++        var ids: [iface.max_shared][max_rows]u32 = undefined;
++        var sampled: [iface.max_shared][max_rows]u32 = undefined;
++        var lane: [iface.max_shared]*Lane = undefined;
++        var row: usize = 0; // the windows' rows so far: each one's grammar rows start there
++        for (windows, 0..) |w, k| {
++            const got = try self.window(w, &ids[k]);
++            if (row + got.rows > iface.shared_rows) return error.WindowTooWide;
++            const bits = try self.putBits(row, got.rows, w.masks);
++            parts[k] = .{ .slot = got.l.slot, .ids = ids[k][0..got.rows], .out = sampled[k][0..got.rows], .bits = bits };
++            lane[k] = got.l;
++            row += got.rows;
++        }
++        try self.x.verifyShared(parts[0..windows.len]);
++        self.shared += 1;
++        for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len], windows) |*o, p, l, w| {
++            @memcpy(o.sampled[0..p.ids.len], p.out);
++            @memcpy(o.drafts[0..w.tokens.len], w.tokens);
++            l.pending_rows = p.ids.len;
++        }
++    }
++
++    fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++        const self = of(ptr);
++        for (windows, paths) |w, path| {
++            if (path.len == 0) return error.EmptyPath;
++            for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
++            _ = try self.bind(w.stream, path.len);
++        }
++    }
++
++    /// The pack has no draft head: the core drafts by copies alone and never asks.
++    fn draftFn(_: *anyopaque, _: []const be.DraftRequest) anyerror!void {
++        return error.NoDraftHead;
++    }
++
++    /// The stream left the rounds: its slot is freed on every rank and its pages go back (the store keeps its prefix).
++    fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
++        const self = of(ptr);
++        const l = self.lanes.get(s) orelse return;
++        self.release(s, l);
++        if (self.lanes.count() == 0) self.x.idle() catch |err| if (err != error.RankLost) std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
++    }
++
++    fn release(self: *Lanes, s: *const lanes.Stream, l: *Lane) void {
++        _ = self.lanes.remove(s);
++        self.x.release(l.slot) catch |err| if (err != error.RankLost) std.log.err("releasing slot {d}: {s}", .{ l.slot, @errorName(err) });
++        self.free(l);
++    }
++};
++
++test "the vtable is a head-less backend: no drafts held, windows exact, stepped prompts" {
++    try std.testing.expect(Lanes.vt.prefill_step != null and Lanes.vt.first_masked == null and Lanes.vt.held == null);
++    try std.testing.expect(Lanes.vt.reports_fill);
++    const f = iface.laneFacts(window_rows, iface.shared_rows);
++    try std.testing.expect(!f.mtp and f.hidden_rows and f.streams_exact);
++}
+diff --git a/zig/src/families/minimax_m3/backend_test.zig b/zig/src/families/minimax_m3/backend_test.zig
+new file mode 100644
+index 0000000..9f22b2a
+--- /dev/null
++++ b/zig/src/families/minimax_m3/backend_test.zig
+@@ -0,0 +1,229 @@
++//! Host tests of the lane backend against core/lanes/fake.zig: same tokens, shared rounds, the radix cache, admission.
++const std = @import("std");
++const lanes = @import("lanes");
++const iface = @import("iface.zig");
++const fakes = @import("engine_fake.zig");
++const backend = @import("backend.zig");
++const pool = @import("pool.zig");
++
++const gpa = std.testing.allocator;
++const World = fakes.World;
++const be = lanes.backend;
++
++const Case = struct { prompt: []const u32, max_new: u32 = 40, sampling: ?lanes.Sampling = null, history_len: u32 = 0 };
++
++fn tokens(n: usize, salt: u32) ![]u32 {
++    const p = try gpa.alloc(u32, n);
++    for (p, 0..) |*t, i| t.* = @intCast((i * 7 + salt) % 90);
++    return p;
++}
++
++/// Every case's emitted tokens when the cases run together through the lane core on `backend`.
++fn drive(b: be.Backend, facts: lanes.Model, cases: []const Case) ![][]u32 {
++    var cfg = try lanes.Config.init(gpa, facts, iface.window_rows, 15);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, b, clock.clock());
++    defer core.deinit();
++    const streams = try gpa.alloc(lanes.Stream, cases.len);
++    defer gpa.free(streams);
++    const proposers = try gpa.alloc(lanes.SuffixLookup, cases.len);
++    defer gpa.free(proposers);
++    for (cases, streams, proposers) |c, *s, *p| {
++        p.* = try lanes.SuffixLookup.init(gpa, .{ .min_match = 5 });
++        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = c.sampling, .proposer = p.proposer(), .history_len = c.history_len });
++    }
++    defer for (streams, proposers) |*s, *p| {
++        s.deinit(gpa);
++        p.deinit();
++    };
++    for (streams) |*s| try core.addStream(s);
++    while (core.activeCount() > 0) try core.step();
++    const out = try gpa.alloc([]u32, cases.len);
++    for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
++    return out;
++}
++
++fn free(runs: [][]u32) void {
++    for (runs) |r| gpa.free(r);
++    gpa.free(runs);
++}
++
++/// The fake target on the same facts: what the reference backend emits for the cases.
++fn reference(facts: lanes.Model, cases: []const Case) ![][]u32 {
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    return drive(target.backend(), facts, cases);
++}
++
++fn expectSame(want: [][]u32, got: [][]u32) !void {
++    try std.testing.expectEqual(want.len, got.len);
++    for (want, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
++}
++
++test "streams through the lane core emit what the fake backend emits, greedy and sampled, rank 1 mirroring" {
++    const w = try World.create(gpa, 4000, 4, 160);
++    defer w.destroy();
++    const p1 = try tokens(300, 1);
++    defer gpa.free(p1);
++    const p2 = try tokens(2600, 2); // two chunks
++    defer gpa.free(p2);
++    const cases = [_]Case{
++        .{ .prompt = p1, .max_new = 60 },
++        .{ .prompt = p2, .max_new = 30, .sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.9 } },
++    };
++    for (cases) |c| {
++        const want = try reference(w.lanes.facts(), &.{c});
++        defer free(want);
++        const got = try drive(w.lanes.backend(), w.lanes.facts(), &.{c});
++        defer free(got);
++        try expectSame(want, got);
++        try std.testing.expect(got[0].len > 0);
++    }
++    try std.testing.expectEqual(@as(usize, 0), w.lanes.lanes.count()); // released: slots free, pages back
++    try std.testing.expect(w.pg.pages.idle());
++    try w.replay();
++    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
++    try std.testing.expectEqualSlices(i32, w.r0.table, w.r1.table);
++    try std.testing.expectEqual(w.r0.runs.items.len, w.r1.runs.items.len);
++}
++
++test "several streams in one round share a forward and still emit what each emits alone" {
++    const w = try World.create(gpa, 3000, 4, 200);
++    defer w.destroy();
++    const p1 = try tokens(200, 3);
++    defer gpa.free(p1);
++    const p2 = try tokens(450, 4);
++    defer gpa.free(p2);
++    const p3 = try tokens(130, 5);
++    defer gpa.free(p3);
++    const cases = [_]Case{ .{ .prompt = p1, .max_new = 50 }, .{ .prompt = p2, .max_new = 40, .sampling = .{ .seed = 3, .temperature = 1.0 } }, .{ .prompt = p3, .max_new = 30 } };
++    const want = try reference(w.lanes.facts(), &cases);
++    defer free(want);
++    const got = try drive(w.lanes.backend(), w.lanes.facts(), &cases);
++    defer free(got);
++    try expectSame(want, got);
++    try std.testing.expect(w.lanes.shared > 0);
++    var shared_runs: usize = 0;
++    for (w.r0.runs.items) |r| shared_runs += @intFromBool(r.kind == .shared);
++    try std.testing.expect(shared_runs > 0);
++    try w.replay();
++    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
++}
++
++test "the radix cache: a later turn resumes from the kept pages, emits what a fresh pass emits, rank 1 swaps the same pages" {
++    const w = try World.create(gpa, 4000, 3, 120);
++    defer w.destroy();
++    w.pg.limit(60, 8);
++    const base = try tokens(2700, 8);
++    defer gpa.free(base);
++    const turn2 = try gpa.alloc(u32, 3000);
++    defer gpa.free(turn2);
++    @memcpy(turn2[0..2700], base);
++    for (turn2[2700..], 0..) |*t, i| t.* = @intCast((i * 11 + 5) % 90);
++    const first = [_]Case{.{ .prompt = base, .max_new = 20, .history_len = 2700 }};
++    const second = [_]Case{.{ .prompt = turn2, .max_new = 20, .history_len = 2700 }};
++    const got1 = try drive(w.lanes.backend(), w.lanes.facts(), &first);
++    defer free(got1);
++    const runs_before = w.r0.runs.items.len;
++    try std.testing.expect(w.pg.cache.live >= 1); // the pass kept a snapshot at its mark
++    var swapped: usize = 0;
++    for (w.tape.steps.items) |s| swapped += @intFromBool(s.h.kind == @backingInt(iface.Kind.keep) and s.h.flags & 1 != 0);
++    try std.testing.expectEqual(@as(usize, 1), swapped); // rank 1 heard the page swap
++    const got2 = try drive(w.lanes.backend(), w.lanes.facts(), &second);
++    defer free(got2);
++    try std.testing.expectEqual(@as(u64, 1), w.lanes.resumed);
++    try std.testing.expectEqual(@as(u32, 1), w.pg.cache.store.tree.counts.hits);
++    try std.testing.expectEqual(@as(u32, 2688), w.r0.runs.items[runs_before].starts[0]); // resumed at the kept mark's rows
++    const fresh = try reference(w.lanes.facts(), &second);
++    defer free(fresh);
++    try expectSame(fresh, got2);
++    try std.testing.expect(w.pg.pages.idle());
++    try w.replay();
++    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv); // the follower's pages hold the same rows under the same ids
++    try std.testing.expectEqualSlices(i32, w.r0.table, w.r1.table);
++}
++
++test "admission: vision, a context past the budget, a pool too small and a table without a free row are refused untouched" {
++    const w = try World.create(gpa, 6000, 1, 20);
++    defer w.destroy();
++    const b = w.lanes.backend();
++    const sent = w.tape.steps.items.len;
++    const long = try tokens(5900, 1);
++    defer gpa.free(long);
++    const short = try tokens(500, 2);
++    defer gpa.free(short);
++    var vision = try lanes.Stream.init(gpa, .{ .id = "v", .prompt = short, .max_new = 10, .images = &.{.{ .pixels = &.{}, .gh = 1, .gw = 1, .at = 0, .tokens = 1 }} });
++    defer vision.deinit(gpa);
++    try std.testing.expectError(error.VisionUnsupported, b.prefill(&vision));
++    var big = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = long, .max_new = 200 });
++    defer big.deinit(gpa);
++    try std.testing.expectError(error.PromptTooLong, b.prefill(&big));
++    const mid = try tokens(3000, 3); // 24 pages against a pool of 20
++    defer gpa.free(mid);
++    var pool_big = try lanes.Stream.init(gpa, .{ .id = "p", .prompt = mid, .max_new = 100 });
++    defer pool_big.deinit(gpa);
++    try std.testing.expectError(error.ContextTooLong, b.prefill(&pool_big));
++    try std.testing.expectEqual(sent, w.tape.steps.items.len); // no rank heard of any of them
++    try std.testing.expect(w.pg.pages.idle());
++    var a = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = short, .max_new = 10 });
++    defer a.deinit(gpa);
++    try b.prefill(&a);
++    var again = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = short, .max_new = 10 });
++    defer again.deinit(gpa);
++    try std.testing.expectError(error.LaneMemory, b.prefill(&again)); // one table row, taken
++    try std.testing.expectEqual(@as(usize, 1), w.lanes.lanes.count());
++    b.release(&a);
++    try std.testing.expect(w.pg.pages.idle());
++}
++
++test "a cancelled prompt pass frees its pages and its slot on both ranks" {
++    const w = try World.create(gpa, 6000, 2, 120);
++    defer w.destroy();
++    const ids = try tokens(5000, 7);
++    defer gpa.free(ids);
++    const Flag = struct {
++        n: usize = 0,
++        fn check(p: *anyopaque) bool {
++            const f: *@This() = @ptrCast(@alignCast(p));
++            f.n += 1;
++            return f.n > 3; // true from the third chunk's gate on
++        }
++    };
++    var flag: Flag = .{};
++    var s = try lanes.Stream.init(gpa, .{ .id = "x", .prompt = ids, .max_new = 10, .cancel_check = .{ .ptr = &flag, .check = Flag.check } });
++    defer s.deinit(gpa);
++    const b = w.lanes.backend();
++    try std.testing.expectError(error.Cancelled, b.prefill(&s));
++    b.release(&s);
++    try std.testing.expectEqual(@as(usize, 0), w.lanes.lanes.count());
++    try std.testing.expect(w.pg.pages.idle());
++    try w.replay();
++    try std.testing.expectEqual(@as(usize, 0), w.hooks1.failures);
++    for (w.r1.table) |e| try std.testing.expectEqual(@as(i32, -1), e); // the follower's row went back to -1
++}
++
++test "lane facts: exact windows over several streams, copy drafts only, no head" {
++    const w = try World.create(gpa, 1000, 1, 10);
++    defer w.destroy();
++    const f = w.lanes.facts();
++    try std.testing.expectEqual(iface.window_rows, f.exact_width);
++    try std.testing.expectEqual(iface.shared_rows, f.batch_rows);
++    try std.testing.expectEqual(iface.max_shared, f.max_streams);
++    try std.testing.expect(f.hidden_rows and f.streams_exact and f.context_copies and !f.mtp and !f.speculate);
++    var cfg = try lanes.Config.init(gpa, f, iface.window_rows, 15);
++    defer cfg.deinit(gpa);
++    try std.testing.expect(cfg.family_streams and !cfg.family_mtp);
++    try std.testing.expectEqual(iface.window_rows - 1, cfg.max_copy);
++}
++
++test "the rest of the contract: no pipelining, no head, no trees, handles expire" {
++    const w = try World.create(gpa, 1000, 1, 10);
++    defer w.destroy();
++    const b = w.lanes.backend();
++    var s: lanes.Stream = undefined;
++    try std.testing.expectError(error.NotPipelined, b.queue(&s, .{ .value = 1 }, 5));
++    try std.testing.expectError(error.NoDraftHead, b.draft(&.{}));
++    try std.testing.expectError(error.NoSuchToken, b.read(3));
++    try std.testing.expectEqual(@as(u32, 128), pool.page_tokens);
++}
+diff --git a/zig/src/families/minimax_m3/cuda.zig b/zig/src/families/minimax_m3/cuda.zig
+index 92a9438..3018fcd 100644
+--- a/zig/src/families/minimax_m3/cuda.zig
++++ b/zig/src/families/minimax_m3/cuda.zig
+@@ -4,6 +4,12 @@ pub const iface = @import("iface.zig");
+ pub const weights = @import("weights.zig");
+ pub const weights_device = @import("weights_device.zig");
+ pub const pages = @import("pages.zig");
++pub const engine = @import("engine.zig");
++pub const engine_ops = @import("engine_ops.zig");
++pub const engine_dev = @import("engine_dev.zig");
++pub const follow = @import("follow.zig");
++pub const backend = @import("backend.zig");
++pub const draw = @import("draw.zig");
+ 
+ test {
+     _ = native;
+@@ -11,6 +17,12 @@ test {
+     _ = weights;
+     _ = weights_device;
+     _ = pages;
++    _ = engine;
++    _ = engine_ops;
++    _ = engine_dev;
++    _ = follow;
++    _ = backend;
++    _ = draw;
+     _ = @import("load.zig");
+     _ = @import("ffn.zig");
+     _ = @import("tp.zig");
+diff --git a/zig/src/families/minimax_m3/draw.zig b/zig/src/families/minimax_m3/draw.zig
+new file mode 100644
+index 0000000..2bca8ee
+--- /dev/null
++++ b/zig/src/families/minimax_m3/draw.zig
+@@ -0,0 +1,267 @@
++//! Token draws from the forward's gathered fp32 logits on rank 0's host, by the lane core's keyed rule; others do none.
++const std = @import("std");
++const ops = @import("engine_ops.zig");
++const shard = @import("shard.zig");
++const iface = @import("iface.zig");
++const gpu_rule = @import("lanes").gpu_rule;
++
++const Cand = gpu_rule.Cand;
++
++/// How the device's gathered rows reach the host: `out.len` bytes at device address `addr`, after the stream drained.
++pub const Fetch = struct {
++    ptr: *anyopaque,
++    call: *const fn (ptr: *anyopaque, addr: u64, out: []u8) anyerror!void,
++};
++
++/// Reusable memory of a draw: a whole row and the candidates' heap.
++pub const Scratch = struct {
++    row: []f32,
++    heap: []Cand,
++
++    pub fn init(gpa: std.mem.Allocator, vocab: usize) !Scratch {
++        const row = try gpa.alloc(f32, vocab);
++        errdefer gpa.free(row);
++        return .{ .row = row, .heap = try gpa.alloc(Cand, gpu_rule.candidates) };
++    }
++
++    pub fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
++        gpa.free(s.row);
++        gpa.free(s.heap);
++    }
++};
++
++/// A logit the draw cannot take: NaN or +inf (-inf is a masked token).
++fn bad(v: f32) bool {
++    return std.math.isNan(v) or v == std.math.inf(f32);
++}
++
++/// gpu_rule.sample's draw without sorting the whole vocabulary: the candidates come from a bounded heap.
++pub fn sample(s: *Scratch, logits: []const f32, rule: ?ops.Sampling, position: u32) !u32 {
++    for (logits) |v| if (bad(v)) return error.NonFiniteLogits;
++    const st = rule orelse {
++        const at = gpu_rule.argmax(logits);
++        return if (logits[at] == -std.math.inf(f32)) error.NoAllowedToken else at;
++    };
++    const r = gpu_rule.rule(st);
++    const cap: usize = if (r.top_k == 0 or r.top_k > gpu_rule.candidates) gpu_rule.candidates else r.top_k;
++    const n: usize = @min(@min(logits.len, gpu_rule.candidates), cap);
++    var m = -std.math.inf(f32);
++    for (logits) |l| m = @max(m, l * r.inv_t);
++    if (m == -std.math.inf(f32)) return error.NoAllowedToken;
++    var lanes: [1024]f32 = @splat(0.0);
++    var heap_n: usize = 0;
++    for (logits, 0..) |l, i| {
++        const c: Cand = .{ .v = l * r.inv_t, .i = @intCast(i) };
++        lanes[i % 1024] += @exp(c.v - m);
++        heapPush(s.heap[0..n], &heap_n, c);
++    }
++    const all = s.heap[0..heap_n];
++    std.mem.sort(Cand, all, {}, gpu_rule.better);
++    var norm = gpu_rule.lanesSum(&lanes);
++    if (r.top_k != 0) {
++        norm = 0.0;
++        for (all) |c| norm += @exp(c.v - m);
++    }
++    var keep: usize = all.len;
++    if (r.top_p > 0.0 and r.top_p < 1.0) {
++        var cum: f32 = 0.0;
++        for (all, 0..) |c, j| {
++            cum += @exp(c.v - m) / norm;
++            if (cum >= r.top_p) {
++                keep = j + 1;
++                break;
++            }
++        }
++    }
++    if (r.min_log > -std.math.inf(f32)) {
++        const floor = m + r.min_log;
++        var j: usize = 0;
++        while (j < keep and all[j].v >= floor) j += 1;
++        keep = j;
++    }
++    var best: usize = 0;
++    var best_score = -std.math.inf(f32);
++    for (all[0..keep], 0..) |c, t| {
++        const score = c.v - @log(-@log(gpu_rule.uniform24(st.seed, position, c.i)));
++        if (t == 0 or score > best_score) {
++            best = t;
++            best_score = score;
++        }
++    }
++    return all[best].i;
++}
++
++/// A min-heap on the kernel's candidate order (the worst candidate at the root) holding the best `heap.len`.
++fn heapPush(heap: []Cand, n: *usize, c: Cand) void {
++    if (n.* < heap.len) {
++        var i = n.*;
++        n.* += 1;
++        heap[i] = c;
++        while (i > 0) { // sift up while the child is worse than its parent
++            const p = (i - 1) / 2;
++            if (!gpu_rule.better({}, heap[p], heap[i])) break;
++            std.mem.swap(Cand, &heap[p], &heap[i]);
++            i = p;
++        }
++        return;
++    }
++    if (!gpu_rule.better({}, c, heap[0])) return;
++    heap[0] = c;
++    var i: usize = 0;
++    while (true) {
++        const l = 2 * i + 1;
++        const r = l + 1;
++        var w = i;
++        if (l < heap.len and gpu_rule.better({}, heap[w], heap[l])) w = l;
++        if (r < heap.len and gpu_rule.better({}, heap[w], heap[r])) w = r;
++        if (w == i) return;
++        std.mem.swap(Cand, &heap[w], &heap[i]);
++        i = w;
++    }
++}
++
++/// A row of grammar words (bit t % 32 of word t / 32: token t allowed) applied to a whole row; the rest become -inf.
++pub fn mask(row: []f32, words: []const u32) void {
++    for (row, 0..) |*v, t| {
++        if (words[t / 32] >> @intCast(t % 32) & 1 == 0) v.* = -std.math.inf(f32);
++    }
++}
++
++/// Rank 0's draw over the gathered logits `[rank][row][slot]` of the last pass; another rank's draw returns at once.
++pub const HostDrawer = struct {
++    gpa: std.mem.Allocator,
++    rank: usize,
++    spans: []shard.Span, // every rank's vocabulary span
++    slot: usize, // logits a rank's slot holds per row (the largest share)
++    vocab: usize,
++    fetch: Fetch,
++    scratch: Scratch,
++    gathered: []f32, // world * total * slot, for the largest pass
++
++    pub fn init(gpa: std.mem.Allocator, rank: usize, spans: []const shard.Span, vocab: usize, fetch: Fetch) !*HostDrawer {
++        const d = try gpa.create(HostDrawer);
++        errdefer gpa.destroy(d);
++        const own = try gpa.dupe(shard.Span, spans);
++        errdefer gpa.free(own);
++        var slot: usize = 0;
++        for (spans) |sp| slot = @max(slot, sp.len());
++        var scratch = try Scratch.init(gpa, vocab);
++        errdefer scratch.deinit(gpa);
++        const gathered: []f32 = if (rank == 0) try gpa.alloc(f32, spans.len * iface.shared_rows * slot) else &.{};
++        d.* = .{ .gpa = gpa, .rank = rank, .spans = own, .slot = slot, .vocab = vocab, .fetch = fetch, .scratch = scratch, .gathered = gathered };
++        return d;
++    }
++
++    pub fn deinit(d: *HostDrawer) void {
++        if (d.rank == 0) d.gpa.free(d.gathered);
++        d.scratch.deinit(d.gpa);
++        d.gpa.free(d.spans);
++        d.gpa.destroy(d);
++    }
++
++    pub fn drawer(d: *HostDrawer) ops.Drawer {
++        return .{ .ptr = d, .draw_fn = drawFn };
++    }
++
++    fn drawFn(ptr: *anyopaque, req: ops.Draw) anyerror!void {
++        const d: *HostDrawer = @ptrCast(@alignCast(ptr));
++        if (d.rank != 0 or req.rows == 0) return;
++        const world = d.spans.len;
++        if (req.total > iface.shared_rows or req.row0 + req.rows > req.total or req.out.len < req.rows or req.first == 0) return error.WindowTooWide;
++        const g = d.gathered[0 .. world * req.total * d.slot];
++        try d.fetch.call(d.fetch.ptr, req.base, std.mem.sliceAsBytes(g));
++        const words = (d.vocab + 31) / 32;
++        for (0..req.rows) |k| {
++            for (d.spans, 0..) |sp, q| @memcpy(d.scratch.row[sp.lo..sp.hi], g[(q * req.total + req.row0 + k) * d.slot ..][0..sp.len()]);
++            if (req.bits != 0) {
++                const all: [*]const u32 = @ptrFromInt(req.bits);
++                mask(d.scratch.row, all[k * words ..][0..words]);
++            }
++            req.out[k] = try sample(&d.scratch, d.scratch.row, req.rule, @intCast(req.first + k));
++        }
++    }
++};
++
++fn randomRow(r: std.Random, row: []f32, levels: u32) void {
++    const noise: f32 = if (levels > 1000) 1.0 else 0.0;
++    for (row) |*v| v.* = @as(f32, @floatFromInt(r.uintLessThan(u32, levels))) * 0.25 - 4.0 + r.float(f32) * noise;
++}
++
++test "the bounded-heap draw is the lane core's draw, with ties, every rule and masked tokens" {
++    const gpa = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(42);
++    const r = prng.random();
++    const vocab = 4099;
++    var s = try Scratch.init(gpa, vocab);
++    defer s.deinit(gpa);
++    const row = try gpa.alloc(f32, vocab);
++    defer gpa.free(row);
++    const rules = [_]?ops.Sampling{
++        null,
++        .{ .seed = 1, .temperature = 0.8, .top_k = 20, .top_p = 0.95 },
++        .{ .seed = 2, .temperature = 1.0, .top_k = 0, .top_p = 1.0 },
++        .{ .seed = 3, .temperature = 0.3, .top_k = 1, .top_p = 0.5, .min_p = 0.05 },
++        .{ .seed = 4, .temperature = 1.5, .top_k = 5000, .top_p = 0.9, .min_p = 0.01 },
++    };
++    for (0..30) |case| {
++        randomRow(r, row, if (case % 2 == 0) 40 else 100_000); // many exact ties, then few
++        if (case % 3 == 0) for (row, 0..) |*v, t| {
++            if (t % 5 != 0) v.* = -std.math.inf(f32); // a grammar left every fifth token
++        };
++        for (rules) |rule| {
++            const pos: u32 = @intCast(100 + case);
++            const want = try gpu_rule.sample(gpa, row, rule, pos, null);
++            try std.testing.expectEqual(want, try sample(&s, row, rule, pos));
++        }
++    }
++}
++
++test "a non-finite logit is refused and a grammar keeps only its tokens" {
++    const gpa = std.testing.allocator;
++    var s = try Scratch.init(gpa, 64);
++    defer s.deinit(gpa);
++    const row = try gpa.alloc(f32, 64);
++    defer gpa.free(row);
++    @memset(row, 0);
++    row[7] = 5;
++    try std.testing.expectEqual(@as(u32, 7), try sample(&s, row, null, 1));
++    var words = [_]u32{ 1 << 3 | 1 << 8, 1 << 5 }; // tokens 3, 8 and 37 allowed
++    mask(row, &words);
++    try std.testing.expectEqual(@as(u32, 3), try sample(&s, row, null, 1)); // 7 is masked; ties go to the lowest id
++    var none = [_]u32{ 0, 0 };
++    mask(row, &none);
++    try std.testing.expectError(error.NoAllowedToken, sample(&s, row, null, 1));
++    try std.testing.expectError(error.NoAllowedToken, sample(&s, row, .{ .seed = 1, .temperature = 1 }, 1));
++    row[0] = std.math.nan(f32);
++    try std.testing.expectError(error.NonFiniteLogits, sample(&s, row, null, 1));
++}
++
++test "rank 0 draws from the gathered slots of every rank, the other rank draws nothing" {
++    const gpa = std.testing.allocator;
++    const spans = [_]shard.Span{ .{ .lo = 0, .hi = 6 }, .{ .lo = 6, .hi = 10 } }; // slot 6: the second rank pads two
++    const Dev = struct {
++        data: [2 * 3 * 6]f32 = @splat(0), // [rank][row][slot] for three rows
++        fn fetch(p: *anyopaque, addr: u64, out: []u8) anyerror!void {
++            const self: *@This() = @ptrCast(@alignCast(p));
++            try std.testing.expectEqual(@as(u64, 0xabc), addr);
++            @memcpy(out, std.mem.sliceAsBytes(self.data[0 .. out.len / 4]));
++        }
++    };
++    var dev: Dev = .{};
++    dev.data[(0 * 3 + 1) * 6 + 2] = 9; // rank 0, row 1: token 2 wins
++    dev.data[(1 * 3 + 2) * 6 + 3] = 9; // rank 1, row 2: token 6 + 3 = 9 wins
++    const f: Fetch = .{ .ptr = &dev, .call = Dev.fetch };
++    const d0 = try HostDrawer.init(gpa, 0, &spans, 10, f);
++    defer d0.deinit();
++    var out: [2]u32 = undefined;
++    try d0.drawer().draw(.{ .base = 0xabc, .total = 3, .row0 = 1, .rows = 2, .first = 50, .rule = null, .bits = 0, .out = &out });
++    try std.testing.expectEqualSlices(u32, &.{ 2, 9 }, &out);
++    const d1 = try HostDrawer.init(gpa, 1, &spans, 10, f);
++    defer d1.deinit();
++    out = .{ 77, 77 };
++    try d1.drawer().draw(.{ .base = 0xabc, .total = 3, .row0 = 1, .rows = 2, .first = 50, .rule = null, .bits = 0, .out = &out });
++    try std.testing.expectEqualSlices(u32, &.{ 77, 77 }, &out);
++    var words = [_]u32{ 1 << 9, 1 << 9 }; // only token 9 allowed in either row
++    try d0.drawer().draw(.{ .base = 0xabc, .total = 3, .row0 = 0, .rows = 2, .first = 50, .rule = null, .bits = @intFromPtr(&words), .out = &out });
++    try std.testing.expectEqualSlices(u32, &.{ 9, 9 }, &out);
++}
+diff --git a/zig/src/families/minimax_m3/engine.zig b/zig/src/families/minimax_m3/engine.zig
+new file mode 100644
+index 0000000..ad8191e
+--- /dev/null
++++ b/zig/src/families/minimax_m3/engine.zig
+@@ -0,0 +1,317 @@
++//! One TP rank's MiniMax-M3.1-Flash engine: slots over the pooled KV pages, chunked prompts, windows and draws.
++const std = @import("std");
++const cuda = @import("cuda");
++const iface = @import("iface.zig");
++const pool = @import("pool.zig");
++const ops_ = @import("engine_ops.zig");
++
++pub const Sampling = iface.Sampling;
++pub const Part = iface.Part;
++pub const Resume = iface.Resume;
++pub const Marks = iface.Marks;
++pub const Cancel = iface.Cancel;
++pub const prefill_rows = iface.prefill_rows;
++pub const window_rows = iface.window_rows;
++pub const shared_rows = iface.shared_rows;
++pub const max_shared = iface.max_shared;
++
++/// The request's rule as the engine runs it: null (or temperature 0) decodes greedily.
++pub fn check(s: ?Sampling) ?Sampling {
++    const x = s orelse return null;
++    return if (x.temperature > 0) x else null;
++}
++
++/// A stream's sequence on the engine: how it draws, the committed rows, and the rows its last window left uncommitted.
++pub const Seq = struct { sampling: ?Sampling = null, pos: usize = 0, pending: usize = 0 };
++
++/// Everything an engine runs on; engine_dev.zig fills it from the device, the host tests from fakes.
++pub const Parts = struct {
++    ops: ops_.Ops,
++    device: ops_.Device,
++    comm: ops_.Comm,
++    drawer: ops_.Drawer,
++    capacity: usize,
++    page_bytes: u64,
++    checkpoint_digest: [32]u8 = @splat(0),
++    stream: ?cuda.Stream = null, // the engine's stream (the host opens the RoCE gather on it)
++    group: ?*cuda.tp_group.Group = null, // the group the forward holds: the host's RoCE small gather goes into it
++    close: ?Closer = null,
++};
++
++/// Frees what an engine's parts own (device buffers, the communicator, the forward's buffers) at `deinit`.
++pub const Closer = struct { ptr: *anyopaque, call: *const fn (ptr: *anyopaque) void };
++
++/// Where a prompt pass's chunk starting at `start` of a `len`-id prompt ends: a chunk's rows, or the next mark.
++pub fn chunkEnd(start: usize, len: usize, marks: ?Marks) usize {
++    var end = @min(len, start + prefill_rows);
++    if (marks) |m| for (m.at) |at| {
++        if (at > start and at < end) {
++            end = at;
++            break;
++        }
++    };
++    return end;
++}
++
++pub const Engine = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    p: Parts,
++    rank: usize,
++    world: usize,
++    capacity: usize,
++    max_pages: usize,
++    seqs: std.ArrayList(Seq) = .empty,
++    slot: u32 = 0,
++    view: ?ops_.PoolView = null,
++    last_rows: [3]usize = @splat(0), // rows of the last pass of each kind: the gathered logits' rank stride
++    checkpoint_digest: [32]u8,
++
++    /// The engine over `parts` with the one sequence a block table starts with (slot 0); `attach` makes the pool.
++    pub fn make(gpa: std.mem.Allocator, io: std.Io, parts: Parts) !*Engine {
++        const e = try gpa.create(Engine);
++        errdefer gpa.destroy(e);
++        e.* = .{ .gpa = gpa, .io = io, .p = parts, .rank = parts.comm.rank, .world = parts.comm.world, .capacity = parts.capacity, .max_pages = iface.maxPages(parts.capacity), .checkpoint_digest = parts.checkpoint_digest };
++        try e.seqs.append(gpa, .{});
++        return e;
++    }
++
++    /// The host opened the RoCE small gather on its group: the forward and the failure check use it from now on.
++    pub fn setGroup(e: *Engine, g: *const cuda.tp_group.Group) void {
++        if (e.p.group) |own| own.fast = g.fast;
++    }
++
++    /// Rank 0's `Tables.upload`: its block-table pushes reach the device on the engine's stream.
++    pub fn uploadHook(e: *Engine) pool.Upload {
++        return .{ .ctx = e, .call = uploadFn };
++    }
++
++    fn uploadFn(ctx: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void {
++        const e: *Engine = @ptrCast(@alignCast(ctx));
++        return e.upload(slot, from, entries);
++    }
++
++    /// The production constructor (iface.conformsEngine's `init`): weights, agreed fingerprint, forward, device.
++    pub const init = @import("engine_dev.zig").init;
++
++    pub fn deinit(e: *Engine) void {
++        e.p.ops.sync() catch {};
++        if (e.p.close) |c| c.call(c.ptr);
++        e.seqs.deinit(e.gpa);
++        e.gpa.destroy(e);
++    }
++
++    /// The pool of `slots` streams and `pages` pages, made now on this rank (rank 0 tells the others first).
++    pub fn attach(e: *Engine, slots: u32, pages: usize) !void {
++        const view = try e.p.device.vtable.attach(e.p.device.ptr, slots, pages, e.max_pages, e.p.page_bytes);
++        try e.p.ops.attach(view);
++        e.view = view;
++        while (e.seqs.items.len < slots) try e.seqs.append(e.gpa, .{});
++    }
++
++    /// `entries` of `slot`'s table row from entry `from` to the device (also rank 0's `Tables.upload`).
++    pub fn upload(e: *Engine, slot: u32, from: usize, entries: []const i32) !void {
++        return e.p.device.vtable.upload(e.p.device.ptr, slot, from, entries);
++    }
++
++    /// Page ids `ids` at entry `from` of `slot`'s table row, as rank 0 decided them.
++    pub fn setPages(e: *Engine, slot: u32, from: usize, ids: []const u32) !void {
++        if (from + ids.len > e.max_pages) return error.TableFull;
++        var buf: [256]i32 = undefined;
++        var at: usize = 0;
++        while (at < ids.len) {
++            const n = @min(buf.len, ids.len - at);
++            for (buf[0..n], ids[at..][0..n]) |*d, id| d.* = @intCast(id);
++            try e.upload(slot, from + at, buf[0..n]);
++            at += n;
++        }
++    }
++
++    /// Slot `slot`'s table row back to -1.
++    pub fn clearRow(e: *Engine, slot: u32) !void {
++        const row = try e.gpa.alloc(i32, e.max_pages);
++        defer e.gpa.free(row);
++        @memset(row, -1);
++        try e.upload(slot, 0, row);
++    }
++
++    /// Binds slot `slot` for the steps that follow.
++    pub fn bind(e: *Engine, slot: u32) !void {
++        if (slot >= e.seqs.items.len) return error.BadSlot;
++        e.slot = slot;
++    }
++
++    /// Frees slot `slot`'s sequence (its pages are rank 0's to return) and clears its table row.
++    pub fn release(e: *Engine, slot: u32) void {
++        if (slot >= e.seqs.items.len) return;
++        e.seqs.items[slot] = .{};
++        if (e.view != null) e.clearRow(slot) catch |err| std.log.err("clearing slot {d}'s block table: {s}", .{ slot, @errorName(err) });
++    }
++
++    /// Bytes a stream holds beyond its pages: its block-table row.
++    pub fn seqBytes(e: *const Engine) u64 {
++        return pool.Dims.tableBytes(e.max_pages);
++    }
++
++    fn cur(e: *Engine) *Seq {
++        return &e.seqs.items[e.slot];
++    }
++
++    /// The committed length of the bound sequence: the pending token sits here, row r of a window draws pos + 1 + r.
++    pub fn pos(e: *const Engine) usize {
++        return e.seqs.items[e.slot].pos;
++    }
++
++    /// A follower's begin (no image rows exist here to clear).
++    pub fn beginFollowing(e: *Engine, sampling: ?Sampling) !void {
++        return e.begin(sampling);
++    }
++
++    /// A fresh sequence on the bound slot with `sampling` (null or temperature 0: greedy).
++    pub fn begin(e: *Engine, sampling: ?Sampling) !void {
++        e.cur().* = .{ .sampling = check(sampling) };
++    }
++
++    /// The whole prompt in chunks (a mark cuts one), then the first token; `from` resumes adopted pages.
++    pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
++        var start = try e.prefillStart(ids.len, from);
++        while (true) {
++            const end = chunkEnd(start, ids.len, marks);
++            if (try e.prefillChunk(ids[start..end], start, ids.len, if (start == (if (from) |r| r.at else 0)) from else null, cancel, marks)) |first| return first;
++            start = end;
++        }
++    }
++
++    /// Where a prompt pass of `len` ids starts: 0, or the rows already in the adopted pages.
++    fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
++        if (len == 0 or len + window_rows >= e.capacity) return error.PromptTooLong;
++        const r = from orelse return 0;
++        if (r.at == 0 or r.at >= len or r.at % pool.page_tokens != 0) return error.BadResume;
++        return r.at;
++    }
++
++    /// One chunk `part` = ids[start..] of a `len`-id prompt; the first token once it ends the prompt, else null.
++    pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
++        const begun = try e.prefillStart(len, from);
++        if (from != null) {
++            if (begun != start) return error.BadChunk;
++            e.cur().pos = start; // the rows before it are in the adopted pages
++        }
++        const rows = part.len;
++        const s = e.cur();
++        if (start >= len or start % pool.page_tokens != 0 or rows == 0 or rows > prefill_rows or start + rows > len) return error.BadChunk;
++        if (start + rows < len and rows % pool.page_tokens != 0) return error.BadChunk; // the next chunk starts on a page
++        if (s.pos != start) return error.BadChunk;
++        if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
++        try e.gate(cancel);
++        const segs = [1]iface.Seg{.{ .slot = e.slot, .row0 = 0, .rows = @intCast(rows) }};
++        try e.p.ops.run(.{ .kind = .prompt, .ids = part, .segs = &segs, .starts = &.{@intCast(start)}, .head = start + rows == len });
++        s.pos = start + rows;
++        if (start + rows < len) return null;
++        var t: [1]u32 = undefined;
++        e.last_rows[@backingInt(ops_.Rows.prompt)] = 1; // only the last row of the chunk goes through the head
++        try e.drawPass(.prompt, 0, 1, len, 0, &t);
++        return t[0];
++    }
++
++    /// The chunk gate on every rank: rank 0's cancel decides for all, so no rank enters a forward the others skip.
++    pub fn gate(e: *Engine, cancel: ?Cancel) !void {
++        const mine: f64 = if (cancel) |c| @floatFromInt(@intFromBool(c.check(c.ptr))) else 0;
++        if (try e.p.comm.maxF64(mine) > 0) return error.Cancelled;
++    }
++
++    /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
++    pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
++        if (ids.len == 0 or ids.len > window_rows or out.len < ids.len) return error.WindowTooWide;
++        const s = e.cur();
++        if (s.pos + ids.len >= e.capacity) return error.ContextFull;
++        const segs = [1]iface.Seg{.{ .slot = e.slot, .row0 = 0, .rows = @intCast(ids.len) }};
++        try e.p.ops.run(.{ .kind = .window, .ids = ids, .segs = &segs, .starts = &.{@intCast(s.pos)} });
++        s.pending = ids.len;
++        e.last_rows[@backingInt(ops_.Rows.window)] = ids.len;
++        try e.drawPass(.window, 0, ids.len, s.pos + 1, bits, out);
++    }
++
++    /// Several streams' windows in one forward: row ops are shared, attention reads each stream's own pages.
++    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
++        if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
++        var segs: [max_shared]iface.Seg = undefined;
++        var starts: [max_shared]u32 = undefined;
++        var ids: [shared_rows]u32 = undefined;
++        var rows: usize = 0;
++        for (parts, 0..) |p, i| {
++            if (p.ids.len == 0 or p.ids.len > window_rows or rows + p.ids.len > shared_rows or p.out.len < p.ids.len) return error.WindowTooWide;
++            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
++            if (p.slot >= e.seqs.items.len) return error.BadSlot;
++            const s = e.seqs.items[p.slot];
++            if (s.pos + p.ids.len >= e.capacity) return error.ContextFull;
++            segs[i] = .{ .slot = p.slot, .row0 = @intCast(rows), .rows = @intCast(p.ids.len) };
++            starts[i] = @intCast(s.pos);
++            @memcpy(ids[rows..][0..p.ids.len], p.ids);
++            rows += p.ids.len;
++        }
++        try e.p.ops.run(.{ .kind = .shared, .ids = ids[0..rows], .segs = segs[0..parts.len], .starts = starts[0..parts.len] });
++        e.last_rows[@backingInt(ops_.Rows.shared)] = rows;
++        for (parts, segs[0..parts.len]) |p, g| {
++            try e.bind(p.slot);
++            e.cur().pending = p.ids.len;
++            try e.drawPass(.shared, g.row0, g.rows, e.cur().pos + 1, p.bits, p.out);
++        }
++    }
++
++    /// Commits the first `n` rows of the last window (the rest were rejected drafts; their KV rows are overwritten).
++    pub fn keep(e: *Engine, n: usize) !void {
++        const s = e.cur();
++        if (n > s.pending) return error.BadKeep;
++        s.pos += n;
++        s.pending = 0;
++    }
++
++    /// Rows [row0, row0 + rows) of the last pass of `kind` drawn at positions first, first + 1, ... (rank 0 draws).
++    fn drawPass(e: *Engine, kind: ops_.Rows, row0: usize, rows: usize, first: u64, bits: u64, out: []u32) !void {
++        if (rows == 0) return;
++        const base = e.p.ops.logits(kind);
++        try e.p.drawer.draw(.{ .base = base, .total = e.last_rows[@backingInt(kind)], .row0 = row0, .rows = rows, .first = first, .rule = e.cur().sampling, .bits = bits, .out = out });
++        return e.checkGathers(); // the draw read rows the forward's gathers made
++    }
++
++    /// The contract's draw: `rows` gathered rows at `logits` (a whole pass) drawn at positions first, first + 1, ...
++    pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, bits: u64, out: []u32) !void {
++        if (rows == 0) return;
++        try e.p.drawer.draw(.{ .base = logits, .total = rows, .row0 = 0, .rows = rows, .first = first, .rule = e.cur().sampling, .bits = bits, .out = out });
++        return e.checkGathers();
++    }
++
++    /// A failed RoCE gather's error, after a synchronize whose result read gathered rows.
++    pub fn checkGathers(e: *const Engine) !void {
++        return e.p.comm.check();
++    }
++
++    pub fn sync(e: *Engine) !void {
++        return e.p.ops.sync();
++    }
++};
++
++comptime {
++    iface.conformsEngine(Engine);
++}
++
++test "a chunk ends at the pass's chunk rows, at a mark, or at the prompt's end" {
++    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 5000, null));
++    try std.testing.expectEqual(@as(usize, 100), chunkEnd(0, 100, null));
++    const Hook = struct {
++        fn call(_: *anyopaque, _: u32) void {}
++    };
++    var x: u8 = 0;
++    const m: Marks = .{ .at = &.{ 512, 1024, 4096 }, .ctx = &x, .call = Hook.call };
++    try std.testing.expectEqual(@as(usize, 512), chunkEnd(0, 5000, m));
++    try std.testing.expectEqual(@as(usize, 1024), chunkEnd(512, 5000, m));
++    try std.testing.expectEqual(@as(usize, 3072), chunkEnd(1024, 5000, m));
++    try std.testing.expectEqual(@as(usize, 4096), chunkEnd(3072, 5000, m));
++    try std.testing.expectEqual(@as(usize, 5000), chunkEnd(4096, 5000, m));
++}
++
++test "temperature 0 is greedy" {
++    try std.testing.expectEqual(@as(?Sampling, null), check(.{ .seed = 1, .temperature = 0 }));
++    try std.testing.expect(check(.{ .seed = 1, .temperature = 0.5 }) != null);
++}
+diff --git a/zig/src/families/minimax_m3/engine_dev.zig b/zig/src/families/minimax_m3/engine_dev.zig
+new file mode 100644
+index 0000000..ba74ab8
+--- /dev/null
++++ b/zig/src/families/minimax_m3/engine_dev.zig
+@@ -0,0 +1,388 @@
++//! The engine on the device: NCCL collectives, page arena, block table, control wire, `Engine.init` (never run).
++const std = @import("std");
++const cuda = @import("cuda");
++const iface = @import("iface.zig");
++const ops = @import("engine_ops.zig");
++const engine = @import("engine.zig");
++const follow = @import("follow.zig");
++const draw = @import("draw.zig");
++const ranks = @import("ranks.zig");
++const config = @import("config.zig");
++const shard = @import("shard.zig");
++const pool = @import("pool.zig");
++const load = @import("load.zig");
++const weights_device = @import("weights_device.zig");
++
++/// GLM's NCCL defaults, set when the environment leaves them unset: connect at init, no cuMem host buffers.
++pub const nccl_defaults = [_][2][:0]const u8{
++    .{ "NCCL_RUNTIME_CONNECT", "0" }, // every connection is registered at init, while memory is free
++    .{ "NCCL_CUMEM_HOST_ENABLE", "0" }, // cuMem host buffers wore out GB10's driver pool under load
++    .{ "NCCL_CUMEM_ENABLE", "0" },
++};
++
++/// Sets each default that `get` finds unset (setenv with overwrite 0, as GLM does).
++pub fn applyNcclDefaults(get: *const fn ([*:0]const u8) ?[*:0]const u8, set: *const fn ([*:0]const u8, [*:0]const u8) void) void {
++    for (nccl_defaults) |kv| if (get(kv[0].ptr) == null) set(kv[0].ptr, kv[1].ptr);
++}
++
++extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++
++fn getenvC(name: [*:0]const u8) ?[*:0]const u8 {
++    return std.c.getenv(name);
++}
++
++fn setenvC(name: [*:0]const u8, value: [*:0]const u8) void {
++    _ = setenv(name, value, 0);
++}
++
++pub fn setNcclDefaults() void {
++    applyNcclDefaults(getenvC, setenvC);
++}
++
++/// Every peer's send/recv connected now, before the weights fill memory (connected on first use, ibv_reg_mr can fail).
++pub fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group) !void {
++    const bytes = 4 << 20; // a prompt piece's exchange: every channel a large send/recv takes
++    var buf = try cuda.DeviceBuffer.alloc(d, 2 * bytes * g.world);
++    defer buf.free();
++    var s = try cuda.Stream.init(d, false);
++    defer s.deinit();
++    try g.lib.check(g.lib.api.ncclGroupStart(), "ncclGroupStart");
++    const posted: anyerror!void = post: {
++        for (0..g.world) |peer| if (peer != g.rank) {
++            g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
++            g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
++        };
++        break :post {};
++    };
++    try g.lib.check(g.lib.api.ncclGroupEnd(), "ncclGroupEnd"); // the group closes on every path
++    try posted;
++    try s.synchronize();
++}
++
++/// The collectives over NCCL on the engine's stream.
++pub const NcclComm = struct {
++    d: *const cuda.Driver,
++    lib: *const cuda.nccl.Library,
++    comm: cuda.nccl.Comm,
++    stream: cuda.Stream,
++    rank: usize,
++    world: usize,
++    one: cuda.DeviceBuffer, // one f64 every rank all-reduces to its maximum
++    group: *const cuda.tp_group.Group,
++
++    pub fn interface(c: *NcclComm) ops.Comm {
++        return .{ .ptr = c, .vtable = &.{ .max_f64 = maxF64, .gather_bytes = gatherBytes, .check = checkFn }, .rank = c.rank, .world = c.world };
++    }
++
++    fn of(ptr: *anyopaque) *NcclComm {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn maxF64(ptr: *anyopaque, v: f64) anyerror!f64 {
++        const c = of(ptr);
++        if (c.world == 1) return v;
++        var x = v;
++        try c.one.uploadAsync(0, std.mem.asBytes(&x), c.stream.handle);
++        try c.lib.check(c.lib.api.ncclAllReduce(c.one.ptr, c.one.ptr, 1, .f64, .max, c.comm, c.stream.handle), "ncclAllReduce");
++        try c.stream.synchronize();
++        try c.one.download(0, std.mem.asBytes(&x));
++        return x;
++    }
++
++    /// Every rank's `mine` in rank order, over one ncclAllGather of bytes (glm/cuda_ranks.zig's `gather`).
++    fn gatherBytes(ptr: *anyopaque, mine: []const u8, out: []u8) anyerror!void {
++        const c = of(ptr);
++        if (out.len != mine.len * c.world) return error.BadGather;
++        if (c.world == 1) return @memcpy(out, mine);
++        var dev = try cuda.DeviceBuffer.alloc(c.d, out.len);
++        defer dev.free();
++        try dev.uploadAsync(c.rank * mine.len, mine, c.stream.handle);
++        try c.lib.check(c.lib.api.ncclAllGather(dev.ptr + c.rank * mine.len, dev.ptr, mine.len, .u8, c.comm, c.stream.handle), "ncclAllGather");
++        try c.stream.synchronize();
++        try dev.download(0, out);
++    }
++
++    fn checkFn(ptr: *anyopaque) anyerror!void {
++        try of(ptr).group.check();
++    }
++};
++
++/// The fingerprint through the byte gather, for `ranks.agree`.
++pub fn gatherFingerprint(c: ops.Comm, mine: ranks.Fingerprint, out: []ranks.Fingerprint) anyerror!void {
++    try c.gatherBytes(std.mem.asBytes(&mine), std.mem.sliceAsBytes(out));
++}
++
++/// The ranks agree on what they run before any weight loads; any difference is error.RankMismatch on every rank.
++pub fn agreeFingerprints(gpa: std.mem.Allocator, c: ops.Comm, mine: ranks.Fingerprint) !void {
++    const all = try gpa.alloc(ranks.Fingerprint, c.world);
++    defer gpa.free(all);
++    try ranks.agree(c, gatherFingerprint, mine, all);
++}
++
++/// The page arena and the int32 block table on the device (iface decision M3).
++pub const DevicePool = struct {
++    d: *const cuda.Driver,
++    stream: cuda.Stream,
++    arena: ?cuda.DeviceBuffer = null,
++    table: ?cuda.DeviceBuffer = null,
++    max_pages: usize = 0,
++
++    pub fn interface(p: *DevicePool) ops.Device {
++        return .{ .ptr = p, .vtable = &.{ .attach = attach, .upload = upload, .deinit = deinitFn } };
++    }
++
++    fn of(ptr: *anyopaque) *DevicePool {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    pub fn release(p: *DevicePool) void {
++        p.stream.synchronize() catch {};
++        if (p.arena) |*a| a.free();
++        if (p.table) |*t| t.free();
++        p.arena = null;
++        p.table = null;
++    }
++
++    fn attach(ptr: *anyopaque, slots: u32, pages: usize, max_pages: usize, page_bytes: u64) anyerror!ops.PoolView {
++        const p = of(ptr);
++        p.release();
++        var arena = try cuda.DeviceBuffer.alloc(p.d, @max(1, pages * page_bytes));
++        errdefer arena.free();
++        var table = try cuda.DeviceBuffer.alloc(p.d, @max(1, slots * max_pages * iface.decisions.table_entry_bytes));
++        errdefer table.free();
++        try table.fill32(0xFFFF_FFFF, p.stream.handle); // every entry -1
++        p.arena = arena;
++        p.table = table;
++        p.max_pages = max_pages;
++        return .{ .arena = arena.ptr, .page_bytes = page_bytes, .pages = pages, .table = table.ptr, .slots = slots, .max_pages = max_pages };
++    }
++
++    fn upload(ptr: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void {
++        const p = of(ptr);
++        const t = p.table orelse return error.NoPool;
++        const at = (@as(usize, slot) * p.max_pages + from) * iface.decisions.table_entry_bytes;
++        try t.uploadAsync(at, std.mem.sliceAsBytes(entries), p.stream.handle);
++    }
++
++    fn deinitFn(ptr: *anyopaque) void {
++        of(ptr).release();
++    }
++};
++
++/// The control link over ncclBroadcast on the engine's stream: a 64-byte header, then its ids.
++pub const NcclWire = struct {
++    lib: *const cuda.nccl.Library,
++    comm: cuda.nccl.Comm,
++    stream: cuda.Stream,
++    buf: cuda.DeviceBuffer,
++
++    pub fn init(d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, ids: usize) !NcclWire {
++        return .{ .lib = lib, .comm = comm, .stream = stream, .buf = try cuda.DeviceBuffer.alloc(d, 64 + ids * 4) };
++    }
++
++    pub fn deinit(w: *NcclWire) void {
++        w.buf.free();
++    }
++
++    pub fn wire(w: *NcclWire) follow.Wire {
++        return .{ .ptr = w, .vtable = &.{ .send = send, .receive = receive } };
++    }
++
++    fn post(w: *NcclWire, offset: usize, bytes: usize) !void {
++        try w.lib.check(w.lib.api.ncclBroadcast(w.buf.ptr + offset, w.buf.ptr + offset, bytes, .u8, 0, w.comm, w.stream.handle), "ncclBroadcast");
++    }
++
++    /// Rank 0: enqueued on the stream and not waited for; the stream orders the next step's upload after it.
++    fn send(ptr: *anyopaque, h: *const iface.Header, ids: []const u32) anyerror!void {
++        const w: *NcclWire = @ptrCast(@alignCast(ptr));
++        if (64 + ids.len * 4 > w.buf.len) return error.TooManyIds;
++        try w.buf.uploadAsync(0, std.mem.asBytes(h), w.stream.handle);
++        try w.post(0, 64);
++        if (ids.len == 0) return;
++        try w.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), w.stream.handle);
++        try w.post(64, ids.len * 4);
++    }
++
++    fn receive(ptr: *anyopaque, out: []u32) anyerror!iface.Header {
++        const w: *NcclWire = @ptrCast(@alignCast(ptr));
++        try w.post(0, 64);
++        try w.stream.synchronize();
++        var h: iface.Header = undefined;
++        try w.buf.download(0, std.mem.asBytes(&h));
++        if (h.n > out.len or 64 + @as(usize, h.n) * 4 > w.buf.len) return error.TooManyIds;
++        if (h.n > 0) {
++            try w.post(64, @as(usize, h.n) * 4);
++            try w.stream.synchronize();
++            try w.buf.download(64, std.mem.sliceAsBytes(out[0..h.n]));
++        }
++        return h;
++    }
++};
++
++/// The device-to-host copy of a pass's gathered logits for rank 0's draw: the stream drains first.
++pub const Download = struct {
++    d: *const cuda.Driver,
++    stream: cuda.Stream,
++
++    pub fn fetch(x: *Download) draw.Fetch {
++        return .{ .ptr = x, .call = call };
++    }
++
++    fn call(ptr: *anyopaque, addr: u64, out: []u8) anyerror!void {
++        const x: *Download = @ptrCast(@alignCast(ptr));
++        try x.stream.synchronize();
++        try x.d.check(x.d.api.cuMemcpyDtoH_v2(out.ptr, addr, out.len), "cuMemcpyDtoH");
++    }
++};
++
++/// A round's grammar words in host memory, where rank 0's draw reads them (the address is the `bits` of a window).
++pub const Bits = struct {
++    gpa: std.mem.Allocator,
++    words: usize, // u32 words of one row
++    buf: []u32 = &.{},
++
++    pub fn interface(b: *Bits) @import("backend.zig").Masks {
++        return .{ .ptr = b, .put = put };
++    }
++
++    pub fn deinit(b: *Bits) void {
++        b.gpa.free(b.buf);
++    }
++
++    fn put(ptr: *anyopaque, row: usize, rows: usize, words: []const u32) anyerror!u64 {
++        const b: *Bits = @ptrCast(@alignCast(ptr));
++        if (words.len != rows * b.words or row + rows > iface.shared_rows) return error.InvalidGrammarMasks;
++        if (b.buf.len == 0) b.buf = try b.gpa.alloc(u32, iface.shared_rows * b.words);
++        @memcpy(b.buf[row * b.words ..][0..words.len], words);
++        return @intFromPtr(b.buf[row * b.words ..].ptr);
++    }
++};
++
++pub fn hashFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
++    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
++    defer gpa.free(bytes);
++    return ranks.hashBytes(bytes);
++}
++
++/// The liveness lines (cuda/tp_watch.zig) as the follower and the leader use them; `io` is the process's.
++pub fn hooksWith(io: *const std.Io) follow.Hooks {
++    return .{ .ctx = @constCast(io), .live = hookLive, .sleep = hookSleep, .wake = hookWake, .failed = hookFailed, .ended = hookEnded };
++}
++
++fn hookLive(_: *anyopaque) bool {
++    return cuda.tp_watch.open();
++}
++
++fn hookSleep(ctx: *anyopaque) void {
++    const io: *const std.Io = @ptrCast(@alignCast(ctx));
++    cuda.tp_watch.sleep(io.*);
++}
++
++fn hookWake(_: *anyopaque) void {
++    cuda.tp_watch.wake();
++}
++
++fn hookFailed(_: *anyopaque, name: []const u8) void {
++    cuda.tp_watch.fail(name);
++}
++
++fn hookEnded(_: *anyopaque) void {
++    cuda.tp_watch.ended();
++}
++
++/// What an engine owns on the device; `close` frees it in the order it was made.
++const Owner = struct {
++    gpa: std.mem.Allocator,
++    stream: cuda.Stream,
++    comm: NcclComm,
++    pool: DevicePool,
++    loaded: weights_device.Loaded,
++    cfg: config.Config,
++    group: cuda.tp_group.Group, // what the forward holds; the host copies its RoCE small gather in after open
++    forward: ops.Ops,
++    download: Download,
++    drawer: *draw.HostDrawer,
++
++    fn close(ptr: *anyopaque) void {
++        const o: *Owner = @ptrCast(@alignCast(ptr));
++        o.stream.synchronize() catch {};
++        o.drawer.deinit();
++        o.forward.vtable.deinit(o.forward.ptr);
++        o.pool.release();
++        o.comm.one.free();
++        o.loaded.deinit();
++        o.stream.deinit();
++        o.gpa.destroy(o);
++    }
++};
++
++/// Opens rank `rank` of `world` over `comm`: the ranks agree on what they run, then the weights and forward load.
++pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: iface.EngineOptions) !*engine.Engine {
++    if (world > ranks.max_world) return error.TooManyRanks;
++    if (rank >= world) return error.NoRank;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ checkpoint, "config.json" }), a, .limited(1 << 24));
++    const quant_path = try std.fs.path.join(a, &.{ checkpoint, "quantization_config.json" });
++    const quant: [32]u8 = hashFile(a, io, quant_path) catch ranks.hashBytes("");
++    const c = try config.parse(gpa, text);
++    const share = try shard.Share.of(&c, rank, world);
++    const dims = try pool.Dims.of(&c, share);
++    var cat = try load.Catalog.open(gpa, io, checkpoint);
++    defer cat.deinit();
++    const digest = try weights_device.digest(gpa, &cat);
++    const own = try gpa.create(Owner);
++    errdefer gpa.destroy(own);
++    var stream = try cuda.Stream.init(d, false);
++    errdefer stream.deinit();
++    own.* = .{ .gpa = gpa, .stream = stream, .cfg = c, .comm = undefined, .pool = .{ .d = d, .stream = stream }, .loaded = undefined, .group = .{ .lib = lib.*, .comm = comm, .rank = rank, .world = world }, .forward = undefined, .download = .{ .d = d, .stream = stream }, .drawer = undefined };
++    var one = try cuda.DeviceBuffer.alloc(d, 8);
++    errdefer one.free();
++    own.comm = .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .rank = rank, .world = world, .one = one, .group = &own.group };
++    const fp = ranks.Fingerprint.of(.{ .rank = rank, .world = world }, o.settings, o.capacity, ranks.hashBytes(text), quant, try hashFile(a, io, "/proc/self/exe"), digest);
++    try agreeFingerprints(gpa, own.comm.interface(), fp);
++    if (!ops.available()) return error.ForwardNotBuilt; // the weights are not read for a build that cannot run them
++    own.loaded = try weights_device.loadWeights(gpa, io, d, stream, checkpoint, &own.cfg, share, o.settings.layers);
++    errdefer own.loaded.deinit();
++    own.forward = try ops.openOps(.{ .gpa = gpa, .io = io, .d = d, .ctx = ctx, .stream = stream, .cfg = &own.cfg, .share = share, .weights = &own.loaded.weights, .settings = o.settings, .place = .{ .rank = rank, .world = world }, .capacity = o.capacity, .lib = lib, .comm = comm, .group = &own.group });
++    errdefer own.forward.vtable.deinit(own.forward.ptr);
++    const spans = try a.alloc(shard.Span, world);
++    for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
++    own.drawer = try draw.HostDrawer.init(gpa, rank, spans, c.vocab, own.download.fetch());
++    errdefer own.drawer.deinit();
++    const e = try engine.Engine.make(gpa, io, .{
++        .ops = own.forward,
++        .device = own.pool.interface(),
++        .comm = own.comm.interface(),
++        .drawer = own.drawer.drawer(),
++        .capacity = o.capacity,
++        .page_bytes = dims.pageBytes(),
++        .checkpoint_digest = digest,
++        .stream = stream,
++        .group = &own.group,
++        .close = .{ .ptr = own, .call = Owner.close },
++    });
++    try stream.synchronize();
++    return e;
++}
++
++test "NCCL defaults are set only where the environment leaves them unset" {
++    const Env = struct {
++        var set_names: [3]?[:0]const u8 = .{ null, null, null };
++        var n: usize = 0;
++        fn get(name: [*:0]const u8) ?[*:0]const u8 {
++            if (std.mem.eql(u8, std.mem.span(name), "NCCL_CUMEM_ENABLE")) return "1"; // the operator chose
++            return null;
++        }
++        fn set(name: [*:0]const u8, value: [*:0]const u8) void {
++            std.testing.expectEqualStrings("0", std.mem.span(value)) catch unreachable;
++            set_names[n] = std.mem.span(name);
++            n += 1;
++        }
++    };
++    applyNcclDefaults(Env.get, Env.set);
++    try std.testing.expectEqual(@as(usize, 2), Env.n);
++    try std.testing.expectEqualStrings("NCCL_RUNTIME_CONNECT", Env.set_names[0].?);
++    try std.testing.expectEqualStrings("NCCL_CUMEM_HOST_ENABLE", Env.set_names[1].?);
++}
+diff --git a/zig/src/families/minimax_m3/engine_fake.zig b/zig/src/families/minimax_m3/engine_fake.zig
+new file mode 100644
+index 0000000..8e9aa8f
+--- /dev/null
++++ b/zig/src/families/minimax_m3/engine_fake.zig
+@@ -0,0 +1,291 @@
++//! Recording fakes for the engine's tests: KV rows are the tokens, so a wrong page, slot or position changes the draw.
++const std = @import("std");
++const lanes = @import("lanes");
++const kv = @import("core").kv_pool;
++const iface = @import("iface.zig");
++const engine = @import("engine.zig");
++const ops = @import("engine_ops.zig");
++const follow = @import("follow.zig");
++const backend = @import("backend.zig");
++const pages_mod = @import("pages.zig");
++const pool = @import("pool.zig");
++
++const fake = lanes.fake;
++const none: u32 = 0xffff_ffff;
++
++pub const Run = struct { kind: ops.Rows, ids: []u32, segs: []iface.Seg, starts: []u32 };
++const RowRef = struct { slot: u32, pos: usize };
++
++/// One rank's device, forward and collectives, all recorded.
++pub const Rank = struct {
++    gpa: std.mem.Allocator,
++    rank: usize,
++    world: usize,
++    table: []i32 = &.{},
++    kv: []u32 = &.{},
++    slots: u32 = 0,
++    max_pages: usize = 0,
++    runs: std.ArrayList(Run) = .empty,
++    rows: [3]std.ArrayList(RowRef) = @splat(.empty),
++    draws: usize = 0,
++    syncs: usize = 0,
++    inject: std.ArrayList(f64) = .empty, // rank 0: peers' gate votes, taken in order (0 when empty)
++    results: std.ArrayList(f64) = .empty, // rank 0: the gate's answers, in order
++    heard: []const f64 = &.{}, // another rank: rank 0's answers, replayed in order
++    heard_at: usize = 0,
++    peers: []const []const u8 = &.{}, // gather: the other ranks' bytes, by rank (empty: the same as ours)
++    fail_run_at: ?usize = null, // the forward with this index fails (error.FakeKernel)
++
++    pub fn deinit(r: *Rank) void {
++        for (r.runs.items) |x| {
++            r.gpa.free(x.ids);
++            r.gpa.free(x.segs);
++            r.gpa.free(x.starts);
++        }
++        r.runs.deinit(r.gpa);
++        for (&r.rows) |*l| l.deinit(r.gpa);
++        r.inject.deinit(r.gpa);
++        r.results.deinit(r.gpa);
++        r.gpa.free(r.table);
++        r.gpa.free(r.kv);
++    }
++
++    pub fn parts(r: *Rank, capacity: usize) engine.Parts {
++        return .{
++            .ops = .{ .ptr = r, .vtable = &.{ .attach = attachOps, .run = run, .logits = logits, .sync = sync, .deinit = noDeinit } },
++            .device = .{ .ptr = r, .vtable = &.{ .attach = attach, .upload = upload, .deinit = noDeinit } },
++            .comm = .{ .ptr = r, .vtable = &.{ .max_f64 = maxF64, .gather_bytes = gather, .check = check }, .rank = r.rank, .world = r.world },
++            .drawer = .{ .ptr = r, .draw_fn = drawFn },
++            .capacity = capacity,
++            .page_bytes = 1 << 20,
++        };
++    }
++
++    fn of(p: *anyopaque) *Rank {
++        return @ptrCast(@alignCast(p));
++    }
++
++    fn noDeinit(_: *anyopaque) void {}
++
++    fn attach(p: *anyopaque, slots: u32, count: usize, max_pages: usize, _: u64) anyerror!ops.PoolView {
++        const r = of(p);
++        r.gpa.free(r.table);
++        r.gpa.free(r.kv);
++        r.table = try r.gpa.alloc(i32, @as(usize, slots) * max_pages);
++        @memset(r.table, -1);
++        r.kv = try r.gpa.alloc(u32, count * pool.page_tokens);
++        @memset(r.kv, none);
++        r.slots = slots;
++        r.max_pages = max_pages;
++        return .{ .arena = 0, .page_bytes = 1 << 20, .pages = count, .table = 0, .slots = slots, .max_pages = max_pages };
++    }
++
++    fn attachOps(_: *anyopaque, _: ops.PoolView) anyerror!void {}
++
++    fn upload(p: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void {
++        const r = of(p);
++        if (slot >= r.slots or from + entries.len > r.max_pages) return error.FakeTable;
++        @memcpy(r.table[@as(usize, slot) * r.max_pages + from ..][0..entries.len], entries);
++    }
++
++    fn pageOf(r: *const Rank, slot: u32, pos: usize) !usize {
++        const id = r.table[@as(usize, slot) * r.max_pages + pos / pool.page_tokens];
++        if (id < 0) return error.FakeNoPage;
++        return @as(usize, @intCast(id)) * pool.page_tokens + pos % pool.page_tokens;
++    }
++
++    fn run(p: *anyopaque, f: ops.Forward) anyerror!void {
++        const r = of(p);
++        if (r.fail_run_at) |n| if (n == r.runs.items.len) return error.FakeKernel;
++        try r.runs.append(r.gpa, .{ .kind = f.kind, .ids = try r.gpa.dupe(u32, f.ids), .segs = try r.gpa.dupe(iface.Seg, f.segs), .starts = try r.gpa.dupe(u32, f.starts) });
++        const list = &r.rows[@backingInt(f.kind)];
++        list.clearRetainingCapacity();
++        for (f.segs, f.starts) |g, start| {
++            for (0..g.rows) |k| {
++                const at = try r.pageOf(g.slot, start + k);
++                r.kv[at] = f.ids[g.row0 + k];
++                if (f.kind != .prompt or k + 1 == g.rows) try list.append(r.gpa, .{ .slot = g.slot, .pos = start + k });
++            }
++        }
++    }
++
++    fn logits(_: *anyopaque, kind: ops.Rows) u64 {
++        return (@as(u64, @backingInt(kind)) + 1) << 40;
++    }
++
++    fn sync(p: *anyopaque) anyerror!void {
++        of(p).syncs += 1;
++    }
++
++    fn maxF64(p: *anyopaque, v: f64) anyerror!f64 {
++        const r = of(p);
++        if (r.rank != 0) {
++            defer r.heard_at += 1;
++            return r.heard[r.heard_at];
++        }
++        const other: f64 = if (r.inject.items.len > 0) r.inject.orderedRemove(0) else 0;
++        const out = @max(v, other);
++        try r.results.append(r.gpa, out);
++        return out;
++    }
++
++    fn gather(p: *anyopaque, mine: []const u8, out: []u8) anyerror!void {
++        const r = of(p);
++        for (0..r.world) |q| {
++            const dst = out[q * mine.len ..][0..mine.len];
++            if (q == r.rank or q >= r.peers.len) @memcpy(dst, mine) else @memcpy(dst, r.peers[q]);
++        }
++    }
++
++    fn check(_: *anyopaque) anyerror!void {}
++
++    /// Rank 0 draws as the fake target does: from the tokens in the stream's pages, keyed by position.
++    fn drawFn(p: *anyopaque, d: ops.Draw) anyerror!void {
++        const r = of(p);
++        r.draws += 1;
++        if (r.rank != 0) return;
++        const kind = (d.base >> 40) - 1;
++        std.debug.assert(d.total == r.rows[@intCast(kind)].items.len);
++        for (0..d.rows) |k| {
++            const ref = r.rows[@intCast(kind)].items[d.row0 + k];
++            var history: [1 << 14]u32 = undefined;
++            for (0..ref.pos + 1) |q| history[q] = r.kv[try r.pageOf(ref.slot, q)];
++            d.out[k] = fake.next(history[0 .. ref.pos + 1], d.rule, d.first + k);
++        }
++    }
++};
++
++/// What a rank 0 sent, in order, for a rank 1 to replay.
++pub const Tape = struct {
++    gpa: std.mem.Allocator,
++    steps: std.ArrayList(struct { h: iface.Header, ids: []u32 }) = .empty,
++    cursor: usize = 0,
++    fail_at: ?usize = null, // the send with this index fails (error.WireBroken), as a lost peer's broadcast does
++
++    pub fn deinit(t: *Tape) void {
++        for (t.steps.items) |s| t.gpa.free(s.ids);
++        t.steps.deinit(t.gpa);
++    }
++
++    pub fn wire(t: *Tape) follow.Wire {
++        return .{ .ptr = t, .vtable = &.{ .send = send, .receive = receive } };
++    }
++
++    fn send(p: *anyopaque, h: *const iface.Header, ids: []const u32) anyerror!void {
++        const t: *Tape = @ptrCast(@alignCast(p));
++        if (t.fail_at) |n| if (n == t.steps.items.len) return error.WireBroken;
++        try t.steps.append(t.gpa, .{ .h = h.*, .ids = try t.gpa.dupe(u32, ids) });
++    }
++
++    fn receive(p: *anyopaque, buf: []u32) anyerror!iface.Header {
++        const t: *Tape = @ptrCast(@alignCast(p));
++        if (t.cursor >= t.steps.items.len) return error.TapeEnd;
++        const s = t.steps.items[t.cursor];
++        if (s.ids.len > buf.len) return error.TooManyIds;
++        @memcpy(buf[0..s.ids.len], s.ids);
++        t.cursor += 1;
++        return s.h;
++    }
++
++    pub fn count(t: *const Tape, kind: iface.Kind) usize {
++        var n: usize = 0;
++        for (t.steps.items) |s| n += @intFromBool(s.h.kind == @backingInt(kind));
++        return n;
++    }
++};
++
++/// The liveness lines as counters.
++pub const Hooks = struct {
++    on: bool = true,
++    sleeps: usize = 0,
++    wakes: usize = 0,
++    ended: usize = 0,
++    failed: [4][]const u8 = undefined,
++    failures: usize = 0,
++
++    pub fn hooks(h: *Hooks) follow.Hooks {
++        return .{ .ctx = h, .live = live, .sleep = sleep, .wake = wake, .failed = failed_, .ended = ended_ };
++    }
++
++    fn of(p: *anyopaque) *Hooks {
++        return @ptrCast(@alignCast(p));
++    }
++    fn live(p: *anyopaque) bool {
++        return of(p).on;
++    }
++    fn sleep(p: *anyopaque) void {
++        of(p).sleeps += 1;
++    }
++    fn wake(p: *anyopaque) void {
++        of(p).wakes += 1;
++    }
++    fn failed_(p: *anyopaque, name: []const u8) void {
++        const h = of(p);
++        if (h.failures < h.failed.len) h.failed[h.failures] = name;
++        h.failures += 1;
++    }
++    fn ended_(p: *anyopaque) void {
++        of(p).ended += 1;
++    }
++};
++
++/// Rank 0 with its lanes backend over the page state, and a rank 1 to replay the tape on (heap: it points at itself).
++pub const World = struct {
++    gpa: std.mem.Allocator,
++    r0: Rank,
++    r1: Rank,
++    e0: *engine.Engine,
++    e1: *engine.Engine,
++    tape: Tape,
++    hooks0: Hooks = .{},
++    hooks1: Hooks = .{},
++    link0: follow.Link,
++    link1: follow.Link,
++    pg: *pages_mod.Pages,
++    lanes: backend.Lanes,
++    bits: u64 = 0,
++
++    pub fn create(gpa: std.mem.Allocator, context: usize, slots: u32, count: usize) !*World {
++        const w = try gpa.create(World);
++        errdefer gpa.destroy(w);
++        const cap = std.mem.alignForward(usize, context + iface.window_rows, pool.page_tokens);
++        w.* = .{ .gpa = gpa, .r0 = .{ .gpa = gpa, .rank = 0, .world = 2 }, .r1 = .{ .gpa = gpa, .rank = 1, .world = 2 }, .e0 = undefined, .e1 = undefined, .tape = .{ .gpa = gpa }, .link0 = undefined, .link1 = undefined, .pg = undefined, .lanes = undefined };
++        w.e0 = try engine.Engine.make(gpa, std.testing.io, w.r0.parts(cap));
++        errdefer w.e0.deinit();
++        w.e1 = try engine.Engine.make(gpa, std.testing.io, w.r1.parts(cap));
++        errdefer w.e1.deinit();
++        w.link0 = try follow.Link.init(gpa, w.tape.wire(), w.hooks0.hooks(), cap);
++        errdefer w.link0.deinit();
++        w.link1 = try follow.Link.init(gpa, w.tape.wire(), w.hooks1.hooks(), cap);
++        errdefer w.link1.deinit();
++        const max_pages = iface.maxPages(cap);
++        const layout: kv.Layout = .{ .fixed_bytes = 4 * max_pages, .token_bytes = 1024, .page_tokens = pool.page_tokens, .snap_bytes = pool.snap_bytes, .all_paged = true };
++        w.pg = try pages_mod.Pages.create(gpa, layout, slots, count, max_pages, iface.window_rows);
++        errdefer w.pg.destroy();
++        w.pg.tables.upload = w.e0.uploadHook();
++        w.lanes = .{ .gpa = gpa, .x = .{ .e = w.e0, .link = &w.link0 }, .pages = w.pg };
++        w.link0.asleep = true;
++        try w.lanes.x.attach(slots, count);
++        return w;
++    }
++
++    pub fn destroy(w: *World) void {
++        w.lanes.deinit();
++        w.pg.destroy();
++        w.link0.deinit();
++        w.link1.deinit();
++        w.e0.deinit();
++        w.e1.deinit();
++        w.tape.deinit();
++        w.r0.deinit();
++        w.r1.deinit();
++        w.gpa.destroy(w);
++    }
++
++    /// Ends the tape and runs rank 1 over it; its gate answers are rank 0's.
++    pub fn replay(w: *World) !void {
++        try w.lanes.x.end();
++        w.r1.heard = w.r0.results.items;
++        try follow.follow(w.e1, &w.link1);
++    }
++};
+diff --git a/zig/src/families/minimax_m3/engine_ops.zig b/zig/src/families/minimax_m3/engine_ops.zig
+new file mode 100644
+index 0000000..36aea4e
+--- /dev/null
++++ b/zig/src/families/minimax_m3/engine_ops.zig
+@@ -0,0 +1,139 @@
++//! The seam between the engine loop (engine, follow, backend) and the forward and prompt passes (forward, prefill).
++const std = @import("std");
++const cuda = @import("cuda");
++const iface = @import("iface.zig");
++const config = @import("config.zig");
++const shard = @import("shard.zig");
++const weights = @import("weights.zig");
++const ranks = @import("ranks.zig");
++
++pub const Sampling = iface.Sampling;
++
++/// Which forward buffer holds the logits of a pass; a prompt pass keeps only its last row, at row 0.
++pub const Rows = enum { prompt, window, shared };
++
++/// One forward: `ids` are every segment's rows in order, `starts[i]` segment i's first position; no `head`: no logits.
++pub const Forward = struct { kind: Rows, ids: []const u32, segs: []const iface.Seg, starts: []const u32, head: bool = true };
++
++/// The device pool a forward reads and writes: the page arena and the int32 block table (iface decision M3).
++pub const PoolView = struct { arena: u64, page_bytes: u64, pages: usize, table: u64, slots: u32, max_pages: usize };
++
++/// What the forward and prompt passes provide; all calls come from the engine thread, in step order on every rank.
++pub const Ops = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// The pool the engine allocated (again, when `attach` is called again); no forward is in flight.
++        attach: *const fn (ptr: *anyopaque, view: PoolView) anyerror!void,
++        /// Enqueues one forward on the engine's stream; the KV rows of its ids are written at their positions.
++        run: *const fn (ptr: *anyopaque, f: Forward) anyerror!void,
++        /// Device address of the fp32 logits of the last pass of `kind`, gathered on every rank: [rank][row][slot].
++        logits: *const fn (ptr: *anyopaque, kind: Rows) u64,
++        /// Waits for every enqueued forward.
++        sync: *const fn (ptr: *anyopaque) anyerror!void,
++        deinit: *const fn (ptr: *anyopaque) void,
++    };
++
++    pub fn attach(o: Ops, view: PoolView) !void {
++        return o.vtable.attach(o.ptr, view);
++    }
++    pub fn run(o: Ops, f: Forward) !void {
++        return o.vtable.run(o.ptr, f);
++    }
++    pub fn logits(o: Ops, kind: Rows) u64 {
++        return o.vtable.logits(o.ptr, kind);
++    }
++    pub fn sync(o: Ops) !void {
++        return o.vtable.sync(o.ptr);
++    }
++};
++
++/// The ranks' collectives (NCCL in engine_dev.zig): the engine never touches the library in its own logic.
++pub const Comm = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++    rank: usize,
++    world: usize,
++
++    pub const VTable = struct {
++        /// The ranks' maximum of `v`, on every rank.
++        max_f64: *const fn (ptr: *anyopaque, v: f64) anyerror!f64,
++        /// Every rank's `mine` (equal lengths) in `out`, in rank order.
++        gather_bytes: *const fn (ptr: *anyopaque, mine: []const u8, out: []u8) anyerror!void,
++        /// A failed small gather's error, after a synchronize that read one.
++        check: *const fn (ptr: *anyopaque) anyerror!void,
++    };
++
++    pub fn maxF64(c: Comm, v: f64) !f64 {
++        return c.vtable.max_f64(c.ptr, v);
++    }
++    pub fn gatherBytes(c: Comm, mine: []const u8, out: []u8) !void {
++        return c.vtable.gather_bytes(c.ptr, mine, out);
++    }
++    pub fn check(c: Comm) !void {
++        return c.vtable.check(c.ptr);
++    }
++};
++
++/// A draw of rows [row0, row0 + rows) of a `total`-row pass gathered at `base`; `bits`: host address of grammar words.
++pub const Draw = struct { base: u64, total: usize, row0: usize, rows: usize, first: u64, rule: ?Sampling, bits: u64, out: []u32 };
++
++/// The token draw: rank 0 alone draws (another rank's `out` stays untouched).
++pub const Drawer = struct {
++    ptr: *anyopaque,
++    draw_fn: *const fn (ptr: *anyopaque, d: Draw) anyerror!void,
++
++    pub fn draw(r: Drawer, d: Draw) !void {
++        return r.draw_fn(r.ptr, d);
++    }
++};
++
++/// The device block table and page arena, made at `attach` (engine_dev.zig); the host fakes it with an array.
++pub const Device = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// A fresh arena of `pages` pages and a table of `slots` rows of -1, replacing any earlier ones.
++        attach: *const fn (ptr: *anyopaque, slots: u32, pages: usize, max_pages: usize, page_bytes: u64) anyerror!PoolView,
++        /// `entries` written at entry `from` of `slot`'s table row.
++        upload: *const fn (ptr: *anyopaque, slot: u32, from: usize, entries: []const i32) anyerror!void,
++        deinit: *const fn (ptr: *anyopaque) void,
++    };
++};
++
++/// What `openOps` is given: the loaded weights of this rank and the handles a forward needs.
++pub const OpenArgs = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    d: *const cuda.Driver,
++    ctx: *const cuda.Context,
++    stream: cuda.Stream,
++    cfg: *const config.Config,
++    share: shard.Share,
++    weights: *const weights.Weights,
++    settings: ranks.Settings,
++    place: ranks.Place,
++    capacity: usize,
++    lib: *const cuda.nccl.Library,
++    comm: cuda.nccl.Comm,
++    /// The ranks' group over `lib` and `comm`; the host sets its RoCE small gather (`fast`) after `openOps`.
++    group: *const cuda.tp_group.Group,
++};
++
++/// Whether forward.zig and prefill.zig are in this tree. MERGE: becomes true when `openOps` below calls them.
++pub fn available() bool {
++    return false;
++}
++
++/// MERGE POINT with branch mm3-t8a: the body becomes `return forward.open(args);` (forward.zig builds the buffers).
++pub fn openOps(args: OpenArgs) !Ops {
++    _ = args;
++    return error.ForwardNotBuilt;
++}
++
++test "the pass kinds are the three buffers a forward owns" {
++    try std.testing.expectEqual(@as(usize, 2), @backingInt(Rows.shared));
++    try std.testing.expect(!available());
++}
+diff --git a/zig/src/families/minimax_m3/engine_test.zig b/zig/src/families/minimax_m3/engine_test.zig
+new file mode 100644
+index 0000000..9e8773f
+--- /dev/null
++++ b/zig/src/families/minimax_m3/engine_test.zig
+@@ -0,0 +1,275 @@
++//! Host tests of the engine and its follower: chunking, resume, windows, cancellation, rank failure, fingerprints.
++const std = @import("std");
++const lanes = @import("lanes");
++const iface = @import("iface.zig");
++const engine = @import("engine.zig");
++const follow = @import("follow.zig");
++const fakes = @import("engine_fake.zig");
++const dev = @import("engine_dev.zig");
++const ranks = @import("ranks.zig");
++const pool = @import("pool.zig");
++
++const gpa = std.testing.allocator;
++const World = fakes.World;
++
++fn prompt(n: usize, salt: u32) ![]u32 {
++    const p = try gpa.alloc(u32, n);
++    for (p, 0..) |*t, i| t.* = @intCast((i * 7 + salt) % 90);
++    return p;
++}
++
++/// A lease for `slot` as the backend takes one: pages promised, covered and written to both tables by the leader.
++fn admit(w: *World, slot: u32, n: usize) !pool_state {
++    var st: pool_state = .{ .st = .{ .slot = slot } };
++    const ids = try prompt(n, 1);
++    defer gpa.free(ids);
++    var sink = w.pg.tables.sink(slot);
++    st.marks = try w.pg.cache.admit(gpa, &st.st, ids, 0, 16, w.pg.window, sink.table(), w.pg.max_pages);
++    try w.lanes.x.bind(slot);
++    try w.lanes.x.begin(null, st.st.lease.ids.items);
++    return st;
++}
++const pool_state = struct {
++    st: @import("state.zig").Stream,
++    marks: []const u32 = &.{},
++    fn done(s: *pool_state, w: *World) void {
++        gpa.free(s.marks);
++        w.pg.cache.end(&s.st, &w.pg.tables);
++    }
++};
++
++test "a prompt crosses in chunks of at most 2048 rows and rank 1 runs the same forwards on the same pages" {
++    const w = try World.create(gpa, 6000, 2, 120);
++    defer w.destroy();
++    const ids = try prompt(5000, 3);
++    defer gpa.free(ids);
++    var s = try admit(w, 0, ids.len);
++    defer s.done(w);
++    const first = try w.lanes.x.prefill(ids, null, null, null);
++    try std.testing.expectEqual(@as(usize, 3), w.r0.runs.items.len); // 2048 + 2048 + 904
++    var at: usize = 0;
++    for (w.r0.runs.items) |r| {
++        try std.testing.expectEqualSlices(u32, ids[at..][0..r.ids.len], r.ids);
++        try std.testing.expectEqual(@as(u32, @intCast(at)), r.starts[0]);
++        try std.testing.expect(r.ids.len <= iface.prefill_rows);
++        at += r.ids.len;
++    }
++    try std.testing.expectEqual(ids.len, at);
++    try std.testing.expectEqual(ids.len, w.e0.pos());
++    try std.testing.expectEqual(lanes.fake.next(ids, null, ids.len), first); // the token the target draws after the prompt
++    try w.replay();
++    try std.testing.expectEqual(w.r0.runs.items.len, w.r1.runs.items.len);
++    for (w.r0.runs.items, w.r1.runs.items) |a, b| {
++        try std.testing.expectEqualSlices(u32, a.ids, b.ids);
++        try std.testing.expectEqualSlices(u32, a.starts, b.starts);
++        try std.testing.expectEqualSlices(iface.Seg, a.segs, b.segs);
++    }
++    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
++    try std.testing.expectEqualSlices(i32, w.r0.table, w.r1.table);
++    try std.testing.expectEqual(w.r0.draws, w.r1.draws); // the follower sent its span for every draw
++}
++
++test "chunk and resume equivalence: any cut of the prompt, and a pass resumed from adopted pages, give the same rows and token" {
++    const w = try World.create(gpa, 6000, 2, 120);
++    defer w.destroy();
++    const ids = try prompt(4096 + 300, 5);
++    defer gpa.free(ids);
++    var whole = try admit(w, 0, ids.len);
++    defer whole.done(w);
++    const want = try w.lanes.x.prefill(ids, null, null, null);
++    // a second slot whose first 2048 rows are the first slot's pages (adopted), then the rest in cuts at 512-row marks
++    var other = try admit(w, 1, ids.len);
++    defer other.done(w);
++    const cut = [_]u32{ 2560, 3072, 4096 };
++    var calls: usize = 0;
++    const Hook = struct {
++        fn call(ctx: *anyopaque, _: u32) void {
++            @as(*usize, @ptrCast(@alignCast(ctx))).* += 1;
++        }
++    };
++    // share the first 16 pages (2048 rows) the way a resume adopts them
++    for (0..16) |i| w.pg.pages.share(&other.st.lease, i, whole.st.lease.ids.items[i]);
++    try w.pg.tables.write(1, other.st.lease.ids.items, 0);
++    try w.lanes.x.bind(1);
++    try w.lanes.x.begin(null, other.st.lease.ids.items);
++    const got = try w.lanes.x.prefill(ids, .{ .at = 2048 }, null, .{ .at = &cut, .ctx = &calls, .call = Hook.call });
++    try std.testing.expectEqual(want, got);
++    try std.testing.expectEqual(@as(usize, 3), calls); // every mark in the pass was called, once, at a chunk start
++    var rows: usize = 2048;
++    var chunks: usize = 0;
++    for (w.r0.runs.items[3..]) |r| { // the second pass starts at the resume point and covers the rest, cut at the marks
++        try std.testing.expectEqual(@as(u32, @intCast(rows)), r.starts[0]);
++        rows += r.ids.len;
++        chunks += 1;
++    }
++    try std.testing.expectEqual(ids.len, rows);
++    try std.testing.expectEqual(@as(usize, 4), chunks); // 2048..2560..3072..4096..4396: a chunk ends at each mark
++    // the pages the resumed pass read are the first slot's, so its rows are bitwise the first slot's
++    try w.replay();
++    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
++}
++
++test "a window verifies at the committed position, keep commits the accepted rows, and shared windows keep their own pages" {
++    const w = try World.create(gpa, 2000, 3, 60);
++    defer w.destroy();
++    const a_ids = try prompt(300, 2);
++    defer gpa.free(a_ids);
++    const b_ids = try prompt(700, 9);
++    defer gpa.free(b_ids);
++    var a = try admit(w, 0, a_ids.len);
++    defer a.done(w);
++    var b = try admit(w, 1, b_ids.len);
++    defer b.done(w);
++    try w.lanes.x.bind(0);
++    const fa = try w.lanes.x.prefill(a_ids, null, null, null);
++    try w.lanes.x.bind(1);
++    const fb = try w.lanes.x.prefill(b_ids, null, null, null);
++    var pa = [_]u32{ fa, 4, 5 };
++    var pb = [_]u32{ fb, 6 };
++    var oa: [3]u32 = undefined;
++    var ob: [2]u32 = undefined;
++    try w.lanes.x.verifyShared(&.{ .{ .slot = 0, .ids = &pa, .out = &oa }, .{ .slot = 1, .ids = &pb, .out = &ob } });
++    const shared = w.r0.runs.items[w.r0.runs.items.len - 1];
++    try std.testing.expectEqual(@import("engine_ops.zig").Rows.shared, shared.kind);
++    try std.testing.expectEqualSlices(u32, &.{ 300, 700 }, shared.starts);
++    try std.testing.expectEqual(@as(u32, 3), shared.segs[1].row0);
++    // row 0 of window a is drawn after prompt + fa: the target's own function of those tokens
++    var hist: [301]u32 = undefined;
++    @memcpy(hist[0..300], a_ids);
++    hist[300] = fa;
++    try std.testing.expectEqual(lanes.fake.next(&hist, null, 301), oa[0]);
++    try w.lanes.x.bind(0);
++    try w.lanes.x.keep(2); // two of three rows accepted
++    try std.testing.expectEqual(@as(usize, 302), w.e0.pos());
++    try w.lanes.x.bind(1);
++    try std.testing.expectEqual(@as(usize, 700), w.e0.pos()); // slot 1 was not committed
++    try std.testing.expectError(error.BadKeep, w.e0.keep(5));
++    var long: [iface.window_rows + 1]u32 = @splat(1);
++    var out: [iface.window_rows + 1]u32 = undefined;
++    try std.testing.expectError(error.WindowTooWide, w.e0.verify(&long, &out, 0));
++    try w.replay();
++    try std.testing.expectEqualSlices(u32, w.r0.kv, w.r1.kv);
++}
++
++test "cancellation at a chunk gate stops every rank before the same forward" {
++    const w = try World.create(gpa, 6000, 2, 120);
++    defer w.destroy();
++    const ids = try prompt(5000, 4);
++    defer gpa.free(ids);
++    var s = try admit(w, 0, ids.len);
++    defer s.done(w);
++    const Flag = struct {
++        calls: usize = 0,
++        fn check(p: ?*anyopaque) bool {
++            const f: *@This() = @ptrCast(@alignCast(p.?));
++            f.calls += 1;
++            return f.calls > 1; // the second chunk's gate sees it
++        }
++    };
++    var flag: Flag = .{};
++    try std.testing.expectError(error.Cancelled, w.lanes.x.prefill(ids, null, .{ .ptr = &flag, .check = Flag.check }, null));
++    try std.testing.expectEqual(@as(usize, 1), w.r0.runs.items.len);
++    try std.testing.expectEqualSlices(f64, &.{ 0, 1 }, w.r0.results.items);
++    try w.lanes.x.release(0);
++    try w.replay(); // the follower hears the same answers, skips the same forward, and goes on to the release
++    try std.testing.expectEqual(@as(usize, 1), w.r1.runs.items.len);
++    try std.testing.expectEqual(@as(usize, 1), w.tape.count(.release));
++    try std.testing.expectEqual(@as(usize, 0), w.hooks1.failures);
++}
++
++test "another rank's vote cancels this rank's chunk too" {
++    const w = try World.create(gpa, 3000, 2, 60);
++    defer w.destroy();
++    const ids = try prompt(2500, 6);
++    defer gpa.free(ids);
++    var s = try admit(w, 0, ids.len);
++    defer s.done(w);
++    try w.r0.inject.append(gpa, 1); // rank 1's gate says stop
++    try std.testing.expectError(error.Cancelled, w.lanes.x.prefill(ids, null, null, null));
++    try std.testing.expectEqual(@as(usize, 0), w.r0.runs.items.len);
++}
++
++test "a follower that fails tells the others and stops; rank 0 ends cleanly when the wire breaks" {
++    {
++        const w = try World.create(gpa, 3000, 2, 60);
++        defer w.destroy();
++        const ids = try prompt(500, 1);
++        defer gpa.free(ids);
++        var s = try admit(w, 0, ids.len);
++        defer s.done(w);
++        _ = try w.lanes.x.prefill(ids, null, null, null);
++        w.r1.fail_run_at = 0; // rank 1's kernel fails on its first forward
++        try std.testing.expectError(error.FakeKernel, w.replay());
++        try std.testing.expectEqual(@as(usize, 1), w.hooks1.failures);
++        try std.testing.expectEqualStrings("FakeKernel", w.hooks1.failed[0]);
++    }
++    {
++        const w = try World.create(gpa, 3000, 2, 60);
++        defer w.destroy();
++        const ids = try prompt(500, 1);
++        defer gpa.free(ids);
++        var s = try admit(w, 0, ids.len);
++        defer s.done(w);
++        w.tape.fail_at = w.tape.steps.items.len + 1; // the chunk goes out; the next send finds rank 1 gone
++        _ = try w.lanes.x.prefill(ids, null, null, null);
++        var window = [_]u32{ 1, 2 };
++        var out: [2]u32 = undefined;
++        try std.testing.expectError(error.RankLost, w.lanes.x.verify(&window, &out, 0));
++        try std.testing.expectEqual(@as(usize, 1), w.hooks0.failures);
++        try std.testing.expectEqualStrings("WireBroken", w.hooks0.failed[0]);
++        const sent = w.tape.steps.items.len;
++        try std.testing.expectError(error.RankLost, w.lanes.x.keep(1)); // refused without touching the wire
++        try std.testing.expectError(error.RankLost, w.lanes.x.release(0));
++        try w.lanes.x.end(); // nothing to send, nothing to wait for
++        try std.testing.expectEqual(sent, w.tape.steps.items.len);
++        try std.testing.expectEqual(@as(usize, 1), w.hooks0.failures);
++    }
++}
++
++test "rank 0 wakes the sleeping ranks once, and idles them only when no stream is left" {
++    const w = try World.create(gpa, 2000, 2, 40);
++    defer w.destroy();
++    try std.testing.expectEqual(@as(usize, 1), w.hooks0.wakes); // the attach step
++    try w.lanes.x.idle();
++    try w.lanes.x.idle(); // already asleep: no second step
++    try std.testing.expectEqual(@as(usize, 1), w.tape.count(.idle) - 1);
++    const ids = try prompt(200, 1);
++    defer gpa.free(ids);
++    var s = try admit(w, 0, ids.len);
++    defer s.done(w);
++    try std.testing.expectEqual(@as(usize, 2), w.hooks0.wakes);
++    try w.replay();
++    try std.testing.expectEqual(@as(usize, 2), w.hooks1.sleeps); // at its start and at the idle step
++}
++
++test "the ranks' fingerprints are gathered as bytes and a difference refuses on every rank" {
++    var r: fakes.Rank = .{ .gpa = gpa, .rank = 0, .world = 2 };
++    const set: ranks.Settings = .{};
++    const mine = ranks.Fingerprint.of(.{ .rank = 0, .world = 2 }, set, 4096, @splat(1), @splat(2), @splat(3), @splat(4));
++    var same = mine;
++    same.rank = 1;
++    r.peers = &.{ std.mem.asBytes(&mine), std.mem.asBytes(&same) };
++    const c = r.parts(4096).comm;
++    try dev.agreeFingerprints(gpa, c, mine);
++    var other = same;
++    other.weights = @splat(9);
++    r.peers = &.{ std.mem.asBytes(&mine), std.mem.asBytes(&other) };
++    try std.testing.expectError(error.RankMismatch, dev.agreeFingerprints(gpa, c, mine));
++}
++
++test "a prompt past the capacity or a chunk off the page grid is refused by the engine" {
++    const w = try World.create(gpa, 2000, 2, 40);
++    defer w.destroy();
++    var long: [2100]u32 = @splat(1);
++    try std.testing.expectError(error.PromptTooLong, w.e0.prefill(&long, null, null, null));
++    try std.testing.expectError(error.BadResume, w.e0.prefill(long[0..300], .{ .at = 100 }, null, null));
++    try std.testing.expectError(error.BadChunk, w.e0.prefillChunk(long[0..100], 0, 300, null, null, null)); // a middle chunk off a page
++    try std.testing.expectError(error.BadChunk, w.e0.prefillChunk(long[0..100], 128, 228, null, null, null)); // not at the position
++}
++
++test "the table row bytes and chunk grid are the contract's" {
++    const w = try World.create(gpa, 2000, 2, 40);
++    defer w.destroy();
++    try std.testing.expectEqual(@as(u64, 4 * iface.maxPages(w.e0.capacity)), w.e0.seqBytes());
++    try std.testing.expect(iface.prefill_rows % pool.page_tokens == 0);
++}
+diff --git a/zig/src/families/minimax_m3/engine_tests.zig b/zig/src/families/minimax_m3/engine_tests.zig
+new file mode 100644
+index 0000000..8b21a23
+--- /dev/null
++++ b/zig/src/families/minimax_m3/engine_tests.zig
+@@ -0,0 +1,12 @@
++//! The root of the `test-minimax-engine` step: the engine loop's files and their host tests.
++test {
++    _ = @import("engine.zig");
++    _ = @import("engine_ops.zig");
++    _ = @import("engine_dev.zig");
++    _ = @import("follow.zig");
++    _ = @import("backend.zig");
++    _ = @import("draw.zig");
++    _ = @import("engine_fake.zig");
++    _ = @import("engine_test.zig");
++    _ = @import("backend_test.zig");
++}
+diff --git a/zig/src/families/minimax_m3/follow.zig b/zig/src/families/minimax_m3/follow.zig
+new file mode 100644
+index 0000000..a8083bc
+--- /dev/null
++++ b/zig/src/families/minimax_m3/follow.zig
+@@ -0,0 +1,302 @@
++//! Rank 0's steps to the other ranks over the NCCL broadcast control link: a 64-byte header, then ids (no TCP mirror).
++const std = @import("std");
++const iface = @import("iface.zig");
++const engine = @import("engine.zig");
++const Engine = engine.Engine;
++
++pub const Kind = iface.Kind;
++pub const Header = iface.Header;
++
++/// The link's two directions: rank 0 sends a step, the others receive it (NCCL broadcast in engine_dev.zig).
++pub const Wire = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// The header, then its `ids` (header.n of them) to every rank; the ids fit the link's capacity.
++        send: *const fn (ptr: *anyopaque, h: *const Header, ids: []const u32) anyerror!void,
++        /// The next step: its header, its ids in `buf[0..h.n]`; error.TooManyIds if they do not fit `buf`.
++        receive: *const fn (ptr: *anyopaque, buf: []u32) anyerror!Header,
++    };
++};
++
++/// What a rank does outside the link: the liveness lines (cuda/tp_watch.zig in production, recorders in tests).
++pub const Hooks = struct {
++    ctx: *anyopaque,
++    /// Whether liveness lines exist (more than one rank).
++    live: *const fn (ctx: *anyopaque) bool,
++    /// Follower: wait for rank 0's wake without spinning in NCCL.
++    sleep: *const fn (ctx: *anyopaque) void,
++    /// Rank 0: the other ranks' sleep returns.
++    wake: *const fn (ctx: *anyopaque) void,
++    /// This rank stops with `name`: every other rank hears it and stops too.
++    failed: *const fn (ctx: *anyopaque, name: []const u8) void,
++    /// This rank ends on purpose: a line closing from here is expected.
++    ended: *const fn (ctx: *anyopaque) void,
++};
++
++pub const Link = struct {
++    wire: Wire,
++    hooks: Hooks,
++    ids: []u32,
++    gpa: std.mem.Allocator,
++    asleep: bool = false, // rank 0: the other ranks sleep on their lines until its next step
++    lost: ?anyerror = null, // rank 0: the first error the wire gave; every later step is error.RankLost
++
++    /// `asked_ids` is at least the context, so a whole prompt may cross as one step; a table row always fits.
++    pub fn init(gpa: std.mem.Allocator, wire: Wire, hooks: Hooks, asked_ids: usize) !Link {
++        const cap = capacityFor(asked_ids);
++        return .{ .wire = wire, .hooks = hooks, .ids = try gpa.alloc(u32, cap), .gpa = gpa };
++    }
++
++    pub fn deinit(l: *Link) void {
++        l.gpa.free(l.ids);
++    }
++
++    /// Ids a step can carry: a chunk, a table row, a shared window's parts and rows, and what the caller asked for.
++    pub fn capacityFor(asked: usize) usize {
++        return @max(@max(asked, iface.prefill_rows), 2 * iface.max_shared + iface.shared_rows);
++    }
++};
++
++/// A shared step's ids: for each part its slot and row count, then every part's ids; returns the words used.
++pub fn encodeShared(buf: []u32, parts: []const iface.Part) !usize {
++    var n: usize = 2 * parts.len;
++    for (parts, 0..) |p, i| {
++        if (n + p.ids.len > buf.len) return error.WindowTooWide;
++        buf[2 * i] = p.slot;
++        buf[2 * i + 1] = @intCast(p.ids.len);
++        @memcpy(buf[n..][0..p.ids.len], p.ids);
++        n += p.ids.len;
++    }
++    return n;
++}
++
++/// The parts of `k` windows in `words` (encodeShared's form), their drawn tokens going to `outs`.
++pub fn decodeShared(words: []const u32, k: usize, parts: []iface.Part, outs: []u32) !void {
++    if (k == 0 or k > iface.max_shared or k > parts.len or words.len < 2 * k) return error.BadStep;
++    var at: usize = 2 * k;
++    var row: usize = 0;
++    for (parts[0..k], 0..) |*p, i| {
++        const n = words[2 * i + 1];
++        if (n == 0 or at + n > words.len or row + n > outs.len) return error.BadStep;
++        p.* = .{ .slot = words[2 * i], .ids = words[at..][0..n], .out = outs[row..][0..n] };
++        at += n;
++        row += n;
++    }
++}
++
++/// Rank 0's engine: every step goes to the other ranks first, then runs here.
++pub const Leader = struct {
++    e: *Engine,
++    link: *Link,
++
++    fn send(x: Leader, h: Header, ids: []const u32) !void {
++        const l = x.link;
++        if (l.lost != null) return error.RankLost;
++        var hh = h;
++        hh.slot = x.e.slot;
++        hh.n = @intCast(ids.len);
++        if (ids.len > l.ids.len) return error.TooManyIds;
++        if (l.asleep) { // the other ranks wait on their lines, not in NCCL: wake them for this step
++            l.hooks.wake(l.hooks.ctx);
++            l.asleep = false;
++        }
++        l.wire.vtable.send(l.wire.ptr, &hh, ids) catch |err| return x.lose(err);
++    }
++
++    /// The wire broke: the other ranks hear it, and every step from now on is refused without touching NCCL.
++    fn lose(x: Leader, err: anyerror) error{RankLost} {
++        x.link.lost = err;
++        x.link.hooks.failed(x.link.hooks.ctx, @errorName(err));
++        return error.RankLost;
++    }
++
++    /// No stream is left: the other ranks sleep on their lines until the next step instead of spinning in NCCL.
++    pub fn idle(x: Leader) !void {
++        if (x.link.lost != null or x.link.asleep or !x.link.hooks.live(x.link.hooks.ctx)) return;
++        try x.send(.{ .kind = @backingInt(Kind.idle) }, &.{});
++        x.link.asleep = true;
++    }
++
++    /// The pool of `slots` streams and `pages` pages on every rank (the idle kind with flag 1).
++    pub fn attach(x: Leader, slots: u32, pages: usize) !void {
++        try x.send(.{ .kind = @backingInt(Kind.idle), .flags = 1, .depth = slots, .a = pages }, &.{});
++        try x.e.attach(slots, pages);
++    }
++
++    pub fn bind(x: Leader, slot: u32) !void {
++        try x.e.bind(slot);
++    }
++
++    /// Frees a stream's sequence on every rank.
++    pub fn release(x: Leader, slot: u32) !void {
++        try x.e.bind(slot);
++        try x.send(.{ .kind = @backingInt(Kind.release) }, &.{});
++        x.e.release(slot);
++    }
++
++    /// A fresh sequence on the bound slot; `row` is its block-table row (the lease's page ids) as rank 0 admitted it.
++    pub fn begin(x: Leader, s: ?engine.Sampling, row: []const u32) !void {
++        const c = engine.check(s);
++        var h: Header = .{ .kind = @backingInt(Kind.begin) };
++        if (c) |v| {
++            h.flags = 1;
++            h.seed = v.seed;
++            h.temperature = v.temperature;
++            h.top_p = v.top_p;
++            h.min_p = v.min_p;
++            h.top_k = v.top_k;
++        }
++        try x.send(h, row);
++        try x.e.begin(c);
++    }
++
++    /// Table entries from `from` on the other ranks (the keep kind with flag 1): rank 0 already wrote its own.
++    pub fn sendPages(x: Leader, from: usize, ids: []const u32) !void {
++        try x.send(.{ .kind = @backingInt(Kind.keep), .flags = 1, .depth = @intCast(from) }, ids);
++    }
++
++    /// One chunk `ids[start..chunkEnd]` of a prompt pass on every rank; the first token once the chunk ends the prompt.
++    pub fn chunk(x: Leader, ids: []const u32, start: usize, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !?u32 {
++        if (start >= ids.len) return error.BadChunk;
++        const part = ids[start..engine.chunkEnd(start, ids.len, marks)];
++        // a mark keeps the prefix before the step goes out: its page swap must reach the other ranks first
++        if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
++        try x.send(.{ .kind = @backingInt(Kind.chunk), .a = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
++        return x.e.prefillChunk(part, start, ids.len, from, cancel, null);
++    }
++
++    /// The whole prompt as chunk steps (the other ranks never see marks, only chunks), then the first token.
++    pub fn prefill(x: Leader, ids: []const u32, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !u32 {
++        var start: usize = if (from) |r| r.at else 0;
++        var adopted = from;
++        while (true) {
++            if (try x.chunk(ids, start, adopted, cancel, marks)) |first| return first;
++            start = engine.chunkEnd(start, ids.len, marks);
++            adopted = null;
++        }
++    }
++
++    pub fn verify(x: Leader, ids: []const u32, out: []u32, bits: u64) !void {
++        try x.send(.{ .kind = @backingInt(Kind.verify) }, ids);
++        try x.e.verify(ids, out, bits);
++    }
++
++    pub fn verifyShared(x: Leader, parts: []const iface.Part) !void {
++        if (parts.len == 0 or parts.len > iface.max_shared) return error.WindowTooWide;
++        var buf: [2 * iface.max_shared + iface.shared_rows]u32 = undefined;
++        const n = try encodeShared(&buf, parts);
++        try x.send(.{ .kind = @backingInt(Kind.shared), .depth = @intCast(parts.len) }, buf[0..n]);
++        try x.e.verifyShared(parts);
++    }
++
++    pub fn keep(x: Leader, n: usize) !void {
++        try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
++        try x.e.keep(n);
++    }
++
++    /// The other ranks leave their loops; nothing is sent when the link already broke.
++    pub fn end(x: Leader) !void {
++        x.link.hooks.ended(x.link.hooks.ctx);
++        if (x.link.lost != null) return;
++        try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
++    }
++};
++
++fn kindOf(h: Header) !Kind {
++    return std.enums.fromInt(Kind, h.kind) orelse error.BadStep;
++}
++
++/// A rank other than 0 runs rank 0's steps until `end`; other errors are told to the others and returned.
++pub fn follow(e: *Engine, link: *Link) !void {
++    return run(e, link) catch |err| {
++        link.hooks.failed(link.hooks.ctx, @errorName(err));
++        return err;
++    };
++}
++
++fn run(e: *Engine, link: *Link) !void {
++    var sampled: [iface.shared_rows]u32 = undefined;
++    link.hooks.sleep(link.hooks.ctx); // rank 0 starts with no stream: its first step wakes this rank
++    while (true) {
++        const h = try link.wire.vtable.receive(link.wire.ptr, link.ids);
++        const ids = link.ids[0..h.n];
++        const kind = try kindOf(h);
++        switch (kind) {
++            .end, .idle => {},
++            else => try e.bind(h.slot),
++        }
++        switch (kind) {
++            .begin => {
++                try e.setPages(h.slot, 0, ids);
++                try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
++            },
++            .prefill, .chunk => {
++                const from: ?engine.Resume = if (h.a != 0) .{ .at = @intCast(h.a) } else null;
++                const start: usize = if (kind == .prefill) (if (from) |r| r.at else 0) else h.depth;
++                const len: usize = if (kind == .prefill) ids.len else h.top_k;
++                if (kind == .prefill) {
++                    _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
++                        error.Cancelled => {},
++                        else => return err,
++                    };
++                } else {
++                    _ = e.prefillChunk(ids, start, len, from, null, null) catch |err| switch (err) {
++                        error.Cancelled => {},
++                        else => return err,
++                    };
++                }
++            },
++            .verify => try e.verify(ids, sampled[0..ids.len], 0),
++            .shared => {
++                var parts: [iface.max_shared]iface.Part = undefined;
++                try decodeShared(ids, h.depth, &parts, &sampled);
++                try e.verifyShared(parts[0..h.depth]);
++            },
++            .keep => if (h.flags & 1 != 0) try e.setPages(h.slot, h.depth, ids) else try e.keep(@intCast(h.a)),
++            .release => e.release(h.slot),
++            .idle => if (h.flags & 1 != 0) try e.attach(h.depth, @intCast(h.a)) else link.hooks.sleep(link.hooks.ctx),
++            .end => {
++                link.hooks.ended(link.hooks.ctx); // rank 0 ends on purpose: its line closing from here is expected
++                return;
++            },
++        }
++    }
++}
++
++test "the follower's header is 64 bytes, round trips, and its kinds are the contract's" {
++    const h: Header = .{ .kind = @backingInt(Kind.chunk), .n = 3, .depth = 2048, .a = 4096, .seed = 1 << 62, .temperature = 0.6, .top_p = 0.95, .top_k = 7000, .slot = 3 };
++    var back: Header = undefined;
++    @memcpy(std.mem.asBytes(&back), std.mem.asBytes(&h));
++    try std.testing.expectEqual(h, back);
++    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Header));
++    try std.testing.expectEqual(Kind.chunk, try kindOf(back));
++    try std.testing.expectError(error.BadStep, kindOf(.{ .kind = 0 }));
++    try std.testing.expectError(error.BadStep, kindOf(.{ .kind = 10 }));
++}
++
++test "a shared step's words round trip and a malformed one is refused" {
++    var a = [_]u32{ 1, 2, 3 };
++    var b = [_]u32{ 9, 8 };
++    var oa: [3]u32 = undefined;
++    var ob: [2]u32 = undefined;
++    const parts = [_]iface.Part{ .{ .slot = 4, .ids = &a, .out = &oa }, .{ .slot = 1, .ids = &b, .out = &ob } };
++    var buf: [2 * iface.max_shared + iface.shared_rows]u32 = undefined;
++    const n = try encodeShared(&buf, &parts);
++    try std.testing.expectEqual(@as(usize, 4 + 5), n);
++    var back: [iface.max_shared]iface.Part = undefined;
++    var outs: [iface.shared_rows]u32 = undefined;
++    try decodeShared(buf[0..n], 2, &back, &outs);
++    try std.testing.expectEqual(@as(u32, 4), back[0].slot);
++    try std.testing.expectEqualSlices(u32, &b, back[1].ids);
++    try std.testing.expectEqual(@as(usize, 2), back[1].out.len);
++    try std.testing.expectError(error.BadStep, decodeShared(buf[0 .. n - 1], 2, &back, &outs));
++    try std.testing.expectError(error.BadStep, decodeShared(buf[0..n], 0, &back, &outs));
++    try std.testing.expectError(error.WindowTooWide, encodeShared(buf[0..5], &parts));
++}
++
++test "the link carries a chunk, a table row and every shared window" {
++    try std.testing.expect(Link.capacityFor(0) >= iface.prefill_rows);
++    try std.testing.expect(Link.capacityFor(100_000) == 100_000);
++}
+diff --git a/zig/src/families/minimax_m3/native.zig b/zig/src/families/minimax_m3/native.zig
+index 0c495d4..6442788 100644
+--- a/zig/src/families/minimax_m3/native.zig
++++ b/zig/src/families/minimax_m3/native.zig
+@@ -1,4 +1,4 @@
+-//! MiniMax-M3.1-Flash behind the native CUDA host (GLM's contract); `open` stops at error.EngineNotBuilt.
++//! MiniMax-M3.1-Flash behind the native CUDA host (GLM's contract): `open` checks, joins the ranks, builds the engine.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const kv = @import("core").kv_pool;
+@@ -12,6 +12,10 @@ const pool = @import("pool.zig");
+ const shard = @import("shard.zig");
+ const pages = @import("pages.zig");
+ const weights_device = @import("weights_device.zig");
++const engine = @import("engine.zig");
++const engine_dev = @import("engine_dev.zig");
++const follow = @import("follow.zig");
++const backend = @import("backend.zig");
+ 
+ pub const model_type = config.model_type;
+ pub const formats: []const []const u8 = &.{"exl3"};
+@@ -53,13 +57,21 @@ pub const Loaded = struct {
+     peer_room: ?Peer = null,
+ };
+ 
+-/// What `attach` builds on, `open` will own: the page state of one rank (T8 adds the device arena beside it).
++/// What `attach` builds on and `open` owns: the page state of rank 0 and, past `open`, its engine, link and lanes.
+ pub const Owned = struct {
+     gpa: std.mem.Allocator,
+     layout: kv.Layout,
+     max_pages: usize,
+     window: u64 = window_rows,
+     pages: ?*pages.Pages = null,
++    up: bool = false, // the engine below exists (a test builds the page state alone)
++    group: cuda.tp_group.Group = undefined, // the ranks' communicator; two ranks add RoCE writes for the main stream
++    e: *engine.Engine = undefined,
++    wire: engine_dev.NcclWire = undefined,
++    link: follow.Link = undefined,
++    bits: engine_dev.Bits = undefined,
++    io: std.Io = undefined,
++    lanes: backend.Lanes = undefined,
+ };
+ 
+ /// Slots for `context` plus a verify window, whole pages: the longest sequence a stream holds.
+@@ -83,8 +95,20 @@ pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64
+ /// The pool behind the engine: `streams` paged sequences and `count` pages, made now (decision M1: all streams page).
+ pub fn attach(p: *anyopaque, streams: u32, count: usize) !void {
+     const own: *Owned = @ptrCast(@alignCast(p));
+-    if (own.pages) |old| old.destroy();
+-    own.pages = try pages.Pages.create(own.gpa, own.layout, streams, count, own.max_pages, own.window);
++    if (own.pages) |old| {
++        own.lanes.pages = null;
++        old.destroy();
++        own.pages = null;
++    }
++    const made = try pages.Pages.create(own.gpa, own.layout, streams, count, own.max_pages, own.window);
++    errdefer made.destroy();
++    if (own.up) { // the arena and tables on every rank first, then rank 0's pushes reach its own device table
++        try own.lanes.x.attach(streams, count);
++        made.tables.upload = own.e.uploadHook();
++        own.lanes.pages = made;
++        try own.lanes.x.idle(); // no stream yet: the other ranks sleep on their lines until the first
++    }
++    own.pages = made;
+ }
+ 
+ /// The prompt cache's limits from the host's plan: pages and snapshot records (0 and 0: off).
+@@ -122,10 +146,9 @@ pub fn admission(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const
+ 
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+     _ = kernels; // our own kernels: a captured set is not used
+-    _ = ctx;
+     const p = try ranks.admit(&ranks.environment);
+     var problem: []const u8 = "";
+-    _ = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
++    const set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
+         std.log.err("{s}", .{problem});
+         return err;
+     };
+@@ -143,8 +166,90 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         },
+         .ok => |cap| std.log.info("minimax budget: {d} tokens a stream, {d} pages, {d:.2} GiB of KV room (the host's plan has the last word)", .{ cap.context, cap.pages, @as(f64, @floatFromInt(cap.pool_bytes)) / (1 << 30) }),
+     };
+-    // UNEXERCISED and not written (T8): NCCL, the engine, forward, prefill, lanes backend, follower, then Loaded.
+-    return error.EngineNotBuilt;
++    // the ranks' lines before NCCL (cuda/tp_watch.zig): a rank that fails, refuses or dies stops every rank
++    if (p.world > 1) try cuda.tp_watch.start(io, p.rank, p.world);
++    return openRank(gpa, io, ctx, dir, &c, o, p, set) catch |err| {
++        cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this rank's error
++        return err;
++    };
++}
++
++/// `open` once the ranks' lines are up: NCCL, the engine and the link, then a follower's loop or rank 0's lanes.
++fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, c: *const config.Config, o: Options, p: ranks.Place, set: ranks.Settings) !Loaded {
++    const share = try shard.Share.of(c, p.rank, p.world);
++    const dims = try pool.Dims.of(c, share);
++    const cap = capacity(o.context);
++    const own = try gpa.create(Owned);
++    errdefer gpa.destroy(own);
++    own.* = .{ .gpa = gpa, .layout = dims.layout(iface.maxPages(cap)), .max_pages = iface.maxPages(cap), .io = io };
++    engine_dev.setNcclDefaults();
++    var lib = try cuda.nccl.Library.open();
++    errdefer lib.close();
++    var id: cuda.nccl.UniqueId = undefined;
++    try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId"); // NCCL_COMM_ID: the same id on every rank
++    var comm: cuda.nccl.Comm = null;
++    try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
++    own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
++    errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
++    if (p.world > 1) try engine_dev.warmPeers(ctx.d, &own.group);
++    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .settings = set });
++    errdefer own.e.deinit();
++    const stream = own.e.p.stream.?;
++    const roce_bytes = @as(usize, if (set.roce_kb == 0) 4096 else set.roce_kb) * 1024;
++    try own.group.openRoce(gpa, io, ctx.d, stream, roce_bytes); // both ranks bring it up or neither does
++    errdefer if (own.group.fast) |f| f.deinit();
++    own.e.setGroup(&own.group);
++    own.wire = try engine_dev.NcclWire.init(ctx.d, &own.group.lib, own.group.comm, stream, follow.Link.capacityFor(cap));
++    errdefer own.wire.deinit();
++    own.link = try follow.Link.init(gpa, own.wire.wire(), engine_dev.hooksWith(&own.io), cap);
++    errdefer own.link.deinit();
++    // Rank 0 admits by the smallest room of the ranks.
++    const rooms = try gpa.alloc(u64, p.world);
++    defer gpa.free(rooms);
++    const mine: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
++    try own.e.p.comm.gatherBytes(std.mem.asBytes(&mine), std.mem.sliceAsBytes(rooms));
++    var peer: ?Peer = null;
++    for (rooms[1..], 1..) |r, q| if (peer == null or r < peer.?.bytes) {
++        peer = .{ .bytes = r, .rank = q };
++    };
++    // every rank loaded and agreed (the fingerprint) before the first step; the digest names what they agreed on
++    if (p.world > 1) try cuda.tp_watch.ready(io, own.e.checkpoint_digest);
++    if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, then leaves the process
++        follow.follow(own.e, &own.link) catch |err| {
++            std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
++            std.c._exit(1); // follow told the other ranks; the stream may hold kernels waiting on a gone rank
++        };
++        std.log.info("rank {d}: rank 0 ended; leaving", .{p.rank});
++        std.process.exit(0);
++    }
++    own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
++    own.bits = .{ .gpa = gpa, .words = (c.vocab + 31) / 32 };
++    own.lanes = .{ .gpa = gpa, .x = .{ .e = own.e, .link = &own.link }, .masks = own.bits.interface() };
++    own.up = true;
++    return .{
++        .backend = own.lanes.backend(),
++        .facts = own.lanes.facts(),
++        .rows = window_rows,
++        .stream_bytes = 0, // every stream pages: its table row is the layout's fixed part
++        .free_streams = iface.decisions.free_streams,
++        .ctx = own,
++        .deinit = close,
++        .layout = own.layout,
++        .peer_room = peer,
++    };
++}
++
++fn close(ptr: *anyopaque) void {
++    const own: *Owned = @ptrCast(@alignCast(ptr));
++    own.lanes.x.end() catch {}; // the other ranks leave on the end step, so their lines close on purpose from here
++    own.lanes.deinit();
++    if (own.pages) |pg| pg.destroy();
++    own.link.deinit();
++    own.wire.deinit();
++    own.bits.deinit();
++    own.e.deinit();
++    own.group.close();
++    own.gpa.destroy(own);
+ }
+ 
+ /// The server's words for this family's refusals.
+@@ -154,6 +259,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     }
+     return switch (err) {
+         error.EngineNotBuilt => "MiniMax-M3.1-Flash is registered and its checkpoint, ranks and memory budget were checked, but this build has no forward pass for it yet (the engine, prefill and lanes backend are not in this tree)",
++        error.ForwardNotBuilt => "MiniMax-M3.1-Flash's ranks agreed and its engine loop is built, but this build has no forward or prompt pass to run on it (forward.zig and prefill.zig are not in this tree)",
++        error.VisionUnsupported => "MiniMax-M3.1-Flash on CUDA is text only: this pack has no vision tower, send the request without images",
++        error.RankLost => "another rank of MiniMax-M3.1-Flash stopped: every rank ends, start them again",
+         error.BudgetRefused => detail_buf[0..detail_len],
+         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
+         error.BadRank => "TF_MM3_WORLD is larger than the checkpoint can be cut for (4 kv heads, 128-unit widths)",
+-- 
+2.43.0
+

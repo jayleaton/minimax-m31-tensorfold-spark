@@ -1,0 +1,15 @@
+[Unit]
+Description=Lock DGX Spark GB10 SM clock cap (300-2250 MHz) for thermal margin
+Documentation=https://forums.developer.nvidia.com/t/hard-power-off-under-sustained-gpu-load-at-90w-persists-after-full-platform-firmware-update/378315
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do /usr/bin/nvidia-smi -q >/dev/null 2>&1 && exit 0; sleep 2; done; echo "GPU not ready after 120s" >&2; exit 1'
+ExecStart=/usr/bin/nvidia-smi -lgc 300,2250
+ExecStartPost=/bin/bash -c '/usr/bin/nvidia-smi --query-gpu=clocks.sm,clocks.max.sm --format=csv,noheader'
+
+[Install]
+WantedBy=multi-user.target

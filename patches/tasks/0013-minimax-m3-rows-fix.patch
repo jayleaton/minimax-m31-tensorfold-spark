@@ -1,0 +1,296 @@
+From 80c2743adff713b372075c7fe1c8e7e4b15f2581 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:48:10 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: fix the rows contract test's decode
+ aliasing, simulate the norm's sums, add mm3-contract (T8d)
+
+The spark2 failure "v was not stored as it came" at 8x32x1 was a test bug: the decode
+window put every row at position 0 (k 1) behind one shared table, so 8 CTAs wrote one
+(page, slot) and one survived. Each decode row now owns its table (row_tab) and page.
+The twin gains a test that flags the planted alias. The rows kernel does have fp32 sums
+(the norm's sum of squares), so the spec keeps accum f32 and the writer now simulates
+them for gate 4. tf-cuda-test mm3-contract runs every MiniMax kernel through gates 1-4.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+---
+ zig/tests/cuda/contract_minimax_all.zig  | 68 ++++++++++++++++++++++
+ zig/tests/cuda/contract_minimax_rows.zig | 72 +++++++++++++++++++-----
+ zig/tests/cuda/main.zig                  |  2 +
+ zig/tests/minimax_rows_tests.zig         | 19 +++++++
+ 4 files changed, 148 insertions(+), 13 deletions(-)
+ create mode 100644 zig/tests/cuda/contract_minimax_all.zig
+
+diff --git a/zig/tests/cuda/contract_minimax_all.zig b/zig/tests/cuda/contract_minimax_all.zig
+new file mode 100644
+index 0000000..3b0816b
+--- /dev/null
++++ b/zig/tests/cuda/contract_minimax_all.zig
+@@ -0,0 +1,68 @@
++//! All MiniMax kernels (act, select, attn, rows, router, proj, pick) through gates 1-4; no controls, no limits.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const act_k = @import("contract_minimax_act.zig");
++const sparse_k = @import("contract_minimax_sparse.zig");
++const rows_k = @import("contract_minimax_rows.zig");
++const proj_k = @import("contract_minimax_proj.zig");
++
++const g = core.contract.gates;
++
++pub fn run(gpu: @import("check.zig").Gpu) !void {
++    const check = @import("check.zig");
++    const a = gpu.gpa;
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var kernels: std.ArrayList(g.Kernel) = .empty;
++    defer kernels.deinit(a);
++
++    var act = try cuda.minimax_m3_act.MiniMaxAct.load(gpu.d);
++    defer act.unload();
++    var acts: [std.enums.values(act_k.Which).len]act_k.Mm3Act = undefined;
++    var n_acts: usize = 0;
++    for (std.enums.values(act_k.Which)) |w| {
++        if (act_k.control(w) != null) continue;
++        acts[n_acts] = .{ .rig = .{ .gpu = gpu, .s = s }, .which = w, .k = &act, .arena = .init(a) };
++        n_acts += 1;
++    }
++    defer for (acts[0..n_acts]) |*x| x.deinit();
++    for (acts[0..n_acts]) |*x| try kernels.append(a, x.kernel());
++
++    var sparse = try cuda.minimax_m3_sparse.Sparse.load(gpu.d);
++    defer sparse.unload();
++    var selects: [sparse_k.variants.len]sparse_k.Select = undefined;
++    for (sparse_k.variants, &selects) |v, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = &sparse, .v = v };
++    defer for (&selects) |*x| x.deinit();
++    for (&selects) |*x| try kernels.append(a, x.kernel());
++    var attns: [sparse_k.cfgs.len]sparse_k.Attn = undefined;
++    for (sparse_k.cfgs, &attns) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .s = &sparse };
++    defer for (&attns) |*x| x.deinit();
++    for (&attns) |*x| try kernels.append(a, x.kernel());
++
++    var rows = try cuda.minimax_m3_rows.Rows.load(gpu.d);
++    defer rows.unload();
++    var logits: [2]rows_k.Logits = undefined;
++    for (std.enums.values(rows_k.Form), &logits) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .k = &rows };
++    defer for (&logits) |*x| x.deinit();
++    for (&logits) |*x| try kernels.append(a, x.kernel());
++    var writers: [rows_k.cfgs.len]rows_k.Writer = undefined;
++    for (rows_k.cfgs, &writers) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .k = &rows, .arena = .init(a) };
++    defer for (&writers) |*x| x.deinit();
++    for (&writers) |*x| try kernels.append(a, x.kernel());
++
++    var proj = try cuda.minimax_m3_proj.Proj.load(gpu.d);
++    defer proj.unload();
++    var projs: [3]proj_k.Proj = undefined;
++    for (std.enums.values(proj_k.Form), &projs) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .k = &proj };
++    defer for (&projs) |*x| x.deinit();
++    for (&projs) |*x| try kernels.append(a, x.kernel());
++    var pick: proj_k.Pick = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &proj };
++    defer pick.deinit();
++    try kernels.append(a, pick.kernel());
++
++    var t: g.Tally = .{};
++    try g.runAll(a, kernels.items, 0x6d33, &t);
++    std.debug.print("SUMMARY mm3-contract {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings\n", .{ t.kernels, t.passed, t.failed, t.known });
++    try check.expect(t.failed == 0, "mm3-contract: {d} gate failures", .{t.failed});
++}
+diff --git a/zig/tests/cuda/contract_minimax_rows.zig b/zig/tests/cuda/contract_minimax_rows.zig
+index ace2d1f..b709435 100644
+--- a/zig/tests/cuda/contract_minimax_rows.zig
++++ b/zig/tests/cuda/contract_minimax_rows.zig
+@@ -1,4 +1,4 @@
+-//! MiniMax-M3.1-Flash row kernels under the contract on CUDA (compile-checked only: no GPU has run these).
++//! MiniMax-M3.1-Flash row kernels under the contract on CUDA (run on spark2, GB10 sm_121).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+@@ -7,6 +7,7 @@ const rig_ = @import("contract_rig.zig");
+ const contract = core.contract;
+ const c = contract.spec;
+ const g = contract.gates;
++const rows_ = contract.rows;
+ const Dense = contract.dense.Dense;
+ const mr = core.minimax_ref;
+ const rk = cuda.minimax_m3_rows;
+@@ -163,13 +164,16 @@ pub const Writer = struct {
+     arena: std.heap.ArenaAllocator,
+     pos: []i32 = &.{},
+     table: []i32 = &.{},
++    /// Decode: row r's table starts at r * blocks, so rows at one position own distinct pages; none for a prompt chunk.
++    row_tab: []i32 = &.{},
++    blocks: usize = 0,
+     q: []u16 = &.{},
+     kk: []u16 = &.{},
+     vv: []u16 = &.{},
+     iq: []u16 = &.{},
+     ik: []u16 = &.{},
+     w: [4][128]f32 = undefined,
+-    dev: [12]u64 = @splat(0),
++    dev: [13]u64 = @splat(0),
+     pages: usize = 0,
+ 
+     pub fn deinit(self: *Writer) void {
+@@ -204,7 +208,7 @@ pub const Writer = struct {
+         const n = shape.rows;
+         self.pos = try a.alloc(i32, n);
+         for (self.pos, 0..) |*p, i| p.* = @intCast(if (self.f.prompt) shape.k + i else if (i == n - 1) shape.k - 1 else (i * 7919) % shape.k);
+-        // blocks the rows touch, as a compact table of shuffled page ids
++        // Prompt chunk: one stream, shuffled page ids. Decode: a stream a row (row_tab), as positions repeat at k 1.
+         var lo: usize = std.math.maxInt(usize);
+         var hi: usize = 0;
+         for (self.pos) |p| {
+@@ -212,13 +216,29 @@ pub const Writer = struct {
+             hi = @max(hi, @as(usize, @intCast(p)) / geom.block);
+         }
+         const blocks = hi + 1;
+-        self.pages = (hi - lo + 1) + 2;
+-        self.table = try a.alloc(i32, blocks);
+-        @memset(self.table, -1);
+-        const perm = try a.alloc(i32, self.pages);
+-        for (perm, 0..) |*x, i| x.* = @intCast(i);
+-        rng.shuffle(i32, perm);
+-        for (lo..blocks) |b| self.table[b] = perm[b - lo];
++        self.blocks = blocks;
++        if (self.f.prompt) {
++            self.pages = (hi - lo + 1) + 2;
++            self.table = try a.alloc(i32, blocks);
++            self.row_tab = &.{};
++            @memset(self.table, -1);
++            const perm = try a.alloc(i32, self.pages);
++            for (perm, 0..) |*x, i| x.* = @intCast(i);
++            rng.shuffle(i32, perm);
++            for (lo..blocks) |b| self.table[b] = perm[b - lo];
++        } else {
++            self.pages = n + 2;
++            self.table = try a.alloc(i32, n * blocks);
++            self.row_tab = try a.alloc(i32, n);
++            @memset(self.table, -1);
++            const perm = try a.alloc(i32, self.pages);
++            for (perm, 0..) |*x, i| x.* = @intCast(i);
++            rng.shuffle(i32, perm);
++            for (self.pos, self.row_tab, 0..) |p, *t, r| {
++                t.* = @intCast(r * blocks);
++                self.table[r * blocks + @as(usize, @intCast(p)) / geom.block] = perm[r];
++            }
++        }
+         // x in [-4, 4); gate 4 (stress) uses small integers so the sum of squares is exact
+         inline for (.{ .{ "q", n * nq * 128 }, .{ "kk", n * kvh * 128 }, .{ "vv", n * kvh * 128 } }) |p| {
+             @field(self, p[0]) = try a.alloc(u16, p[1]);
+@@ -249,6 +269,7 @@ pub const Writer = struct {
+         self.dev[9] = try self.rig.output(self.iq.len * 2);
+         self.dev[10] = try self.rig.scratch(self.pages * lay);
+         self.dev[11] = try self.rig.scratch(4);
++        self.dev[12] = if (self.f.prompt) 0 else try self.rig.input(std.mem.sliceAsBytes(self.row_tab));
+         return true;
+     }
+ 
+@@ -259,12 +280,12 @@ pub const Writer = struct {
+     pub fn run(self: *Writer) !void {
+         const n = self.shape.rows;
+         const rows: cuda.minimax_m3_sparse.Rows = if (self.f.prompt) .{ .n = n, .pos0 = self.pos[0] } else .{ .n = n, .pos = self.dev[7] };
+-        const p: cuda.minimax_m3_sparse.Paged = .{ .pool = self.dev[10], .page_bytes = pool.pageBytes(), .layer_off = 0, .kvh = kvh, .tables = self.dev[6] };
++        const p: cuda.minimax_m3_sparse.Paged = .{ .pool = self.dev[10], .page_bytes = pool.pageBytes(), .layer_off = 0, .kvh = kvh, .tables = self.dev[6], .row_tab = self.dev[12] };
+         const status = self.dev[11];
+         const in: rk.Inputs = .{ .q = self.dev[0], .q_ld = nq * 128, .k = self.dev[1], .k_ld = kvh * 128, .v = self.dev[2], .v_ld = kvh * 128, .iq = self.dev[3], .iq_ld = niq * 128, .ik = self.dev[4], .ik_ld = 128 };
+         const nm: rk.Norms = .{ .q = self.dev[5], .k = self.dev[5] + 512, .iq = self.dev[5] + 1024, .ik = self.dev[5] + 1536 };
+         const out: rk.Outputs = .{ .q = self.dev[8], .q_ld = nq * 128, .iq = self.dev[9], .iq_ld = niq * 128 };
+-        try self.k.qkRope(self.rig.s, .{}, self.opts(), in, nm, out, rows, p, @intCast(self.table.len), status);
++        try self.k.qkRope(self.rig.s, .{}, self.opts(), in, nm, out, rows, p, @intCast(self.blocks), status);
+         try self.rig.s.synchronize();
+     }
+ 
+@@ -289,6 +310,31 @@ pub const Writer = struct {
+         for (m, n, 0..) |*o, v, d| o.* = if (d < 32) @abs(n[d]) + @abs(n[d + 32]) else if (d < 64) @abs(n[d]) + @abs(n[d - 32]) else @abs(v);
+     }
+ 
++    /// The scratch outputs if each norm's sum of squares (the kernel's only sums) ran in `acc` in `order`.
++    pub fn simulate(self: *Writer, acc: c.Accum, order: g.Order, out: []f64) !void {
++        for (0..self.shape.rows) |r| {
++            for (0..nq + niq) |h| {
++                const kind: usize = if (h < nq) 0 else 1;
++                const i = if (h < nq) h else h - nq;
++                const p: usize = @intCast(self.pos[r]);
++                const src = if (kind == 0) self.q[(r * nq + i) * 128 ..][0..128] else self.iq[(r * niq + i) * 128 ..][0..128];
++                var x: [128]f64 = undefined;
++                var sq: [128]f64 = undefined;
++                for (&x, &sq, src) |*o, *t, s| {
++                    o.* = if (kind == 0) c.fromBf16(s) else fp16v(s);
++                    t.* = o.* * o.*;
++                }
++                const ss = rows_.sumIn(acc, order, &sq);
++                const inv = 1 / @sqrt(ss / 128 + 1e-6);
++                var y: [128]f64 = undefined;
++                for (&y, x, self.w[kind * 2][0..]) |*o, v, wv| o.* = v * inv * wv;
++                mr.rope(&y, 64, p, 1e7, .neox_half);
++                const at = if (kind == 0) (r * nq + i) * 128 else self.q.len + (r * niq + i) * 128;
++                @memcpy(out[at..][0..128], &y);
++            }
++        }
++    }
++
+     pub fn reference(self: *Writer, want: []f64, mag: []f64) !void {
+         var y: [128]f64 = undefined;
+         var m: [128]f64 = undefined;
+@@ -319,7 +365,7 @@ pub const Writer = struct {
+         @memset(touched, false);
+         for (0..self.shape.rows) |r| {
+             const p: usize = @intCast(self.pos[r]);
+-            const page: usize = @intCast(self.table[p / geom.block]);
++            const page: usize = @intCast(self.table[(if (self.f.prompt) 0 else r * self.blocks) + p / geom.block]);
+             const t = p % geom.block;
+             for (0..kvh) |h| {
+                 const k0 = pool.kv(page, 0, 0, h, t) / 2;
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 505ee05..8ed2414 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -198,6 +198,7 @@ const usage =
+     \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
+     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
+     \\  mm3-proj-contract         MiniMax-M3.1-Flash index projection and pick kernels alone through gates 1-4 (no controls, no limits)
++    \\  mm3-contract              every MiniMax-M3.1-Flash kernel (act, select, attn, rows, router, proj, pick) through gates 1-4 (no controls, no limits)
+     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
+     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
+     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
+@@ -378,6 +379,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "kernel-contract")) return contract_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "mm3-proj-contract")) return @import("contract_minimax_proj.zig").run(gpu);
++    if (std.mem.eql(u8, cmd, "mm3-contract")) return @import("contract_minimax_all.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
+diff --git a/zig/tests/minimax_rows_tests.zig b/zig/tests/minimax_rows_tests.zig
+index 04dce98..eb93cf5 100644
+--- a/zig/tests/minimax_rows_tests.zig
++++ b/zig/tests/minimax_rows_tests.zig
+@@ -399,6 +399,25 @@ test "writer mutants: each planted fault fails the reference check the real twin
+     }
+ }
+ 
++test "rows aliasing one (page, slot) cannot all be checked: the check flags the planted alias, distinct streams pass" {
++    // The GPU contract once put 8 decode rows at position 0 behind one table: one slot, one survivor; see it.
++    var prng = std.Random.DefaultPrng.init(26);
++    const rng = prng.random();
++    const pos = [_]i32{ 0, 0 };
++    var f = try Fix.init(rng, 2, true);
++    defer f.deinit();
++    const alias = [_]i32{ 0, 0 };
++    _ = twin.call(2, f.h, .{}, f.inputs(), &f.nm, f.target(&alias, &pos, 0), .none);
++    try testing.expect(!okCall(&f, .{}, &pos, &alias));
++    // the same positions in two streams (two tables, two pages): each row's cells are its own
++    var h = try Fix.init(rng, 2, true);
++    defer h.deinit();
++    const own = [_]i32{ 0, fx_pages };
++    h.tables[fx_pages] = if (h.tables[0] == 0) 1 else 0;
++    _ = twin.call(2, h.h, .{}, h.inputs(), &h.nm, h.target(&own, &pos, 0), .none);
++    try testing.expect(okCall(&h, .{}, &pos, &own));
++}
++
+ test "angles: float64 sincos rounded once; an fp32 angle is off by whole bf16 steps at a million positions" {
+     const pos = 1_048_573;
+     var worst: f64 = 0;
+-- 
+2.43.0
+

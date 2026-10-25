@@ -1,0 +1,6 @@
+# Path globs that must never be in engine/patches (one per line): scripts/export-engine.sh fails when the exported tree
+# changes or adds a file matching one, instead of shipping it.
+#
+# Files copied from a third party whose terms do not allow redistributing them: the DFlash2 draft for this model whose
+# card declares no licence (the engine tests use a synthetic config, fixtures/dflash2_minimax_layout.json, instead).
+**/*radixark*

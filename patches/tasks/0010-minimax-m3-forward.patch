@@ -1,0 +1,1513 @@
+From 97496fe3a578a63c45f10be0c2aa9062dc61a06c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 12:41:14 +0300
+Subject: [PATCH] MiniMax-M3.1-Flash: device forward, launch planner and prompt
+ driver (T8a)
+
+forward_plan.zig writes one step's launch sequence as data (embed, 60 layers of
+attention and dense or MoE FFN with the TP exchanges, head); forward_exec.zig
+launches it through the existing exl3, norms, rows, sparse, act and rank_scatter
+wrappers; forward.zig is the call API; prefill.zig is the chunk, mark and resume
+driver. Host tests check the op order against the T0 model, the widths 1, 2, 3,
+16, 17, 64, 128, dataflow and rank agreement. Step test-minimax-forward.
+Never run on a GPU. Missing: the fp16 index projection kernel (see docs).
+
+Claude-Session: https://claude.ai/code/session_01QguKy82jHfqdgzDsrrC5xs
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/interface-decisions.md                  |  49 +-
+ zig/build/minimax_family.zig                 |  10 +
+ zig/src/families/minimax_m3/forward.zig      | 112 ++++
+ zig/src/families/minimax_m3/forward_exec.zig | 312 +++++++++++
+ zig/src/families/minimax_m3/forward_plan.zig | 365 +++++++++++++
+ zig/src/families/minimax_m3/forward_test.zig | 511 +++++++++++++++++++
+ zig/src/families/minimax_m3/prefill.zig      |  70 +++
+ 7 files changed, 1428 insertions(+), 1 deletion(-)
+ create mode 100644 zig/src/families/minimax_m3/forward.zig
+ create mode 100644 zig/src/families/minimax_m3/forward_exec.zig
+ create mode 100644 zig/src/families/minimax_m3/forward_plan.zig
+ create mode 100644 zig/src/families/minimax_m3/forward_test.zig
+ create mode 100644 zig/src/families/minimax_m3/prefill.zig
+
+diff --git a/docs/interface-decisions.md b/docs/interface-decisions.md
+index 076c66d..8ae1e42 100644
+--- a/docs/interface-decisions.md
++++ b/docs/interface-decisions.md
+@@ -57,4 +57,51 @@ structured output #1017, tool calls #1018) with BobClawblaw (rank watch #855, #9
+ cut #593). The backend-owned radix prompt cache the decision M2 builds on is BlivionIaG's and ThinkOffApp's HIP work
+ (#625, #626) with jschmied and BobClawblaw. The EXL3 operators `weights.zig` describes records for are vcruz305's EXL3
+ module (#42) inside TensorFold, with justincasey and BHCC2025, and turboderp's exllamav3 format. Ash Hart (ashhart)
+-and the TensorFold contributors wrote the rest of the tree this builds on.
++and the TensorFold contributors wrote the rest of the tree this builds on. The forward and prompt driver of T8a take the
++shape of v1.1.2's `glm/cuda_forward.zig` and `Engine.prefillChunk` (Bizuayeu, BobClawblaw and the contributors named above)
++and call the EXL3 linear and grouped-expert wrappers (vcruz305's EXL3 module #42 inside TensorFold) as that file does.
++
++## T8a requests
++
++`iface.zig` is unchanged. The forward (`forward.zig`, `forward_plan.zig`, `forward_exec.zig`) and the prompt driver
++(`prefill.zig`) are written against it. What T8a needs from other tasks, and what it chose where the plan says UNVERIFIED:
++
++- Missing kernel, fp16 index projection. `index_q_proj` (fp16 [256, 6144] a rank) and `index_k_proj` (fp16 [128, 6144],
++  replicated) have no GEMV in the tree (`dense_rows.cu` takes bf16 weights; `tf_mm3_rows` only norms and rotates the
++  result). The planner emits `index_proj {layer, rows}` (reads `a`, writes `iq_raw`, `ik_raw`, fp16, `index_fp16` flag on)
++  and `Device.emit` returns `error.NoIndexProjKernel` until a kernel exists. A forward cannot run without it.
++- Missing kernel, per-rank (logit, id) pick. `Head.mode = .picks` plans `local_pick` and `pick_gather`; the device returns
++  `error.NoPickKernel`. The padded logits gather (`.gather`, `tp.LogitsGather` layout `[rank][row][slot]`) is complete, so
++  the engine (T8b) draws from `Forward.address(out)` with `Sampler.draw` over `shard.Share.vocab` spans, or merges picks.
++- For T8b (engine, follower, backend): the engine owns the `Pages` (pool base, `rk.Mirror`, `rk.Cache`), the `Modules`,
++  the `Buffers` and the `Link` (group, NCCL library and communicator); `Forward.run(Call)` queues one step on the stream
++  and returns the head's layout. A follower runs the same `Call` on its rank: both ranks plan the identical op sequence
++  (tested), which is what keeps the NCCL calls in step. `prefill.zig` is generic over a `host` with `capacity`, `gate`,
++  `chunk`, `first` and `advance`; Engine.prefill and prefillChunk are a line each over it. Add `forward.zig` and
++  `prefill.zig` to `cuda.zig`'s re-exports and test block (not done here: T8b edits that file).
++- Chunking choice (not in the plan): a prompt pass splits chunks at rank 0's marks as well as at 2,048 rows, so every
++  chunk starts on a page and a mark is always a chunk start. `prefillChunk` takes `part` as exactly the chunk's rows, or
++  2,049 ids (a full chunk plus the next id, GLM's follower form); a non-final chunk must be whole pages.
++
++### UNVERIFIED semantics chosen
++
++- R1, residual stream: fp32 (`res`), the T0 default (`bf16_residual` false). Each block's output is the fp32 rank-order sum;
++  `norm_add` adds it into `res` and norms into bf16 `a` in one launch (`Norms.addRms`, folded `1 + w` weights). A bf16
++  residual would round at every add; if upstream does, the stream and the `norm_add` kernel change together.
++- R2, routed plus shared: `Experts.run` writes the routed fp32 rows, the shared down projection writes its own, and
++  `tf_rank_sum` with world 2 and me 1 adds them (`routed + shared`, one rounded fp32 add, no fma) into the partial that
++  the one FFN exchange carries. The routed scale 2.0 is inside the router kernel (`ffn.routePlan` default); the planner
++  assumes `post_scale` 1 (the frozen default switches).
++- R3, prompt experts: chunks run the decode grouped kernel in calls of 256 rows (`plan.expert_rows`, ~125 MB of scratch);
++  the x3gm prompt path is not wired. Prompt dense layers run `Dense.prompt` (128-row blocks of the decode kernel).
++- R4, the head computes the final norm for every row of a chunk although only the last row is read.
++- R5, index heads: `index_proj` is planned before `qk_rope` (which consumes it); T0 computes the index projection after
++  the main norm and rope, which reads only `a`, so the order of the two does not change a value.
++
++### Later step (speed), deliberately not done
++
++Tensor-core prompt attention and scoring (speed-borrow-glm C1), RoCE small gathers and L2 prefetch beside the exchanges
++(C2; `Group.allGather` already uses RoCE when the engine opened it), overlapped or row-split exchanges and expert chunk
++sizing (C4), the shared expert on a side stream and launch order (C6), mul1 prompt kernels and x3seg decode kernels from
++DeepSeek (candidates 1 and 2), CUDA graphs and keyed round graphs (candidate 6). Each needs a GPU gate first; the
++planner's op list is the place to fuse or reorder them, and its tests must keep passing.
+diff --git a/zig/build/minimax_family.zig b/zig/build/minimax_family.zig
+index cd0bdb7..8748617 100644
+--- a/zig/build/minimax_family.zig
++++ b/zig/build/minimax_family.zig
+@@ -34,7 +34,17 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod
+     @import("minimax_ref_host.zig").ffn(b, host, core, cuda, umbrella);
+     @import("minimax_ref_host.zig").rows(b, host, core, cuda, umbrella);
+     @import("minimax_host.zig").steps(b, host, api, tokenizer, template, server_add, umbrella);
++    forward(b, host, cuda, core, lanes, api, umbrella);
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug)) }));
+     b.step("test-minimax-engine-host", "MiniMax-M3.1-Flash interface, weights descriptors, page state and native host half without a GPU").dependOn(&run.step);
+     umbrella.dependOn(&run.step);
+ }
++
++/// The forward planner, the device executor's compile check and the prompt driver (forward.zig), host only.
++fn forward(b: *std.Build, host: std.Build.ResolvedTarget, cuda: Mod, core: Mod, lanes: Mod, api: Mod, umbrella: *std.Build.Step) void {
++    const m = module(b, host, .debug, cuda, core, lanes, api, canonModule(b, host, .debug));
++    m.root_source_file = b.path("zig/src/families/minimax_m3/forward.zig");
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
++    b.step("test-minimax-forward", "MiniMax-M3.1-Flash forward launch plan, op order, widths and prompt chunks without a GPU").dependOn(&run.step);
++    umbrella.dependOn(&run.step);
++}
+diff --git a/zig/src/families/minimax_m3/forward.zig b/zig/src/families/minimax_m3/forward.zig
+new file mode 100644
+index 0000000..d0e9477
+--- /dev/null
++++ b/zig/src/families/minimax_m3/forward.zig
+@@ -0,0 +1,112 @@
++//! MiniMax-M3.1-Flash's forward on CUDA (plan T8a): decode, verify and shared windows, prompt chunks; UNEXERCISED.
++const std = @import("std");
++const cuda = @import("cuda");
++const plan = @import("forward_plan.zig");
++const exec = @import("forward_exec.zig");
++const iface = @import("iface.zig");
++const weights = @import("weights.zig");
++const rows_cfg = @import("rows.zig");
++const Config = @import("config.zig").Config;
++const rk = cuda.minimax_m3_rows;
++
++pub const Geometry = plan.Geometry;
++pub const Modules = exec.Modules;
++pub const Buffers = exec.Buffers;
++pub const Link = exec.Link;
++pub const Pages = exec.Pages;
++pub const Head = plan.Head;
++pub const HeadMode = plan.HeadMode;
++pub const Error = error{ BadCall, BadCommit };
++
++/// One forward call: the ids of its rows and where they sit.
++pub const Call = struct {
++    ids: []const i32,
++    slot: u32 = 0, // one stream: its slot, the position of its first row
++    pos0: u32 = 0,
++    segs: []const iface.Seg = &.{}, // several streams' windows, rows in order (empty: one stream)
++    positions: []const i32 = &.{}, // shared: the position of every row
++    prompt: bool = false, // a prompt chunk: prompt kernels, one row of logits at most
++    head: Head = .all,
++    mode: HeadMode = .gather,
++};
++
++/// Where a call left the head: `rows` rows of logits ([rank][row][slot] fp32 once gathered) or (logit, id) pairs.
++pub const Out = struct { rows: u32, slot: u32, world: u32, picks: bool };
++
++fn maxOf(xs: []const i32) u32 {
++    var m: i32 = 0;
++    for (xs) |x| m = @max(m, x);
++    return @intCast(m);
++}
++
++pub const Forward = struct {
++    dev: exec.Device,
++    tab: []i32, // host copy of a shared window's per-row table offsets
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, st: cuda.Stream, m: *Modules, w: *const weights.Weights, g: *const Geometry, b: *Buffers, pages: Pages, link: ?Link) !Forward {
++        const c = g.cfg;
++        const o = try rows_cfg.opts(.{}, .{ .rot = c.rotary_dim, .theta = c.rope_theta, .eps = c.eps }, .folded, .folded, true);
++        return .{
++            .dev = .{ .d = d, .st = st, .m = m, .w = w, .g = g, .b = b, .pages = pages, .link = link, .opts = o },
++            .tab = try gpa.alloc(i32, iface.shared_rows),
++        };
++    }
++
++    pub fn deinit(f: *Forward, gpa: std.mem.Allocator) void {
++        gpa.free(f.tab);
++        f.* = undefined;
++    }
++
++    /// The call's Shape: rows, kind and the largest position the scoring grid must cover.
++    pub fn shape(c: Call) Error!plan.Shape {
++        const n: u32 = @intCast(c.ids.len);
++        const shared = c.segs.len > 0;
++        if (n == 0 or (shared and (c.prompt or c.positions.len != n))) return error.BadCall;
++        var rows: u32 = 0;
++        for (c.segs) |s| rows += s.rows;
++        if (shared and rows != n) return error.BadCall;
++        const last = if (shared) maxOf(c.positions) else c.pos0 + n - 1;
++        return .{ .rows = n, .prompt = c.prompt, .shared = shared, .max_pos = last, .head = c.head, .mode = c.mode };
++    }
++
++    /// The ids (and a shared window's positions and table offsets) go to the device; the ops are queued on the stream.
++    pub fn run(f: *Forward, c: Call) !Out {
++        const sh = try shape(c);
++        const dev = &f.dev;
++        const b = dev.b;
++        dev.pages.slot = c.slot;
++        dev.pages.pos0 = c.pos0;
++        try cuda.copy_source.enqueue(dev.d, b.ptr(.ids), std.mem.sliceAsBytes(c.ids), dev.st);
++        if (sh.shared) {
++            if (c.segs.len > iface.max_shared) return error.BadCall;
++            var segs: [iface.max_shared]rk.geom.Seg = undefined;
++            for (c.segs, segs[0..c.segs.len]) |s, *o| o.* = .{ .slot = s.slot, .rows = s.rows };
++            try dev.pages.mirror.setRows(dev.st, f.tab[0..sh.rows], segs[0..c.segs.len]);
++            try cuda.copy_source.enqueue(dev.d, b.ptr(.pos), std.mem.sliceAsBytes(c.positions), dev.st);
++        }
++        try plan.plan(dev.g, sh, dev);
++        return out(dev.g, sh);
++    }
++
++    /// Where `sh`'s head left its rows.
++    pub fn out(g: *const Geometry, sh: plan.Shape) Out {
++        const n: u32 = if (sh.head == .all) sh.rows else 1;
++        return .{ .rows = if (sh.head == .none) 0 else n, .slot = g.slot, .world = g.world, .picks = sh.mode == .picks };
++    }
++
++    /// The device address of the head's result for `o` (a call's `Out` carries the layout, not the address).
++    pub fn address(f: *const Forward, o: Out) u64 {
++        const id: plan.Buf = if (o.picks) (if (o.world > 1) .pairs_all else .pairs) else (if (o.world > 1) .hgather else .hlog);
++        return f.dev.b.ptr(id);
++    }
++
++    /// The next position after keeping `keep` of a window's rows (later rows are overwritten, no state rolls back).
++    pub fn commit(pos: usize, rows: usize, keep: usize, prompt: bool) Error!usize {
++        if (keep == 0 or keep > rows or (prompt and keep != rows)) return error.BadCommit;
++        return pos + keep;
++    }
++};
++
++test {
++    _ = @import("forward_test.zig");
++}
+diff --git a/zig/src/families/minimax_m3/forward_exec.zig b/zig/src/families/minimax_m3/forward_exec.zig
+new file mode 100644
+index 0000000..33e8411
+--- /dev/null
++++ b/zig/src/families/minimax_m3/forward_exec.zig
+@@ -0,0 +1,312 @@
++//! The device half of a forward step: kernels, buffers and `Device.emit`; UNEXERCISED (compiled, never launched).
++const std = @import("std");
++const cuda = @import("cuda");
++const plan = @import("forward_plan.zig");
++const weights = @import("weights.zig");
++const ffn = @import("ffn.zig");
++const rows_cfg = @import("rows.zig");
++const sparse = cuda.minimax_m3_sparse;
++const rk = cuda.minimax_m3_rows;
++const Op = plan.Op;
++const Buf = plan.Buf;
++const Ref = plan.Ref;
++
++pub const Error = error{ NoIndexProjKernel, NoPickKernel, NoLink, BadOp };
++
++/// Every kernel module a step launches from.
++pub const Modules = struct {
++    dense: cuda.exl3.Dense,
++    experts: cuda.exl3_experts.Experts,
++    norms: cuda.norms.Norms,
++    embed: cuda.embed_rows.EmbedRows,
++    act: cuda.minimax_m3_act.MiniMaxAct,
++    rows: rk.Rows,
++    sparse: sparse.Sparse,
++    scatter: cuda.rank_scatter.RankScatter,
++
++    pub fn load(d: *const cuda.Driver) !Modules {
++        var m: Modules = undefined;
++        m.dense = try cuda.exl3.Dense.load(d);
++        errdefer m.dense.unload();
++        m.experts = try cuda.exl3_experts.Experts.load(d);
++        errdefer m.experts.unload();
++        m.norms = try cuda.norms.Norms.load(d);
++        errdefer m.norms.unload();
++        m.embed = try cuda.embed_rows.EmbedRows.load(d);
++        errdefer m.embed.unload();
++        m.act = try cuda.minimax_m3_act.MiniMaxAct.load(d);
++        errdefer m.act.unload();
++        m.rows = try rk.Rows.load(d);
++        errdefer m.rows.unload();
++        m.sparse = try sparse.Sparse.load(d);
++        errdefer m.sparse.unload();
++        m.scatter = try cuda.rank_scatter.RankScatter.load(d);
++        return m;
++    }
++
++    pub fn deinit(m: *Modules) void {
++        m.scatter.unload();
++        m.sparse.unload();
++        m.rows.unload();
++        m.act.unload();
++        m.embed.unload();
++        m.norms.unload();
++        m.experts.unload();
++        m.dense.unload();
++        m.* = undefined;
++    }
++};
++
++/// How the two ranks meet: the group's all-gather, and NCCL for the row-share form of a prompt chunk's sum.
++pub const Link = struct { group: *const cuda.tp_group.Group, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm };
++
++/// The routed experts' layer shape, for sizing the scratch before any weights exist.
++fn shapeLayer(g: *const plan.Geometry) cuda.exl3_experts.Layer {
++    return .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .experts = g.experts, .dims = g.hidden, .width = g.moe_w, .codebook = .mul1 };
++}
++
++/// Rows of one rank's share of `rows` rows, at most (the padded slot of the share form).
++fn shareRows(rows: usize, world: usize) usize {
++    return (rows + world - 1) / world;
++}
++
++/// Buffers that are not rows of a step: scratch of the kernels and the exchange.
++pub const Extra = enum { experts, gathered, scatter, share, shares, bmax, sel, status };
++
++pub const Buffers = struct {
++    mem: [plan.bufs.len + std.enums.values(Extra).len]cuda.DeviceBuffer,
++    n: usize,
++    bm_stride: usize,
++
++    fn take(b: *Buffers, d: *const cuda.Driver, bytes: usize) !void {
++        b.mem[b.n] = try cuda.DeviceBuffer.alloc(d, bytes);
++        b.n += 1;
++    }
++
++    pub fn init(d: *const cuda.Driver, g: *const plan.Geometry, bm_stride: usize) !Buffers {
++        var b: Buffers = .{ .mem = undefined, .n = 0, .bm_stride = bm_stride };
++        errdefer b.deinit();
++        for (plan.bufs) |id| try b.take(d, g.rowBytes(id) * g.capacity(id));
++        const world: usize = g.world;
++        const slot_rows = shareRows(g.max_rows, world);
++        const experts = try cuda.exl3_experts.scratchBytes(shapeLayer(g), plan.expert_rows, g.topk);
++        const wide: usize = @min(g.max_rows, 128);
++        try b.take(d, experts);
++        try b.take(d, world * wide * g.hidden * 4);
++        try b.take(d, world * slot_rows * g.hidden * 4);
++        try b.take(d, slot_rows * g.hidden * 4);
++        try b.take(d, world * slot_rows * g.hidden * 4);
++        try b.take(d, @as(usize, g.max_rows) * g.kvh * bm_stride * 4);
++        try b.take(d, @as(usize, g.max_rows) * g.kvh * 16 * 4);
++        try b.take(d, 4);
++        return b;
++    }
++
++    pub fn deinit(b: *Buffers) void {
++        for (b.mem[0..b.n]) |*m| m.free();
++        b.n = 0;
++    }
++
++    pub fn ptr(b: *const Buffers, id: Buf) u64 {
++        return b.mem[@backingInt(id)].ptr;
++    }
++
++    pub fn extra(b: *const Buffers, e: Extra) *const cuda.DeviceBuffer {
++        return &b.mem[plan.bufs.len + @backingInt(e)];
++    }
++
++    pub fn scratch(b: *const Buffers) sparse.Scratch {
++        return .{ .bmax = b.extra(.bmax).ptr, .sel = b.extra(.sel).ptr, .bm_stride = b.bm_stride };
++    }
++};
++
++/// The pool the paged kernels address (the engine's arena), and where this call's block tables are.
++pub const Pages = struct { cache: rk.Cache, layer_bytes: u64, mirror: *rk.Mirror, slot: u32 = 0, pos0: u32 = 0 };
++
++pub const Device = struct {
++    d: *const cuda.Driver,
++    st: cuda.Stream,
++    m: *Modules,
++    w: *const weights.Weights,
++    g: *const plan.Geometry,
++    b: *Buffers,
++    pages: Pages,
++    link: ?Link,
++    opts: rk.Opts,
++    sw: ffn.Switches = .{},
++    shared: bool = false, // this call's rows carry their own positions and table offsets
++
++    fn at(dv: *const Device, r: Ref) u64 {
++        return dv.b.ptr(r.buf) + @as(u64, r.row) * dv.g.rowBytes(r.buf);
++    }
++
++    fn layer(dv: *const Device, l: u32) *const weights.Layer {
++        return &dv.w.layers[l];
++    }
++
++    fn paged(dv: *const Device, l: u32) !sparse.Paged {
++        var c = dv.pages.cache;
++        c.layer_off = @as(u64, l) * dv.pages.layer_bytes;
++        return if (dv.shared) dv.pages.mirror.shared(c) else try dv.pages.mirror.single(c, dv.pages.slot);
++    }
++
++    fn rowsOf(dv: *const Device, n: u32) sparse.Rows {
++        return if (dv.shared) .{ .n = n, .pos = dv.b.ptr(.pos) } else .{ .n = n, .pos0 = @intCast(dv.pages.pos0) };
++    }
++
++    fn zeroBytes(dv: *const Device, p: u64, bytes: usize) !void {
++        try dv.d.check(dv.d.api.cuMemsetD8Async(p, 0, bytes, dv.st.handle), "cuMemsetD8Async");
++    }
++
++    fn copy(dv: *const Device, dst: u64, src: u64, bytes: usize) !void {
++        try dv.d.check(dv.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, dv.st.handle), "cuMemcpyDtoDAsync");
++    }
++
++    fn weightOf(dv: *const Device, w: plan.Lin, l: u32) cuda.exl3.Weight {
++        const ly = dv.layer(l);
++        return switch (w) {
++            .q => ly.q,
++            .k => ly.k,
++            .v => ly.v,
++            .o => ly.o,
++            .dense_gate => ly.ffn.dense.gate,
++            .dense_up => ly.ffn.dense.up,
++            .dense_down => ly.ffn.dense.down,
++            .shared_gate => ly.ffn.moe.shared.gate,
++            .shared_up => ly.ffn.moe.shared.up,
++            .shared_down => ly.ffn.moe.shared.down,
++            .head => dv.w.head,
++        };
++    }
++
++    fn normOf(dv: *const Device, n: plan.Norm, l: u32) u64 {
++        return switch (n) {
++            .input => dv.layer(l).input_ln,
++            .post => dv.layer(l).post_ln,
++            .final => dv.w.final_norm,
++        };
++    }
++
++    /// Launches one op on the stream.
++    pub fn emit(dv: *Device, op: Op) !void {
++        const s = dv.st;
++        const m = dv.m;
++        const hidden = dv.g.hidden;
++        switch (op) {
++            .stage => |o| {
++                dv.shared = o.shared;
++                try dv.zeroBytes(dv.b.extra(.status).ptr, 4);
++            },
++            .embed => |o| try m.embed.bf16(s, dv.b.ptr(.ids), dv.w.embed, dv.b.ptr(.emb), o.rows, hidden),
++            .zero => |o| try dv.zeroBytes(dv.b.ptr(o.buf), @as(usize, o.rows) * dv.g.rowBytes(o.buf)),
++            .norm_add => |o| {
++                const kind: cuda.norms.Kind = if (o.x_f32) .f32 else .bf16;
++                const wt = dv.normOf(o.norm, o.layer);
++                try m.norms.addRms(s, dv.at(o.x), kind, dv.b.ptr(.res), null, wt, dv.at(o.y), .bf16, o.rows, hidden, dv.g.cfg.eps);
++            },
++            .linear => |o| {
++                const w = dv.weightOf(o.w, o.layer);
++                const wide = o.w == .o or o.w == .dense_down or o.w == .shared_down or o.w == .head;
++                const ydt: cuda.exl3.DType = if (wide) .f32 else .bf16;
++                if (o.prompt) {
++                    try m.dense.prompt(s, w, dv.at(o.x), .bf16, o.rows, dv.at(o.y), ydt);
++                } else try m.dense.decode(s, w, dv.at(o.x), .bf16, o.rows, dv.at(o.y), ydt);
++            },
++            .index_proj => return error.NoIndexProjKernel,
++            .qk_rope => |o| try dv.qkRope(o.layer, o.rows),
++            .score => |o| {
++                const scale: f32 = @floatCast(std.math.pow(f64, 128, -0.5));
++                try m.sparse.score(s, dv.b.ptr(.iqn), dv.rowsOf(o.rows), try dv.paged(o.layer), dv.b.scratch(), o.max_pos, scale);
++            },
++            .select => |o| try m.sparse.select(s, dv.rowsOf(o.rows), dv.g.kvh, dv.b.scratch(), .{}),
++            .attend => |o| {
++                const scale: f32 = @floatCast(std.math.pow(f64, 128, -0.5));
++                try m.sparse.attend(s, dv.b.ptr(.qn), dv.rowsOf(o.rows), try dv.paged(o.layer), dv.b.scratch(), dv.b.ptr(.attn), scale);
++            },
++            .router => |o| try m.rows.routerLogits(s, rows_cfg.router, dv.b.ptr(.a), hidden, false, dv.layer(o.layer).ffn.moe.router, dv.b.ptr(.logits_r), o.rows),
++            .route => |o| {
++                const moe = dv.layer(o.layer).ffn.moe;
++                const rp = try ffn.routePlan(dv.sw);
++                try m.act.route(s, dv.b.ptr(.logits_r), moe.bias, rp.route, dv.b.ptr(.pick), dv.b.ptr(.wts), o.rows);
++            },
++            .experts => |o| {
++                const l = dv.layer(o.layer).ffn.moe.experts;
++                const sc = try cuda.exl3_experts.scratch(dv.b.extra(.experts).ptr, l, plan.expert_rows, dv.g.topk);
++                const x = dv.at(.{ .buf = .a, .row = o.row0 });
++                const pick = dv.at(.{ .buf = .pick, .row = o.row0 });
++                const wts = dv.at(.{ .buf = .wts, .row = o.row0 });
++                try m.experts.run(s, l, x, hidden, .bf16, pick, wts, o.rows, dv.at(.{ .buf = .routed, .row = o.row0 }), sc);
++            },
++            .swiglu => |o| {
++                const p = ffn.actParams(dv.sw);
++                const ld: usize = o.n;
++                try m.act.swigluoai(s, .bf16, dv.b.ptr(.gate), ld, dv.b.ptr(.up), ld, dv.b.ptr(.act), ld, o.rows, o.n, p);
++            },
++            .add2 => |o| {
++                // tf_rank_sum as a two-term fp32 add: peers slot 0 is `a`, own (rank 1) is `b`, one rounded add each
++                try m.scatter.rankSum(s, dv.b.ptr(o.a), dv.b.ptr(o.b), 2, 1, @as(usize, o.rows) * hidden, dv.b.ptr(o.out));
++            },
++            .exchange => |o| try dv.sum(o),
++            .logits_gather => |o| {
++                const link = dv.link orelse return error.NoLink;
++                const bytes = @as(usize, o.rows) * dv.g.slot * 4;
++                try link.group.allGather(s, dv.b.ptr(.hlog), dv.b.ptr(.hgather), bytes);
++            },
++            .local_pick, .pick_gather => return error.NoPickKernel,
++        }
++    }
++
++    fn qkRope(dv: *const Device, l: u32, n: u32) !void {
++        const ly = dv.layer(l);
++        const g = dv.g;
++        const heads: rk.Heads = .{ .nq = g.nq, .niq = g.niq, .kvh = g.kvh, .index_key = true };
++        const b = dv.b;
++        const in: rk.Inputs = .{
++            .q = b.ptr(.q),
++            .q_ld = g.q_w,
++            .k = b.ptr(.k),
++            .k_ld = g.kv_w,
++            .v = b.ptr(.v),
++            .v_ld = g.kv_w,
++            .iq = b.ptr(.iq_raw),
++            .iq_ld = g.iq_w,
++            .ik = b.ptr(.ik_raw),
++            .ik_ld = g.ik_w,
++        };
++        const nm: rk.Norms = .{ .q = ly.q_norm, .k = ly.k_norm, .iq = ly.index_q_norm, .ik = ly.index_k_norm };
++        const out: rk.Outputs = .{ .q = b.ptr(.qn), .q_ld = g.q_w, .iq = b.ptr(.iqn), .iq_ld = g.iq_w };
++        const pg = try dv.paged(l);
++        try dv.m.rows.qkRope(dv.st, heads, dv.opts, in, nm, out, dv.rowsOf(n), pg, @intCast(dv.pages.mirror.max_pages), b.extra(.status).ptr);
++    }
++
++    /// A block's partial sums added in rank order into `dst` on every rank, in tp.zig's gather or share form.
++    fn sum(dv: *const Device, o: anytype) !void {
++        const link = dv.link orelse return error.NoLink;
++        const g = dv.g;
++        const world: usize = g.world;
++        const rank: usize = g.rank;
++        const width: usize = g.hidden;
++        const rows: usize = o.rows;
++        if (o.form == .gather_sum) {
++            const slot = rows * width * 4;
++            try link.group.allGather(dv.st, dv.b.ptr(o.src), dv.b.extra(.gathered).ptr, slot);
++            return dv.m.scatter.rankSum(dv.st, dv.b.extra(.gathered).ptr, dv.b.ptr(o.src), world, rank, rows * width, dv.b.ptr(o.dst));
++        }
++        const slot = shareRows(rows, world) * width * 4;
++        try dv.m.scatter.run(link.lib, link.comm, world, rank, dv.st, dv.b.ptr(o.src), rows, width, dv.b.extra(.scatter).ptr, dv.b.extra(.share).ptr);
++        try link.group.allGather(dv.st, dv.b.extra(.share).ptr, dv.b.extra(.shares).ptr, slot);
++        for (0..world) |r| {
++            const rs = cuda.rank_scatter.share(rows, world, r);
++            const bytes = (rs[1] - rs[0]) * width * 4;
++            if (bytes > 0) try dv.copy(dv.b.ptr(o.dst) + rs[0] * width * 4, dv.b.extra(.shares).ptr + r * slot, bytes);
++        }
++    }
++
++    /// After the step: a launch that found no page for a row left bits in the status word.
++    pub fn status(dv: *const Device) !i32 {
++        var out: [4]u8 = undefined;
++        try dv.b.extra(.status).download(0, &out);
++        try dv.st.synchronize();
++        return std.mem.readInt(i32, &out, .little);
++    }
++};
+diff --git a/zig/src/families/minimax_m3/forward_plan.zig b/zig/src/families/minimax_m3/forward_plan.zig
+new file mode 100644
+index 0000000..b57b0f1
+--- /dev/null
++++ b/zig/src/families/minimax_m3/forward_plan.zig
+@@ -0,0 +1,365 @@
++//! One MiniMax-M3.1-Flash forward step as data: a pure planner (no GPU) the executor and the tests share.
++const std = @import("std");
++const Config = @import("config.zig").Config;
++const shard = @import("shard.zig");
++const tp = @import("tp.zig");
++const iface = @import("iface.zig");
++
++pub const Error = error{ BadRows, TooManyRows, BadThin };
++
++/// Routed-expert rows one launch takes: its scratch is sized for them, a longer chunk runs in several calls.
++pub const expert_rows: u32 = 256;
++/// Most rows whose logits the head keeps at once (a decode or verify window; a prompt chunk keeps one row).
++pub const head_rows: u32 = 128;
++
++/// Device buffers a step's ops name; the executor maps each to an allocation (rows are the first index).
++pub const Buf = enum {
++    ids, // int32 token ids
++    pos, // int32 positions (a shared window's rows)
++    row_tab, // int32 table offsets (a shared window's rows)
++    emb, // bf16 embedding rows
++    res, // fp32 residual stream (decision R1: fp32, the T0 default has no rounding)
++    a, // bf16 normed input of the current block
++    q,
++    k,
++    v, // bf16 projections
++    iq_raw,
++    ik_raw, // fp16 index projections
++    qn,
++    iqn, // bf16 normed and rotated q and index q
++    attn, // bf16 attention output
++    part, // fp32 this rank's partial sum of a block
++    routed, // fp32 routed experts' output
++    shr, // fp32 shared expert's output
++    sum, // fp32 the ranks' partials added in rank order
++    gate,
++    up,
++    act, // bf16 dense and shared MLP rows
++    logits_r, // fp32 router logits
++    pick, // int32 routed picks
++    wts, // fp32 routed weights
++    hlog, // fp32 this rank's head logits
++    hgather, // fp32 every rank's head logits, [rank][row][slot]
++    pairs, // (logit, id) of this rank's best
++    pairs_all, // every rank's pair
++};
++
++pub const bufs = std.enums.values(Buf);
++
++/// A buffer and the first row an op reads or writes in it.
++pub const Ref = struct { buf: Buf, row: u32 = 0 };
++
++pub const Norm = enum { input, post, final };
++
++/// The matrices a `linear` op names (layer picks the record; head and the layer's dense or shared MLP are by kind).
++pub const Lin = enum { q, k, v, o, dense_gate, dense_up, dense_down, shared_gate, shared_up, shared_down, head };
++
++pub const Form = tp.Form;
++
++pub const Op = union(enum) {
++    stage: struct { rows: u32, shared: bool }, // ids, positions and row tables go to the device; status cleared
++    embed: struct { rows: u32 },
++    zero: struct { buf: Buf, rows: u32 },
++    norm_add: struct { x: Ref, x_f32: bool, norm: Norm, layer: u32, y: Ref, rows: u32 }, // res += x; y = rms(res) w
++    linear: struct { w: Lin, layer: u32, x: Ref, y: Ref, rows: u32, prompt: bool },
++    index_proj: struct { layer: u32, rows: u32 }, // fp16 weights: a -> iq_raw, ik_raw
++    qk_rope: struct { layer: u32, rows: u32 }, // norm + rope; q, index q to scratch; k, v, index key into pages
++    score: struct { layer: u32, rows: u32, max_pos: u32 },
++    select: struct { layer: u32, rows: u32 },
++    attend: struct { layer: u32, rows: u32 },
++    router: struct { layer: u32, rows: u32 }, // fp32 gate times a
++    route: struct { layer: u32, rows: u32 },
++    experts: struct { layer: u32, row0: u32, rows: u32 },
++    swiglu: struct { layer: u32, shared: bool, n: u32, rows: u32 }, // act = swigluoai(gate, up)
++    add2: struct { a: Buf, b: Buf, out: Buf, rows: u32 }, // out = a + b in fp32 (routed + shared)
++    exchange: struct { form: Form, site: tp.Site, src: Buf, dst: Buf, rows: u32 },
++    logits_gather: struct { rows: u32 },
++    local_pick: struct { rows: u32 },
++    pick_gather: struct { rows: u32 },
++};
++
++/// The kernels' classes, one per launch of the T0 model's order (see forward_test.zig).
++pub const Stage = enum {
++    stage,
++    embed,
++    zero,
++    norm_in,
++    proj_q,
++    proj_k,
++    proj_v,
++    index_proj,
++    qk_rope,
++    score,
++    select,
++    attend,
++    proj_o,
++    exchange_attn,
++    norm_post,
++    dense_gate,
++    dense_up,
++    dense_act,
++    dense_down,
++    router,
++    route,
++    experts,
++    shared_gate,
++    shared_up,
++    shared_act,
++    shared_down,
++    combine,
++    exchange_ffn,
++    norm_final,
++    head,
++    gather,
++    pick,
++};
++
++pub fn stageOf(op: Op) Stage {
++    return switch (op) {
++        .stage => .stage,
++        .embed => .embed,
++        .zero => .zero,
++        .norm_add => |o| switch (o.norm) {
++            .input => .norm_in,
++            .post => .norm_post,
++            .final => .norm_final,
++        },
++        .linear => |o| switch (o.w) {
++            .q => .proj_q,
++            .k => .proj_k,
++            .v => .proj_v,
++            .o => .proj_o,
++            .dense_gate => .dense_gate,
++            .dense_up => .dense_up,
++            .dense_down => .dense_down,
++            .shared_gate => .shared_gate,
++            .shared_up => .shared_up,
++            .shared_down => .shared_down,
++            .head => .head,
++        },
++        .index_proj => .index_proj,
++        .qk_rope => .qk_rope,
++        .score => .score,
++        .select => .select,
++        .attend => .attend,
++        .router => .router,
++        .route => .route,
++        .experts => .experts,
++        .swiglu => |o| if (o.shared) .shared_act else .dense_act,
++        .add2 => .combine,
++        .exchange => |o| if (o.site == .attn_out) .exchange_attn else .exchange_ffn,
++        .logits_gather, .pick_gather => .gather,
++        .local_pick => .pick,
++    };
++}
++
++/// The rank's widths: what each buffer holds per row and which matrices exist.
++pub const Geometry = struct {
++    cfg: *const Config,
++    hidden: u32,
++    layers: u32, // layers run (a thin model: the first ones)
++    world: u32,
++    rank: u32,
++    max_rows: u32,
++    nq: u32, // this rank's query heads, index heads, kv heads
++    niq: u32,
++    kvh: u32,
++    q_w: u32,
++    kv_w: u32,
++    iq_w: u32,
++    ik_w: u32,
++    dense_w: u32,
++    shared_w: u32,
++    moe_w: u32,
++    experts: u32,
++    topk: u32,
++    slot: u32, // logits a rank's gather slot holds (the largest share)
++    own_vocab: u32, // this rank's head rows
++    vocab_lo: u32, // first vocabulary id of this rank's rows
++
++    pub fn of(c: *const Config, s: shard.Share, layers: u32, max_rows: u32) !Geometry {
++        if (layers == 0 or layers > c.layers) return error.BadThin;
++        const lg = try tp.LogitsGather.of(c, s.world);
++        return .{
++            .cfg = c,
++            .hidden = c.hidden,
++            .layers = layers,
++            .world = @intCast(s.world),
++            .rank = @intCast(s.rank),
++            .max_rows = max_rows,
++            .nq = @intCast(s.q_heads.len()),
++            .niq = @intCast(s.index_heads.len()),
++            .kvh = @intCast(s.kv_heads.len()),
++            .q_w = @intCast(s.q_heads.len() * c.head_dim),
++            .kv_w = @intCast(s.kv_heads.len() * c.head_dim),
++            .iq_w = @intCast(s.index_heads.len() * c.index.dim),
++            .ik_w = c.index.dim,
++            .dense_w = @intCast(s.dense.len()),
++            .shared_w = @intCast(s.shared.len()),
++            .moe_w = @intCast(s.moe.len()),
++            .experts = c.experts,
++            .topk = c.topk,
++            .slot = @intCast(lg.slot),
++            .own_vocab = @intCast(s.vocab.len()),
++            .vocab_lo = @intCast(s.vocab.lo),
++        };
++    }
++
++    pub fn isMoe(g: *const Geometry, layer: u32) bool {
++        return g.cfg.isMoe(layer);
++    }
++
++    /// Rows a buffer holds at most: the ids and activations by `max_rows`, the head's by `head_rows`.
++    pub fn capacity(g: *const Geometry, b: Buf) u32 {
++        return switch (b) {
++            .hlog, .hgather, .pairs, .pairs_all => head_rows,
++            else => g.max_rows,
++        };
++    }
++
++    /// Bytes one row of `b` takes.
++    pub fn rowBytes(g: *const Geometry, b: Buf) usize {
++        const rows_w: usize = @max(g.dense_w, g.shared_w);
++        return switch (b) {
++            .ids, .pos, .row_tab => 4,
++            .emb, .a => g.hidden * 2,
++            .res, .part, .routed, .shr, .sum => g.hidden * 4,
++            .q, .qn, .attn => g.q_w * 2,
++            .k, .v => g.kv_w * 2,
++            .iq_raw, .iqn => g.iq_w * 2,
++            .ik_raw => g.ik_w * 2,
++            .gate, .up, .act => rows_w * 2,
++            .logits_r => g.experts * 4,
++            .pick, .wts => g.topk * 4,
++            .hlog => g.slot * 4,
++            .hgather => g.world * g.slot * 4,
++            .pairs => 8,
++            .pairs_all => g.world * 8,
++        };
++    }
++};
++
++/// What one call computes: its rows, how its streams sit in the batch and which rows the head reads.
++pub const Head = enum { all, last, none };
++pub const HeadMode = enum { gather, picks };
++
++pub const Shape = struct {
++    rows: u32,
++    prompt: bool = false, // a prompt chunk of one stream
++    shared: bool = false, // several streams' windows in one batch (positions and table offsets per row)
++    max_pos: u32 = 0, // the largest position among the rows
++    head: Head = .all,
++    mode: HeadMode = .gather,
++};
++
++pub fn check(g: *const Geometry, sh: Shape) Error!void {
++    if (sh.rows == 0) return error.BadRows;
++    if (sh.rows > g.max_rows) return error.TooManyRows;
++    if (sh.shared and (sh.prompt or sh.rows > iface.shared_rows)) return error.TooManyRows;
++    if (sh.head == .all and sh.rows > head_rows) return error.TooManyRows;
++}
++
++/// The shipped model's launches for `sh`, in order, into `sink.emit(op)`.
++pub fn plan(g: *const Geometry, sh: Shape, sink: anytype) !void {
++    try check(g, sh);
++    const n = sh.rows;
++    try sink.emit(.{ .stage = .{ .rows = n, .shared = sh.shared } });
++    try sink.emit(.{ .embed = .{ .rows = n } });
++    try sink.emit(.{ .zero = .{ .buf = .res, .rows = n } });
++    try sink.emit(.{ .norm_add = .{ .x = .{ .buf = .emb }, .x_f32 = false, .norm = .input, .layer = 0, .y = .{ .buf = .a }, .rows = n } });
++    var l: u32 = 0;
++    while (l < g.layers) : (l += 1) {
++        try attention(g, sh, l, sink);
++        try mlp(g, sh, l, sink);
++    }
++    try head(g, sh, sink);
++}
++
++fn lin(sink: anytype, w: Lin, l: u32, x: Ref, y: Ref, n: u32, prompt: bool) !void {
++    try sink.emit(.{ .linear = .{ .w = w, .layer = l, .x = x, .y = y, .rows = n, .prompt = prompt } });
++}
++
++/// The ranks' partial sums of a block: none on one rank, else the exchange; returns the buffer holding the sum.
++fn exchange(g: *const Geometry, sh: Shape, site: tp.Site, sink: anytype) !Buf {
++    if (g.world == 1) return .part;
++    try sink.emit(.{ .exchange = .{ .form = tp.formFor(sh.rows), .site = site, .src = .part, .dst = .sum, .rows = sh.rows } });
++    return .sum;
++}
++
++/// The Gemma norm after the sum: the next norm of the stream, the layer's own post norm or the final one.
++fn normAdd(sink: anytype, x: Buf, norm: Norm, layer: u32, n: u32) !void {
++    try sink.emit(.{ .norm_add = .{ .x = .{ .buf = x }, .x_f32 = true, .norm = norm, .layer = layer, .y = .{ .buf = .a }, .rows = n } });
++}
++
++fn attention(g: *const Geometry, sh: Shape, l: u32, sink: anytype) !void {
++    const n = sh.rows;
++    const a: Ref = .{ .buf = .a };
++    try lin(sink, .q, l, a, .{ .buf = .q }, n, sh.prompt);
++    try lin(sink, .k, l, a, .{ .buf = .k }, n, sh.prompt);
++    try lin(sink, .v, l, a, .{ .buf = .v }, n, sh.prompt);
++    try sink.emit(.{ .index_proj = .{ .layer = l, .rows = n } });
++    try sink.emit(.{ .qk_rope = .{ .layer = l, .rows = n } });
++    try sink.emit(.{ .score = .{ .layer = l, .rows = n, .max_pos = sh.max_pos } });
++    try sink.emit(.{ .select = .{ .layer = l, .rows = n } });
++    try sink.emit(.{ .attend = .{ .layer = l, .rows = n } });
++    try lin(sink, .o, l, .{ .buf = .attn }, .{ .buf = .part }, n, sh.prompt);
++    try normAdd(sink, try exchange(g, sh, .attn_out, sink), .post, l, n);
++}
++
++fn swiglu(sink: anytype, l: u32, n: u32, width: u32, shared: bool) !void {
++    try sink.emit(.{ .swiglu = .{ .layer = l, .shared = shared, .n = width, .rows = n } });
++}
++
++fn mlp(g: *const Geometry, sh: Shape, l: u32, sink: anytype) !void {
++    const n = sh.rows;
++    const a: Ref = .{ .buf = .a };
++    if (!g.isMoe(l)) {
++        try lin(sink, .dense_gate, l, a, .{ .buf = .gate }, n, sh.prompt);
++        try lin(sink, .dense_up, l, a, .{ .buf = .up }, n, sh.prompt);
++        try swiglu(sink, l, n, g.dense_w, false);
++        try lin(sink, .dense_down, l, .{ .buf = .act }, .{ .buf = .part }, n, sh.prompt);
++    } else {
++        try sink.emit(.{ .router = .{ .layer = l, .rows = n } });
++        try sink.emit(.{ .route = .{ .layer = l, .rows = n } });
++        var at: u32 = 0;
++        while (at < n) : (at += expert_rows) {
++            try sink.emit(.{ .experts = .{ .layer = l, .row0 = at, .rows = @min(expert_rows, n - at) } });
++        }
++        try lin(sink, .shared_gate, l, a, .{ .buf = .gate }, n, sh.prompt);
++        try lin(sink, .shared_up, l, a, .{ .buf = .up }, n, sh.prompt);
++        try swiglu(sink, l, n, g.shared_w, true);
++        try lin(sink, .shared_down, l, .{ .buf = .act }, .{ .buf = .shr }, n, sh.prompt);
++        try sink.emit(.{ .add2 = .{ .a = .routed, .b = .shr, .out = .part, .rows = n } });
++    }
++    const next: Norm = if (l + 1 < g.layers) .input else .final;
++    try normAdd(sink, try exchange(g, sh, .ffn_out, sink), next, if (next == .input) l + 1 else l, n);
++}
++
++/// The final norm ran at the end of the last layer; the head cuts this rank's rows and gathers or merges them.
++fn head(g: *const Geometry, sh: Shape, sink: anytype) !void {
++    if (sh.head == .none) return;
++    const n: u32 = if (sh.head == .all) sh.rows else 1;
++    const x: Ref = .{ .buf = .a, .row = if (sh.head == .all) 0 else sh.rows - 1 };
++    try lin(sink, .head, 0, x, .{ .buf = .hlog }, n, false);
++    switch (sh.mode) {
++        .gather => if (g.world > 1) try sink.emit(.{ .logits_gather = .{ .rows = n } }),
++        .picks => {
++            try sink.emit(.{ .local_pick = .{ .rows = n } });
++            if (g.world > 1) try sink.emit(.{ .pick_gather = .{ .rows = n } });
++        },
++    }
++}
++
++/// An op list for tests: owns the ops it was given.
++pub const Recorder = struct {
++    gpa: std.mem.Allocator,
++    ops: std.ArrayList(Op) = .empty,
++
++    pub fn emit(r: *Recorder, op: Op) !void {
++        try r.ops.append(r.gpa, op);
++    }
++
++    pub fn deinit(r: *Recorder) void {
++        r.ops.deinit(r.gpa);
++    }
++};
+diff --git a/zig/src/families/minimax_m3/forward_test.zig b/zig/src/families/minimax_m3/forward_test.zig
+new file mode 100644
+index 0000000..b639548
+--- /dev/null
++++ b/zig/src/families/minimax_m3/forward_test.zig
+@@ -0,0 +1,511 @@
++//! Host tests of the forward planner and the prompt driver: op order against the T0 model, widths, dataflow, ranks.
++const std = @import("std");
++const plan = @import("forward_plan.zig");
++const exec = @import("forward_exec.zig");
++const fwd = @import("forward.zig");
++const prefill = @import("prefill.zig");
++const iface = @import("iface.zig");
++const tp = @import("tp.zig");
++const shard = @import("shard.zig");
++const pool = @import("pool.zig");
++const Op = plan.Op;
++const Stage = plan.Stage;
++const Buf = plan.Buf;
++const flash = &@import("config.zig").flash;
++
++fn geometry(rank: usize, world: usize, layers: u32, max_rows: u32) !plan.Geometry {
++    return plan.Geometry.of(flash, try shard.Share.of(flash, rank, world), layers, max_rows);
++}
++
++fn record(g: *const plan.Geometry, sh: plan.Shape, r: *plan.Recorder) !void {
++    try plan.plan(g, sh, r);
++}
++
++// ---------------------------------------------------------------- T0 order
++
++// What ref.zig's layerStep does, event by event (attention, then the feed-forward), with TP2's rank sum added.
++const Ev = enum { norm, q, k, v, rope_q, rope_k, index_q, index_k, rope_iq, rope_ik, cache, scores, pick, attend, o, rank_sum, residual, router, route, experts, w1, w3, act, w2, combine };
++
++const t0_attention = [_]Ev{ .norm, .q, .k, .v, .rope_q, .rope_k, .index_q, .index_k, .rope_iq, .rope_ik, .cache, .scores, .pick, .attend, .o, .rank_sum, .residual };
++const t0_dense = [_]Ev{ .norm, .w1, .w3, .act, .w2, .rank_sum, .residual };
++const t0_moe = [_]Ev{ .norm, .router, .route, .experts, .w1, .w3, .act, .w2, .combine, .rank_sum, .residual };
++
++// The device stages one T0 event list becomes: the fused norm+residual, one qk_rope after the index projections.
++fn deviceStages(a: std.mem.Allocator, events: []const Ev, moe: bool, attn: bool, world: u32, out: *std.ArrayList(Stage)) !void {
++    var rope = false;
++    for (events) |e| switch (e) {
++        .q => try out.append(a, .proj_q),
++        .k => try out.append(a, .proj_k),
++        .v => try out.append(a, .proj_v),
++        .index_q => try out.append(a, .index_proj),
++        .index_k, .rope_q, .rope_k, .rope_iq, .cache => {},
++        .rope_ik => if (!rope) {
++            try out.append(a, .qk_rope);
++            rope = true;
++        },
++        .scores => try out.append(a, .score),
++        .pick => try out.append(a, .select),
++        .attend => try out.append(a, .attend),
++        .o => try out.append(a, .proj_o),
++        .rank_sum => if (world > 1) try out.append(a, if (attn) .exchange_attn else .exchange_ffn),
++        .residual, .norm => {},
++        .router => try out.append(a, .router),
++        .route => try out.append(a, .route),
++        .experts => try out.append(a, .experts),
++        .w1 => try out.append(a, if (moe) .shared_gate else .dense_gate),
++        .w3 => try out.append(a, if (moe) .shared_up else .dense_up),
++        .act => try out.append(a, if (moe) .shared_act else .dense_act),
++        .w2 => try out.append(a, if (moe) .shared_down else .dense_down),
++        .combine => try out.append(a, .combine),
++    };
++}
++
++// The expected stages of a whole model: the layers' events with the fused norms placed where residual + norm meet.
++fn expected(a: std.mem.Allocator, layers: u32, world: u32, out: *std.ArrayList(Stage)) !void {
++    try out.appendSlice(a, &.{ .stage, .embed, .zero, .norm_in });
++    for (0..layers) |l| {
++        const moe = flash.isMoe(@intCast(l));
++        try deviceStages(a, &t0_attention, false, true, world, out);
++        try out.append(a, .norm_post);
++        try deviceStages(a, if (moe) &t0_moe else &t0_dense, moe, false, world, out);
++        // the exchange of the ffn site is the rank_sum event after w2, which deviceStages maps by position
++        try out.append(a, if (l + 1 < layers) .norm_in else .norm_final);
++    }
++    try out.append(a, .head);
++}
++
++fn stages(a: std.mem.Allocator, ops: []const Op) ![]Stage {
++    const out = try a.alloc(Stage, ops.len);
++    for (ops, out) |op, *s| s.* = plan.stageOf(op);
++    return out;
++}
++
++test "the planner's order is the T0 model's order, dense and MoE layers, one rank and two" {
++    const a = std.testing.allocator;
++    for ([_]u32{ 1, 2 }) |world| {
++        const g = try geometry(0, world, 5, 16);
++        var r: plan.Recorder = .{ .gpa = a };
++        defer r.deinit();
++        try record(&g, .{ .rows = 3 }, &r);
++        var want: std.ArrayList(Stage) = .empty;
++        defer want.deinit(a);
++        try expected(a, 5, world, &want);
++        // T0 has no logits gather of its own: take it off the end
++        const got = try stages(a, r.ops.items);
++        defer a.free(got);
++        const n = if (world > 1) got.len - 1 else got.len;
++        try std.testing.expectEqualSlices(Stage, want.items, got[0..n]);
++        if (world > 1) try std.testing.expectEqual(Stage.gather, got[n]);
++    }
++}
++
++// ---------------------------------------------------------------- dataflow
++
++const Set = std.EnumSet(Tag);
++const Tag = enum { ids, pos, row_tab, emb, res, a, q, k, v, iq_raw, ik_raw, qn, iqn, attn, part, routed, shr, sum, gate, up, act, logits_r, pick, wts, hlog, hgather, pairs, pairs_all, pages, bmax, sel };
++
++fn tag(b: Buf) Tag {
++    return std.meta.stringToEnum(Tag, @tagName(b)).?;
++}
++
++const Flow = struct {
++    r: [8]Tag = undefined,
++    nr: usize = 0,
++    w: [4]Tag = undefined,
++    nw: usize = 0,
++
++    fn of(reads: []const Tag, writes: []const Tag) Flow {
++        var f: Flow = .{};
++        @memcpy(f.r[0..reads.len], reads);
++        f.nr = reads.len;
++        @memcpy(f.w[0..writes.len], writes);
++        f.nw = writes.len;
++        return f;
++    }
++};
++
++fn flow(op: Op, shared: bool) Flow {
++    return switch (op) {
++        .stage => Flow.of(&.{}, &.{ .ids, .pos, .row_tab }),
++        .embed => Flow.of(&.{.ids}, &.{.emb}),
++        .zero => |o| Flow.of(&.{}, &.{tag(o.buf)}),
++        .norm_add => |o| Flow.of(&.{ tag(o.x.buf), .res }, &.{ .res, tag(o.y.buf) }),
++        .linear => |o| Flow.of(&.{tag(o.x.buf)}, &.{tag(o.y.buf)}),
++        .index_proj => Flow.of(&.{.a}, &.{ .iq_raw, .ik_raw }),
++        .qk_rope => if (shared) Flow.of(&.{ .q, .k, .v, .iq_raw, .ik_raw, .pos, .row_tab }, &.{ .qn, .iqn, .pages }) else Flow.of(&.{ .q, .k, .v, .iq_raw, .ik_raw }, &.{ .qn, .iqn, .pages }),
++        .score => if (shared) Flow.of(&.{ .iqn, .pages, .pos, .row_tab }, &.{.bmax}) else Flow.of(&.{ .iqn, .pages }, &.{.bmax}),
++        .select => Flow.of(&.{.bmax}, &.{.sel}),
++        .attend => Flow.of(&.{ .qn, .sel, .pages }, &.{.attn}),
++        .router => Flow.of(&.{.a}, &.{.logits_r}),
++        .route => Flow.of(&.{.logits_r}, &.{ .pick, .wts }),
++        .experts => Flow.of(&.{ .a, .pick, .wts }, &.{.routed}),
++        .swiglu => Flow.of(&.{ .gate, .up }, &.{.act}),
++        .add2 => |o| Flow.of(&.{ tag(o.a), tag(o.b) }, &.{tag(o.out)}),
++        .exchange => |o| Flow.of(&.{tag(o.src)}, &.{tag(o.dst)}),
++        .logits_gather => Flow.of(&.{.hlog}, &.{.hgather}),
++        .local_pick => Flow.of(&.{.hlog}, &.{.pairs}),
++        .pick_gather => Flow.of(&.{.pairs}, &.{.pairs_all}),
++    };
++}
++
++fn dataflowHolds(ops: []const Op, shared: bool) !void {
++    var written: Set = .{};
++    for (ops, 0..) |op, i| {
++        const f = flow(op, shared);
++        for (f.r[0..f.nr]) |t| if (!written.contains(t)) {
++            std.debug.print("op {d} ({t}) reads {t} before anything wrote it\n", .{ i, plan.stageOf(op), t });
++            return error.ReadBeforeWrite;
++        };
++        for (f.w[0..f.nw]) |t| written.insert(t);
++    }
++}
++
++test "every op reads only what an earlier op wrote, at every width, shared or not, one rank or two" {
++    const a = std.testing.allocator;
++    for ([_]u32{ 1, 2 }) |world| for ([_]u32{ 1, 2, 3, 16, 17, 64, 128 }) |n| for ([_]bool{ false, true }) |shared| {
++        if (shared and n > iface.shared_rows) continue;
++        const g = try geometry(@intCast(world - 1), world, 4, 128);
++        var r: plan.Recorder = .{ .gpa = a };
++        defer r.deinit();
++        try record(&g, .{ .rows = n, .shared = shared, .max_pos = 4000 }, &r);
++        try dataflowHolds(r.ops.items, shared);
++    };
++}
++
++// ---------------------------------------------------------------- widths
++
++test "every width the contract names plans the same stages; only the rows differ" {
++    const a = std.testing.allocator;
++    const g = try geometry(0, 2, 5, 128);
++    var base: ?[]Stage = null;
++    defer if (base) |b| a.free(b);
++    for ([_]u32{ 1, 2, 3, 16, 17, 64, 128 }) |n| {
++        var r: plan.Recorder = .{ .gpa = a };
++        defer r.deinit();
++        try record(&g, .{ .rows = n, .max_pos = 300 }, &r);
++        const s = try stages(a, r.ops.items);
++        if (base) |b| {
++            defer a.free(s);
++            try std.testing.expectEqualSlices(Stage, b, s);
++        } else base = s;
++        for (r.ops.items) |op| switch (op) {
++            .linear => |o| try std.testing.expect(o.rows == n and !o.prompt),
++            .exchange => |o| {
++                try std.testing.expectEqual(plan.Form.gather_sum, o.form);
++                try std.testing.expectEqual(n, o.rows);
++            },
++            .experts => |o| try std.testing.expectEqual(n, o.rows),
++            .score => |o| try std.testing.expectEqual(@as(u32, 300), o.max_pos),
++            else => {},
++        };
++    }
++    var r: plan.Recorder = .{ .gpa = a };
++    defer r.deinit();
++    try std.testing.expectError(error.TooManyRows, record(&g, .{ .rows = 129 }, &r));
++    try std.testing.expectError(error.TooManyRows, record(&g, .{ .rows = iface.shared_rows + 1, .shared = true }, &r));
++    try std.testing.expectError(error.BadRows, record(&g, .{ .rows = 0 }, &r));
++    try std.testing.expect(iface.window_rows <= 128 and iface.shared_rows <= 128);
++}
++
++test "a prompt chunk: prompt kernels, one head row, the share-form sum, expert calls covering the rows" {
++    const a = std.testing.allocator;
++    const g = try geometry(1, 2, 4, iface.prefill_rows);
++    var r: plan.Recorder = .{ .gpa = a };
++    defer r.deinit();
++    try record(&g, .{ .rows = iface.prefill_rows, .prompt = true, .max_pos = 4095, .head = .last }, &r);
++    var covered: u32 = 0;
++    var exchanges: usize = 0;
++    var heads: usize = 0;
++    for (r.ops.items) |op| switch (op) {
++        .linear => |o| {
++            if (o.w == .head) {
++                heads += 1;
++                try std.testing.expectEqual(@as(u32, 1), o.rows);
++                try std.testing.expectEqual(iface.prefill_rows - 1, o.x.row);
++                try std.testing.expect(!o.prompt);
++            } else try std.testing.expect(o.prompt and o.rows == iface.prefill_rows);
++        },
++        .experts => |o| {
++            try std.testing.expectEqual(covered, o.row0);
++            try std.testing.expect(o.rows <= plan.expert_rows);
++            covered += o.rows;
++        },
++        .exchange => |o| {
++            exchanges += 1;
++            try std.testing.expectEqual(plan.Form.scatter_gather, o.form);
++        },
++        else => {},
++    };
++    try std.testing.expectEqual(@as(usize, 1), heads);
++    try std.testing.expectEqual(iface.prefill_rows, covered); // one MoE layer of four
++    try std.testing.expectEqual(@as(usize, 8), exchanges);
++    var none: plan.Recorder = .{ .gpa = a };
++    defer none.deinit();
++    try record(&g, .{ .rows = 128, .prompt = true, .head = .none }, &none);
++    try std.testing.expectEqual(Stage.norm_final, plan.stageOf(none.ops.items[none.ops.items.len - 1]));
++    try std.testing.expectError(error.TooManyRows, record(&g, .{ .rows = 256, .head = .all }, &none));
++    try std.testing.expectError(error.TooManyRows, record(&g, .{ .rows = 3, .prompt = true, .shared = true }, &none));
++}
++
++// ---------------------------------------------------------------- ranks and the TP plan
++
++test "both ranks launch the same sequence, and the exchanges are tp.zig's plan" {
++    const a = std.testing.allocator;
++    const g0 = try geometry(0, 2, 6, 16);
++    const g1 = try geometry(1, 2, 6, 16);
++    var r0: plan.Recorder = .{ .gpa = a };
++    defer r0.deinit();
++    var r1: plan.Recorder = .{ .gpa = a };
++    defer r1.deinit();
++    try record(&g0, .{ .rows = 5 }, &r0);
++    try record(&g1, .{ .rows = 5 }, &r1);
++    try std.testing.expectEqual(r0.ops.items.len, r1.ops.items.len);
++    for (r0.ops.items, r1.ops.items) |x, y| try std.testing.expect(std.meta.eql(x, y));
++    var sites: std.ArrayList(tp.Site) = .empty;
++    defer sites.deinit(a);
++    for (r0.ops.items) |op| if (op == .exchange) try sites.append(a, op.exchange.site);
++    try std.testing.expectEqual(tp.tokenExchanges(flash, 6), sites.items.len);
++    for (0..6) |l| {
++        const lp = tp.layerPlan(flash, @intCast(l));
++        for (lp, 0..) |c, i| try std.testing.expectEqual(c.site, sites.items[2 * l + i]);
++    }
++    var one: plan.Recorder = .{ .gpa = a };
++    defer one.deinit();
++    const solo = try geometry(0, 1, 6, 16);
++    try record(&solo, .{ .rows = 5 }, &one);
++    for (one.ops.items) |op| try std.testing.expect(op != .exchange and op != .logits_gather);
++}
++
++test "a MoE layer adds the routed and shared experts into one partial before its single exchange" {
++    const a = std.testing.allocator;
++    const g = try geometry(0, 2, 4, 16);
++    var r: plan.Recorder = .{ .gpa = a };
++    defer r.deinit();
++    try record(&g, .{ .rows = 4 }, &r);
++    var in_layer3 = false;
++    var exch: usize = 0;
++    var adds: usize = 0;
++    for (r.ops.items) |op| {
++        if (op == .router and op.router.layer == 3) in_layer3 = true;
++        if (!in_layer3) continue;
++        if (op == .add2) {
++            adds += 1;
++            try std.testing.expectEqual(Buf.routed, op.add2.a);
++            try std.testing.expectEqual(Buf.shr, op.add2.b);
++            try std.testing.expectEqual(Buf.part, op.add2.out);
++        }
++        if (op == .exchange) exch += 1;
++    }
++    try std.testing.expectEqual(@as(usize, 1), adds);
++    try std.testing.expectEqual(@as(usize, 1), exch); // layer 3's attention exchange came before its router
++}
++
++test "the head: padded gather bytes match tp.LogitsGather, or a pick merge" {
++    const a = std.testing.allocator;
++    const g = try geometry(0, 2, 3, 128);
++    const lg = try tp.LogitsGather.of(flash, 2);
++    try std.testing.expectEqual(@as(usize, lg.slot), g.slot);
++    try std.testing.expectEqual(lg.bytes(16), @as(usize, g.world) * 16 * g.slot * 4);
++    var r: plan.Recorder = .{ .gpa = a };
++    defer r.deinit();
++    try record(&g, .{ .rows = 16 }, &r);
++    const last = r.ops.items[r.ops.items.len - 1];
++    try std.testing.expectEqual(@as(u32, 16), last.logits_gather.rows);
++    var p: plan.Recorder = .{ .gpa = a };
++    defer p.deinit();
++    try record(&g, .{ .rows = 1, .mode = .picks }, &p);
++    try std.testing.expectEqual(Stage.pick, plan.stageOf(p.ops.items[p.ops.items.len - 2]));
++    try std.testing.expectEqual(Stage.gather, plan.stageOf(p.ops.items[p.ops.items.len - 1]));
++    const out = fwd.Forward.out(&g, .{ .rows = 16, .head = .last });
++    try std.testing.expectEqual(@as(u32, 1), out.rows);
++    try std.testing.expectEqual(@as(u32, 0), fwd.Forward.out(&g, .{ .rows = 16, .head = .none }).rows);
++}
++
++test "geometry: this rank's widths for the shipped model" {
++    const g = try geometry(0, 2, 60, 2048);
++    try std.testing.expectEqual(@as(u32, 32), g.nq);
++    try std.testing.expectEqual(@as(u32, 2), g.niq);
++    try std.testing.expectEqual(@as(u32, 2), g.kvh);
++    try std.testing.expectEqual(@as(u32, 4096), g.q_w);
++    try std.testing.expectEqual(@as(u32, 256), g.kv_w);
++    try std.testing.expectEqual(@as(u32, 6144), g.dense_w);
++    try std.testing.expectEqual(@as(u32, 1536), g.shared_w);
++    try std.testing.expectEqual(@as(u32, 1536), g.moe_w);
++    try std.testing.expectEqual(@as(u32, 782 * 128), g.slot);
++    try std.testing.expectError(error.BadThin, geometry(0, 2, 61, 16));
++    var total: usize = 0;
++    for (plan.bufs) |b| total += g.rowBytes(b) * g.capacity(b);
++    try std.testing.expect(total < (2 << 30)); // the row buffers of a 2048-row chunk stay under 2 GiB
++}
++
++test "the fp32 residual is never rounded: partials, the sum and the residual are fp32 in every norm" {
++    const a = std.testing.allocator;
++    const g = try geometry(0, 2, 4, 16);
++    var r: plan.Recorder = .{ .gpa = a };
++    defer r.deinit();
++    try record(&g, .{ .rows = 2 }, &r);
++    var norms: usize = 0;
++    for (r.ops.items) |op| if (op == .norm_add) {
++        if (norms > 0) {
++            try std.testing.expect(op.norm_add.x_f32);
++            try std.testing.expectEqual(Buf.sum, op.norm_add.x.buf);
++        }
++        norms += 1;
++    };
++    try std.testing.expectEqual(@as(usize, 4 * 2 + 1), norms);
++}
++
++// ---------------------------------------------------------------- the call and the commit
++
++test "a call's shape: one stream, a shared window, and what is refused" {
++    const ids = [_]i32{ 1, 2, 3, 4, 5 };
++    const s = try fwd.Forward.shape(.{ .ids = &ids, .pos0 = 300 });
++    try std.testing.expect(!s.shared and s.rows == 5 and s.max_pos == 304);
++    const pos = [_]i32{ 10, 11, 12, 700, 701 };
++    const segs = [_]iface.Seg{ .{ .slot = 0, .row0 = 0, .rows = 3 }, .{ .slot = 1, .row0 = 3, .rows = 2 } };
++    const sh = try fwd.Forward.shape(.{ .ids = &ids, .segs = &segs, .positions = &pos });
++    try std.testing.expect(sh.shared and sh.max_pos == 701);
++    try std.testing.expectError(error.BadCall, fwd.Forward.shape(.{ .ids = &ids, .segs = &segs }));
++    try std.testing.expectError(error.BadCall, fwd.Forward.shape(.{ .ids = &.{} }));
++    try std.testing.expectError(error.BadCall, fwd.Forward.shape(.{ .ids = &ids, .segs = segs[0..1], .positions = &pos }));
++    try std.testing.expectEqual(@as(usize, 316), try fwd.Forward.commit(300, 16, 16, false));
++    try std.testing.expectEqual(@as(usize, 303), try fwd.Forward.commit(300, 16, 3, false));
++    try std.testing.expectError(error.BadCommit, fwd.Forward.commit(300, 16, 0, false));
++    try std.testing.expectError(error.BadCommit, fwd.Forward.commit(300, 16, 17, false));
++    try std.testing.expectError(error.BadCommit, fwd.Forward.commit(0, 128, 100, true));
++}
++
++// ---------------------------------------------------------------- the prompt driver
++
++const Fake = struct {
++    cap: usize,
++    pos: usize = 0,
++    log: std.ArrayList([3]usize) = .empty, // start, rows, head (0 none, 1 last)
++    marks: std.ArrayList(u32) = .empty,
++    gates: usize = 0,
++    drew: ?usize = null,
++    cancel_after: ?usize = null,
++
++    pub fn capacity(f: *Fake) usize {
++        return f.cap;
++    }
++    pub fn gate(f: *Fake, c: ?iface.Cancel) !void {
++        f.gates += 1;
++        if (prefill.cancelled(c)) return error.Cancelled;
++    }
++    pub fn chunk(f: *Fake, ids: []const i32, start: usize, head: plan.Head) !void {
++        try std.testing.expectEqual(f.pos, start);
++        try f.log.append(std.testing.allocator, .{ start, ids.len, @intFromBool(head == .last) });
++    }
++    pub fn first(f: *Fake, len: usize) !u32 {
++        f.drew = len;
++        return 4242;
++    }
++    pub fn advance(f: *Fake, rows: usize) !void {
++        f.pos += rows;
++    }
++    fn deinit(f: *Fake) void {
++        f.log.deinit(std.testing.allocator);
++        f.marks.deinit(std.testing.allocator);
++    }
++};
++
++fn always(_: ?*anyopaque) bool {
++    return true;
++}
++
++fn onMark(ctx: *anyopaque, at: u32) void {
++    const f: *Fake = @ptrCast(@alignCast(ctx));
++    f.marks.append(std.testing.allocator, at) catch unreachable;
++}
++
++test "a prompt pass: whole-page chunks, the head only on the last, marks on chunk starts, one first token" {
++    var ids: [5000]u32 = undefined;
++    for (&ids, 0..) |*x, i| x.* = @intCast(i);
++    var f: Fake = .{ .cap = 70000 };
++    defer f.deinit();
++    const at = [_]u32{ 1024, 3200, 4992 };
++    const marks: iface.Marks = .{ .at = &at, .ctx = &f, .call = onMark };
++    try std.testing.expectEqual(@as(u32, 4242), try prefill.prefill(&f, &ids, null, null, marks));
++    var total: usize = 0;
++    for (f.log.items, 0..) |c, i| {
++        try std.testing.expectEqual(total, c[0]);
++        try std.testing.expectEqual(@as(usize, 0), c[0] % pool.page_tokens);
++        try std.testing.expect(c[1] <= iface.prefill_rows);
++        try std.testing.expectEqual(@as(usize, @intFromBool(i + 1 == f.log.items.len)), c[2]);
++        total += c[1];
++    }
++    try std.testing.expectEqual(@as(usize, 5000), total);
++    try std.testing.expectEqual(@as(usize, 5000), f.pos);
++    try std.testing.expectEqual(@as(?usize, 5000), f.drew);
++    try std.testing.expectEqualSlices(u32, &at, f.marks.items);
++    try std.testing.expectEqual(f.log.items.len, f.gates);
++    // 0-1024, 1024-3072, 3072-3200, 3200-4992, 4992-5000
++    try std.testing.expectEqual(@as(usize, 5), f.log.items.len);
++}
++
++test "a resumed pass starts at the adopted pages and ends where a fresh one does" {
++    var ids: [4100]u32 = undefined;
++    @memset(&ids, 9);
++    var fresh: Fake = .{ .cap = 70000 };
++    defer fresh.deinit();
++    _ = try prefill.prefill(&fresh, &ids, null, null, null);
++    var res: Fake = .{ .cap = 70000, .pos = 2048 };
++    defer res.deinit();
++    _ = try prefill.prefill(&res, &ids, .{ .at = 2048 }, null, null);
++    try std.testing.expectEqual(fresh.pos, res.pos);
++    try std.testing.expectEqual(@as(usize, 2048), res.log.items[0][0]);
++    try std.testing.expectEqual(@as(?usize, 4100), res.drew);
++    var bad: Fake = .{ .cap = 70000 };
++    defer bad.deinit();
++    try std.testing.expectError(error.BadResume, prefill.prefill(&bad, &ids, .{ .at = 100 }, null, null));
++    try std.testing.expectError(error.BadResume, prefill.prefill(&bad, &ids, .{ .at = 4100 }, null, null));
++    try std.testing.expectError(error.BadResume, prefill.prefill(&bad, &ids, .{ .at = 0 }, null, null));
++    var tight: Fake = .{ .cap = 4110 };
++    defer tight.deinit();
++    try std.testing.expectError(error.PromptTooLong, prefill.prefill(&tight, ids[0..4100], null, null, null));
++}
++
++test "a follower's chunk with the next id, a bad chunk, a cancel and an over-long prompt" {
++    var ids: [300]u32 = undefined;
++    @memset(&ids, 1);
++    var f: Fake = .{ .cap = 1000 };
++    defer f.deinit();
++    try std.testing.expectError(error.BadChunk, prefill.prefillChunk(&f, ids[0..129], 0, 300, null, null, null));
++    try std.testing.expectEqual(@as(?u32, null), try prefill.prefillChunk(&f, ids[0..128], 0, 300, null, null, null));
++    try std.testing.expectEqual(@as(usize, 128), f.log.items[0][1]);
++    var long: [3000]u32 = undefined;
++    @memset(&long, 3);
++    var w: Fake = .{ .cap = 5000 };
++    defer w.deinit();
++    try std.testing.expectEqual(@as(?u32, null), try prefill.prefillChunk(&w, long[0..2049], 0, 3000, null, null, null));
++    try std.testing.expectEqual(@as(usize, 2048), w.log.items[0][1]);
++    try std.testing.expectError(error.BadChunk, prefill.prefillChunk(&f, ids[0..10], 100, 300, null, null, null));
++    try std.testing.expectError(error.BadChunk, prefill.prefillChunk(&f, ids[0..0], 128, 300, null, null, null));
++    try std.testing.expectError(error.BadChunk, prefill.prefillChunk(&f, ids[0..20], 256, 270, null, null, null));
++    try std.testing.expectEqual(@as(?u32, 4242), try prefill.prefillChunk(&f, ids[128..300], 128, 300, null, null, null));
++    var g: Fake = .{ .cap = 300 };
++    defer g.deinit();
++    try std.testing.expectError(error.PromptTooLong, prefill.prefill(&g, &ids, null, null, null));
++    const stop: iface.Cancel = .{ .ptr = null, .check = always };
++    var h: Fake = .{ .cap = 1000 };
++    defer h.deinit();
++    try std.testing.expectError(error.Cancelled, prefill.prefill(&h, &ids, null, stop, null));
++    try std.testing.expectEqual(@as(usize, 0), h.log.items.len);
++    var it: prefill.Chunks = .{ .at = 0, .len = 5000 };
++    var n: usize = 0;
++    while (it.next()) |c| n += c.end - c.start;
++    try std.testing.expectEqual(@as(usize, 5000), n);
++}
++
++// ---------------------------------------------------------------- the device half compiles
++
++test "the executor, buffers and call path compile against the CUDA wrappers (no launch here)" {
++    _ = &exec.Device.emit;
++    _ = &exec.Buffers.init;
++    _ = &exec.Modules.load;
++    _ = &fwd.Forward.init;
++    _ = &fwd.Forward.run;
++    _ = &fwd.Forward.address;
++    _ = &exec.Device.status;
++}
+diff --git a/zig/src/families/minimax_m3/prefill.zig b/zig/src/families/minimax_m3/prefill.zig
+new file mode 100644
+index 0000000..9fe3b34
+--- /dev/null
++++ b/zig/src/families/minimax_m3/prefill.zig
+@@ -0,0 +1,70 @@
++//! MiniMax-M3.1-Flash's prompt pass: page chunks, marks, a resume and the first token, over any engine `host`.
++const std = @import("std");
++const iface = @import("iface.zig");
++const pool = @import("pool.zig");
++const plan = @import("forward_plan.zig");
++
++pub const Error = error{ PromptTooLong, BadResume, BadChunk, Cancelled };
++
++pub fn cancelled(c: ?iface.Cancel) bool {
++    const k = c orelse return false;
++    return k.check(k.ptr);
++}
++
++/// Where a prompt pass of `len` ids starts: 0, or the page-multiple the adopted pages already hold.
++pub fn begin(len: usize, capacity: usize, from: ?iface.Resume) Error!usize {
++    if (len == 0 or len + iface.window_rows >= capacity) return error.PromptTooLong;
++    const r = from orelse return 0;
++    if (r.at == 0 or r.at >= len or r.at % pool.page_tokens != 0) return error.BadResume;
++    return r.at;
++}
++
++/// The end of the chunk that starts at `start`: a full chunk, the prompt's end, or the next mark inside it.
++pub fn chunkEnd(start: usize, len: usize, marks: ?iface.Marks) usize {
++    var end = @min(len, start + iface.prefill_rows);
++    if (marks) |m| for (m.at) |at| {
++        if (at > start and at < end) end = at;
++    };
++    return end;
++}
++
++/// The chunk boundaries of a pass, for tests and for a follower that wants them ahead.
++pub const Chunks = struct {
++    at: usize,
++    len: usize,
++    marks: ?iface.Marks = null,
++
++    pub fn next(c: *Chunks) ?struct { start: usize, end: usize } {
++        if (c.at >= c.len) return null;
++        const end = chunkEnd(c.at, c.len, c.marks);
++        defer c.at = end;
++        return .{ .start = c.at, .end = end };
++    }
++};
++
++/// One chunk of a `len`-id pass: `part` is its rows, plus the next id after a full chunk (GLM's follower sends it).
++pub fn prefillChunk(host: anytype, part: []const u32, start: usize, len: usize, from: ?iface.Resume, cancel: ?iface.Cancel, marks: ?iface.Marks) !?u32 {
++    if ((from != null or start == 0) and try begin(len, host.capacity(), from) != start) return error.BadChunk;
++    if (start >= len or start % pool.page_tokens != 0) return error.BadChunk;
++    const rows = if (start + part.len == len or part.len != iface.prefill_rows + 1) part.len else iface.prefill_rows;
++    if (rows == 0 or rows > iface.prefill_rows or start + rows > len) return error.BadChunk;
++    if (start + rows < len and rows % pool.page_tokens != 0) return error.BadChunk;
++    if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
++    try host.gate(cancel);
++    const last = start + rows == len;
++    const ids: []const i32 = @ptrCast(part[0..rows]);
++    try host.chunk(ids, start, if (last) plan.Head.last else plan.Head.none);
++    const first: ?u32 = if (last) try host.first(len) else null;
++    try host.advance(rows);
++    return first;
++}
++
++/// The whole prompt: from the resume point (or 0) to the end; returns the first token.
++pub fn prefill(host: anytype, ids: []const u32, from: ?iface.Resume, cancel: ?iface.Cancel, marks: ?iface.Marks) !u32 {
++    var start = try begin(ids.len, host.capacity(), from);
++    while (true) {
++        const end = chunkEnd(start, ids.len, marks);
++        if (try prefillChunk(host, ids[start..end], start, ids.len, null, cancel, marks)) |first| return first;
++        start = end;
++    }
++}
+-- 
+2.43.0
+

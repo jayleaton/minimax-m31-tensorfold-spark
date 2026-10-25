@@ -1,0 +1,66 @@
+#!/bin/bash
+# Device thermal guard for DGX Spark (GB10). Reads /etc/spark/thermal.env.
+# normal -> throttled at >= GUARD_PAUSE_C; back to normal at <= GUARD_RESUME_C.
+# >= GUARD_KILL_C held GUARD_KILL_HOLD_S -> emergency clocks until <= GUARD_RESUME_C.
+# Publishes /run/spark-thermal/{state,temp} so job guards can pause or stop their own work.
+# It never kills processes: stopping jobs is each job guard's decision.
+set -u
+ENV=${SPARK_THERMAL_ENV:-/etc/spark/thermal.env}
+# shellcheck source=/dev/null
+. "$ENV"
+RUN=${SPARK_THERMAL_RUN:-/run/spark-thermal}
+mkdir -p "$RUN"
+
+read_temp() {
+  if [ -n "${SPARK_THERMAL_TEMP_CMD:-}" ]; then eval "$SPARK_THERMAL_TEMP_CMD"; return; fi
+  local best g z
+  g=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+  case $g in (*[!0-9]*|"") g=0;; esac
+  best=$g
+  for z in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$z" ] || continue
+    z=$(( $(cat "$z") / 1000 ))
+    [ "$z" -gt "$best" ] && best=$z
+  done
+  echo "$best"
+}
+
+set_clock() {
+  if [ -n "${SPARK_THERMAL_DRYRUN:-}" ]; then echo "would set clock $1"; return; fi
+  nvidia-smi -lgc "$SPARK_CLOCK_MIN_MHZ,$1" >/dev/null
+}
+
+publish() { echo "$1" > "$RUN/state.tmp" && mv "$RUN/state.tmp" "$RUN/state"; echo "$2" > "$RUN/temp"; }
+
+state=normal hot_since=0
+publish normal "$(read_temp)"
+while :; do
+  t=$(read_temp); now=$(date +%s)
+  case $t in (*[!0-9]*|"") echo "no temperature reading" >&2; sleep "$SPARK_THERMAL_INTERVAL_S"; continue;; esac
+  if [ "$t" -ge "$GUARD_KILL_C" ]; then
+    [ "$hot_since" -eq 0 ] && hot_since=$now
+  else
+    hot_since=0
+  fi
+  case $state in
+    normal)
+      if [ "$t" -ge "$GUARD_PAUSE_C" ]; then
+        set_clock "$SPARK_CLOCK_THROTTLE_MHZ"; state=throttled
+        echo "throttled: ${t}C >= ${GUARD_PAUSE_C}C, clocks capped at ${SPARK_CLOCK_THROTTLE_MHZ} MHz"
+      fi ;;
+    throttled)
+      if [ "$t" -le "$GUARD_RESUME_C" ]; then
+        set_clock "$SPARK_CLOCK_MAX_MHZ"; state=normal
+        echo "normal: ${t}C <= ${GUARD_RESUME_C}C, clocks back to ${SPARK_CLOCK_MAX_MHZ} MHz"
+      fi ;;
+  esac
+  if [ "$state" != emergency ] && [ "$hot_since" -ne 0 ] && [ $((now - hot_since)) -ge "$GUARD_KILL_HOLD_S" ]; then
+    set_clock "$SPARK_CLOCK_EMERGENCY_MHZ"; state=emergency
+    echo "EMERGENCY: ${t}C >= ${GUARD_KILL_C}C for ${GUARD_KILL_HOLD_S}s, clocks at ${SPARK_CLOCK_EMERGENCY_MHZ} MHz; job guards must stop" >&2
+  elif [ "$state" = emergency ] && [ "$t" -le "$GUARD_RESUME_C" ]; then
+    set_clock "$SPARK_CLOCK_MAX_MHZ"; state=normal
+    echo "normal: ${t}C <= ${GUARD_RESUME_C}C after emergency, clocks back to ${SPARK_CLOCK_MAX_MHZ} MHz"
+  fi
+  publish "$state" "$t"
+  sleep "$SPARK_THERMAL_INTERVAL_S"
+done

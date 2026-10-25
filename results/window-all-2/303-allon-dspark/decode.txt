@@ -1,0 +1,5 @@
+[stamp] waiting for normal before decode C1: {'head': 'normal', 'worker': 'throttled'}
+[bench] decode C1 rep 0: aggregate 19.55 tok/s, per stream 19.51 tok/s, TTFT [0.72], 
+[bench] decode C1 rep 1: aggregate 19.28 tok/s, per stream 19.24 tok/s, TTFT [0.625], 
+[bench] -> out/bench-graphs-on-20261026-014929.json
+[results] run/results.md (copy out/results-20261026-015036.md) from ['out/smoke-20261026-013547.json', 'out/bench-graphs-off-20261025-135403.json', 'out/bench-graphs-on-20261026-014929.json']

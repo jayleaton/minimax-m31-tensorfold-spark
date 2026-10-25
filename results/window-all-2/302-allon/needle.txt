@@ -1,0 +1,3 @@
+[smoke] PASS needle: needle at depth 0.4 of a ~120000-token prompt (sparse MSA past 2048) | {"passkey": "75009", "content": "75009", "prompt_tokens": 120008, "tokenize_count": 120008, "sized_by": "/tokenize", "needle_sentence": 2801, "of_sentences": 7005, "needle_token_offset": 48097, "depth": 0.4, "cached_tokens": 0, "seconds": 703.57, "problems": []}
+[smoke] {'PASS': 1, 'FAIL': 0, 'SKIP': 0, 'DRY': 0} -> out/smoke-20261026-012248.json
+[results] run/results.md (copy out/results-20261026-013432.md) from ['out/smoke-20261026-012248.json', 'out/bench-graphs-off-20261025-135403.json', 'out/bench-graphs-on-20261026-012128.json']
