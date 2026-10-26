@@ -31,11 +31,16 @@ SMOKE_DIFFERS = {"WORKER", "WEIGHTS", "MODEL_DIR", "ENGINE_PATCHES", "ENGINE_COM
                  "CONTEXT", "PARALLEL", "MEM_GATE_GIB", "KV_TIER_DIR", "TF_MM3_KV_TIER", "TF_MM3_KV_TIER_GIB",
                  "TF_MM3_KV_HORIZON", "TF_MM3_KV_CANDIDATES", "KV_TIER_KEEP_GIB",
                  # production is the measured profile: the dspark draft and the RoCE switches on, the smoke load plain
-                 "DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DRAFT_DEPTH", "TF_MM3_ROCE_SUM",
+                 "DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB", "TF_MM3_ROCE_SUM",
                  "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST"}
 DRAFTS_PROFILE = ROOT / "config" / "drafts.env.example"
 # What the drafts profile may set differently from the smoke profile, its drafts-off control (config/drafts.env.example)
-DRAFTS_DIFFERS = {"DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DRAFT_DEPTH", "MEM_GATE_GIB"}
+DRAFTS_DIFFERS = {"DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB", "MEM_GATE_GIB"}
+SLOTS4 = ROOT / "config" / "slots4.env.example"
+# What the four-slot profile may set differently from the drafts profile (config/slots4.env.example says why)
+SLOTS4_DIFFERS = {"PARALLEL", "CONTEXT", "MEM_GATE_GIB", "ENGINE_PATCHES", "ENGINE_COMMIT",
+                  # measured at four streams at depth 3, depth by confidence at one stream only
+                  "TF_MM3_DRAFT_DEPTH", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB"}
 # Engine switches no profile of this recipe may set
 FORBIDDEN_ENGINE_ENV = ("KV_SPLIT_DEDUP", "KV_SPLIT_EARLY", "TF_TP_ROCE_CHUNKED_KB")
 SHELL_SCRIPTS = sorted([ROOT / "start.sh", ROOT / "stop.sh", *(ROOT / "scripts").glob("*.sh"),
@@ -432,7 +437,9 @@ class RankContractTests(ScriptFixture, unittest.TestCase):
         e = example_env()
         tier = ("TF_MM3_KV_TIER=/kvtier", ":/kvtier") if e.get("KV_TIER_DIR") else ()
         drafts = (("--no-drafts",) if e["DRAFTS"] == "0" else
-                  ("--drafter ", "/dspark", f"TF_MM3_DRAFT_DEPTH={e['TF_MM3_DRAFT_DEPTH']}") if e["DRAFTER"] == "dspark" else ())
+                  ("--drafter ", "/dspark", *(f"{k}={e[k]}" for k in ("TF_MM3_DRAFT_DEPTH", "TF_MM3_DSPARK_CHANCES",
+                                                                      "TF_MM3_CALIB") if e.get(k)))
+                  if e["DRAFTER"] == "dspark" else ())
         roce = tuple(f"{k}={e[k]}" for k in ("TF_MM3_ROCE_SUM", "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST", "TF_MM3_GRAPHS_TP") if e.get(k))
         for part in ("TF_MM3_RANK=1", f"--context {e['CONTEXT']}", f"--parallel {e['PARALLEL']}", "--kv-cache fp8",
                      *drafts, *roce, "TENSORFOLD_MEMORY_RESERVE_GIB=8", "NCCL_CUMEM_ENABLE=0", *tier):
@@ -549,6 +556,35 @@ class SmokeScriptTests(ScriptFixture, unittest.TestCase):
         self.assertNotIn("/hf", rank0 + rank1)
 
 
+class Slots4ProfileTests(unittest.TestCase):
+    """config/slots4.env.example: the drafts profile at four streams, each able to hold its whole CONTEXT at once."""
+
+    def setUp(self):
+        self.env = example_env(SLOTS4)
+        self.drafts = example_env(DRAFTS_PROFILE)
+
+    def test_every_line_is_a_comment_blank_or_assignment(self):
+        for number, line in enumerate(SLOTS4.read_text().splitlines(), 1):
+            with self.subTest(line=number):
+                self.assertRegex(line, r"^(|#.*|[A-Z][A-Z0-9_]*=.*)$")
+
+    def test_only_the_slots_differ_from_the_drafts_profile(self):
+        self.assertEqual(sorted(set(self.drafts) - set(self.env)), [])
+        changed = {k for k in self.drafts if self.env[k] != self.drafts[k]} | (set(self.env) - set(self.drafts))
+        self.assertEqual(changed, SLOTS4_DIFFERS)
+        self.assertEqual(sorted(k for k, v in self.env.items() if "<" in v), ["ENGINE_COMMIT", "WORKER"])
+        e = self.env
+        self.assertEqual((e["PARALLEL"], e["DRAFTS"], e["DRAFTER"], e["KV"], e["KV_TIER_DIR"]), ("4", "1", "dspark", "fp8", ""))
+
+    def test_every_slot_holds_its_context_at_once_beside_the_draft(self):
+        e = self.env
+        s = profile_gate(e)
+        self.assertEqual(int(e["MEM_GATE_GIB"]), s["mem_gate"])
+        self.assertGreater(s["draft"], profile_gate(self.drafts)["draft"], "four rings, not one")
+        need = int(e["PARALLEL"]) * -(-(int(e["CONTEXT"]) + 16) // qb.PAGE_TOKENS)
+        self.assertLessEqual(need, s["pages"] * 0.93, "with the engine's pool about 7 % under the calculator's")
+
+
 class DraftsScriptTests(ScriptFixture, unittest.TestCase):
     """The drafts profile through start.sh: the draft and the stats switch on both ranks, and nothing else changed
     against the smoke profile run as its control."""
@@ -561,11 +597,18 @@ class DraftsScriptTests(ScriptFixture, unittest.TestCase):
         rank1 = out[out.index("[dry-run] rank 1"):out.index("[dry-run] rank 0")]
         return rank1, out[out.index("[dry-run] rank 0"):]
 
+    def test_four_slots_and_the_draft_reach_both_ranks(self):
+        for rank in self.dry(SLOTS4):
+            for part in ("--drafter /model/dspark", "TF_MM3_DRAFT_DEPTH=3", "--parallel 4", "--context 40960"):
+                self.assertIn(part, rank)
+            self.assertNotIn("--no-drafts", rank)
+
     def test_the_draft_and_its_stats_reach_both_ranks(self):
         for rank in self.dry(DRAFTS_PROFILE):
-            for part in ("--drafter /model/dspark", "TF_MM3_DSPARK_STATS=1", "TF_MM3_DRAFT_DEPTH=3", "drafts=1,drafter=dspark",
-                         "--context 131072"):
+            for part in ("--drafter /model/dspark", "TF_MM3_DSPARK_STATS=1", "TF_MM3_DSPARK_CHANCES=1", "TF_MM3_CALIB=auto",
+                         "drafts=1,drafter=dspark", "--context 131072"):
                 self.assertIn(part, rank)
+            self.assertNotIn("TF_MM3_DRAFT_DEPTH", rank)
             self.assertNotIn("--no-drafts", rank)
 
     def test_the_smoke_profile_is_the_matched_control(self):
@@ -573,7 +616,7 @@ class DraftsScriptTests(ScriptFixture, unittest.TestCase):
         for drafted, plain in zip(on, off):
             self.assertNotIn("TF_MM3_DSPARK_STATS", plain)
             back = (drafted.replace("--drafter /model/dspark", "--no-drafts").replace("-e TF_MM3_DSPARK_STATS=1 ", "")
-                    .replace("-e TF_MM3_DRAFT_DEPTH=3 ", "")
+                    .replace("-e TF_MM3_DSPARK_CHANCES=1 ", "").replace("-e TF_MM3_CALIB=auto ", "")
                     .replace("drafts=1,drafter=dspark", "drafts=0,drafter="))
             self.assertEqual(back.strip(), plain.strip())
 
@@ -960,7 +1003,7 @@ class CalculatorTests(unittest.TestCase):
 
     def test_the_drafter_switch_keeps_dspark(self):
         self.assertEqual(qb.draft_gib(False, 4), 0.0)
-        self.assertEqual(qb.draft_gib(True, 4), qb.DSPARK_RANK_GIB)
+        self.assertAlmostEqual(qb.draft_gib(True, 4) - qb.DSPARK_RANK_GIB, 3 * 21_053_440 / qb.GIB)  # a ring a stream
         self.assertEqual(qb.draft_gib("dspark", 1), qb.DSPARK_RANK_GIB)
         one, four = qb.draft_gib("dflash2", 1), qb.draft_gib("dflash2", 4)
         self.assertAlmostEqual(four - one, 3 * 21_135_360 / qb.GIB)

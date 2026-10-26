@@ -1,0 +1,1 @@
+[decode32k] {"prompt_tokens": 32771, "ttft_s": 62.81, "decode_tps": 15.89, "tokens": 256, "status": 200, "error": null}

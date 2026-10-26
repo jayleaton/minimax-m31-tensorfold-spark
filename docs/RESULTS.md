@@ -1,8 +1,10 @@
 # Results
 
-**Serving measurements: [results/window-all-2](../results/window-all-2/README.md)** (one combined run on our pair,
-2026-10-25: speed, prefill, concurrency, tool calls, structured output, needle, images, load time; the README's Results
-section summarises it). This page keeps the calculator and the pack's offline figures, and lists what that run did not
+**Serving measurements: [results/window-all-3](../results/window-all-3/README.md)** (one combined run on our pair,
+2026-10-26: speed, prefill, the prefix cache, concurrency with drafts, tool calls, structured output, MMLU-200, memory
+after the load, load time; both Sparks ran at their thermal limits; the README's Results section summarises it) and
+[results/window-all-2](../results/window-all-2/README.md) (2026-10-25: also the needle, images and the DFlash2 draft).
+This page keeps the calculator and the pack's offline figures, and lists what that run did not
 measure. Mark any figure not taken through the server NOT MEASURED rather than rounding up.
 
 ## R0. Calculator (arithmetic, not measurement)

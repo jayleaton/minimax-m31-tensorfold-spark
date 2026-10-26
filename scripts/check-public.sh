@@ -79,8 +79,10 @@ declare -A LINE_OK=(
 # until its wording is settled.
 # device/ holds the operator's device artifacts copied verbatim (tests/test_repo.py pins their sha256): they pass the clock
 # wording and the private names list, and every other pattern still applies to them. A line naming the operator's
-# GPU unit (dgx-gpu-clock-cap) or the device file's SPARK_CLOCK_* variables passes the clock rule too.
-CLOCK_OK='^device/[^:]+:[0-9]+:|dgx-gpu-clock-cap|SPARK_CLOCK_[A-Z_*]+|^docs/OPERATIONS\.md:[0-9]+:.*300-2100 MHz by `dgx-gpu-clock-cap\.service`|^patches/[^:]+\.patch:[0-9]+:\+.*(FixedClock|clock\.clock\(\)|Io\.Clock)|^docs/speed-borrow-glm\.md:[0-9]+:.*wall-clock|^docs/speed-borrow-deepseek\.md:[0-9]+:'
+# GPU unit (dgx-gpu-clock-cap) or the device file's SPARK_CLOCK_* variables passes the clock rule too. In the engine
+# series, the dspark calibration's cache key carries the machine's clock cap as read from /etc/spark/thermal.env (the field
+# clock_mhz, machineClockCap): those code lines pass.
+CLOCK_OK='^engine/patches/[^:]+\.patch:[0-9]+:\+.*(\bclock_mhz\b|machineClockCap|SM clock cap from /etc/spark/thermal\.env)|^device/[^:]+:[0-9]+:|dgx-gpu-clock-cap|SPARK_CLOCK_[A-Z_*]+|^docs/OPERATIONS\.md:[0-9]+:.*300-2100 MHz by `dgx-gpu-clock-cap\.service`|^patches/[^:]+\.patch:[0-9]+:\+.*(FixedClock|clock\.clock\(\)|Io\.Clock)|^docs/speed-borrow-glm\.md:[0-9]+:.*wall-clock|^docs/speed-borrow-deepseek\.md:[0-9]+:'
 # e-mail addresses of the public patch authors (format-patch headers) and the one credited contributor's address
 EMAIL_OK='^patches/tasks/[^:]+\.patch:[0-9]+:(miaai-lab@users\.noreply\.github\.com|mia\.ailab1@gmail\.com|noreply@anthropic\.com)$'
 EMAIL_OK+='|^docs/speed-borrow-deepseek\.md:[0-9]+:coinupbtc@users\.noreply\.github\.com$'

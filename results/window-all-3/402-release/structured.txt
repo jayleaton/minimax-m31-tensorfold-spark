@@ -1,0 +1,3 @@
+[structured] schemas: PASS (14 cases)
+[structured] tools: FAIL (15 cases)
+[structured] thinking: PASS (9 cases)

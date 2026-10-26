@@ -1,0 +1,4 @@
+[bench] decode C1 rep 0: aggregate 20.51 tok/s, per stream 20.47 tok/s, TTFT [0.588], 
+[bench] decode C1 rep 1: aggregate 23.05 tok/s, per stream 23.01 tok/s, TTFT [0.586], 
+[bench] -> out/bench-graphs-on-20261026-122420.json
+[results] run/results.md (copy out/results-20261026-122511.md) from ['out/smoke-20261026-111027.json', 'out/bench-graphs-off-20261025-135403.json', 'out/bench-graphs-on-20261026-122420.json']

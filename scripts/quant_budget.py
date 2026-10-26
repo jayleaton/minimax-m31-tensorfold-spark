@@ -187,7 +187,8 @@ ENGINE_WORKSPACE_GIB = 1.5
 # the draft a rank: dspark_config.cost with one stream (budget.draftBytes, 2,180,405,250 B) plus the 8 ring snapshot
 # buffers native.draftCost adds (8 x one stream's K/V ring of 4112 rows x 5,120 B), all spent before any KV
 DSPARK_STREAM_BYTES = 2_180_405_250
-DSPARK_SNAPSHOT_BYTES = 8 * 4112 * 5120
+DSPARK_RING_BYTES = 4112 * 5120           # a stream's draft ring on a rank (native.draftCost's per_lane)
+DSPARK_SNAPSHOT_BYTES = 8 * DSPARK_RING_BYTES
 DSPARK_RANK_GIB = (DSPARK_STREAM_BYTES + DSPARK_SNAPSHOT_BYTES) / GIB
 VISION_TOWER_GIB = 2.27          # rank 0: Tower.plannedBytes 1,901,408,256 B + first_call_bytes 512 MiB (mm3/vision, measured)
 VISION_ROW_BYTES = 6144 * 2      # an image token's row (hidden 6144, bf16), on every rank, for each of PARALLEL lanes
@@ -258,12 +259,12 @@ def dflash2_cost(c=DFLASH2, world=2, snaps=ENGINE_DRAFT_SNAPS):
 
 
 def draft_gib(drafter, parallel):
-    """GiB a rank gives the draft before any KV: none, dspark (one stream and its ring snapshots, native.draftCost) or
-    dflash2 (weights + runtime + a ring a stream). ``drafter`` True is dspark (the old --drafter switch)."""
+    """GiB a rank gives the draft before any KV: none, dspark (one stream, its ring snapshots and a ring a further
+    stream, native.draftCost) or dflash2 (weights + runtime + a ring a stream). ``drafter`` True is dspark."""
     if not drafter:
         return 0.0
     if drafter is True or drafter == "dspark":
-        return DSPARK_RANK_GIB
+        return DSPARK_RANK_GIB + (max(1, parallel) - 1) * DSPARK_RING_BYTES / GIB
     if drafter == "dflash2":
         cost = dflash2_cost()
         return (cost["weights"] + cost["runtime"] + max(1, parallel) * cost["per_lane"]) / GIB

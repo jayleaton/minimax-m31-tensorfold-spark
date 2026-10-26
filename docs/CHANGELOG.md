@@ -4,6 +4,16 @@ Every change to this recipe, newest first. Nothing here has been run on two Spar
 
 ## Unreleased
 
+- **The measured profile (window-all-3).** `config/prod.env.example` is the profile measured on the pair
+  (results/window-all-3, 2026-10-26): the dspark draft with each round's depth sized by its own confidences
+  (`TF_MM3_DSPARK_CHANCES=1`, `TF_MM3_CALIB=auto`; `TF_MM3_DRAFT_DEPTH` no longer set), otherwise as window-all-2. Median
+  decode 31.75 / 30.5 tok/s (T0 / T1) against 19.75 / 19.1 with every switch off; prefill 687 / 531 tok/s at 2K / 32K,
+  window-all-2's prefill regression gone; a repeated 70K prompt's first token in 0.76 s. `config/drafts.env.example`
+  measures that depth rule; `config/slots4.env.example` (four streams, drafts at depth 3, as measured) builds
+  `engine/patches`. `scripts/config.sh` checks both new switches. The engine is `engine/patches`, exported from
+  `mm3/window-all-3` @ `0547afe80`. The run hit the Sparks' thermal limits and stopped early: the README's Limits say
+  which checks are missing.
+
 - **Operations at parity with the DeepSeek-V4.1 recipe.** `PREPARED=1`: each node's `HEAD_PREPARED` / `WORKER_PREPARED`
   folder at `/prepared` and `TF_MM3_PREPARED` / `TF_MM3_PREPARED_WRITE=1` on both ranks (an engine without the feature
   ignores them); preflight and start report each node's file or want `PREPARED_FREE_GIB` free; `serve.sh prepared list /

@@ -1,0 +1,2017 @@
+{
+ "label": "4315-release-chances",
+ "model": "MiniMax-M3.1-Flash-EXL3",
+ "shots": 0,
+ "max_tokens": 8,
+ "accuracy": 0.78,
+ "correct": 156,
+ "n": 200,
+ "errors": 0,
+ "no_letter": 0,
+ "thought": 0,
+ "leaks": 0,
+ "prompt_tokens_median": 278,
+ "seconds": 164.0,
+ "items": [
+  {
+   "i": 0,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 255,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 1,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 286,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 2,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 319,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 3,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 250,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 4,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 300,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 5,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 304,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 6,
+   "answer": 3,
+   "got": 0,
+   "prompt_tokens": 322,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 7,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 357,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\n- **I.** Dec"
+  },
+  {
+   "i": 8,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 344,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\n- **I is true"
+  },
+  {
+   "i": 9,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 273,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 10,
+   "answer": 0,
+   "got": 2,
+   "prompt_tokens": 297,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 11,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 246,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 12,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 250,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 13,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 281,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 14,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 243,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 15,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 277,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 16,
+   "answer": 0,
+   "got": 3,
+   "prompt_tokens": 323,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\nChecking: E = false"
+  },
+  {
+   "i": 17,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 247,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 18,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 266,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 19,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 293,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 20,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 361,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 21,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 633,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 22,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 251,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 23,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 374,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 24,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 260,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 25,
+   "answer": 3,
+   "got": 2,
+   "prompt_tokens": 276,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 26,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 281,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 27,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 280,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 28,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 261,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 29,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 337,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 30,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 457,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 31,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 693,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 32,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 260,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 33,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 272,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 34,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 303,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 35,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 293,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 36,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 247,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 37,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 409,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 38,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 258,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 39,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 257,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 40,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 242,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 41,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 257,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 42,
+   "answer": 3,
+   "got": 0,
+   "prompt_tokens": 321,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 43,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 311,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 44,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 305,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 45,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 288,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 46,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 260,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 47,
+   "answer": 0,
+   "got": 1,
+   "prompt_tokens": 262,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 48,
+   "answer": 1,
+   "got": 3,
+   "prompt_tokens": 505,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 49,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 331,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 50,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 306,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 51,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 251,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 52,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 435,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 53,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 302,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 54,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 262,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 55,
+   "answer": 0,
+   "got": 1,
+   "prompt_tokens": 256,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 56,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 269,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 57,
+   "answer": 1,
+   "got": 2,
+   "prompt_tokens": 255,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 58,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 279,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 59,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 264,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 60,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 305,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 61,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 278,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 62,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 267,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 63,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 302,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 64,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 284,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 65,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 281,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 66,
+   "answer": 1,
+   "got": 2,
+   "prompt_tokens": 259,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 67,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 307,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**B**\n\nThe echo frequency heard by"
+  },
+  {
+   "i": 68,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 250,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 69,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 272,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 70,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 345,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 71,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 240,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 72,
+   "answer": 0,
+   "got": 1,
+   "prompt_tokens": 244,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 73,
+   "answer": 0,
+   "got": 1,
+   "prompt_tokens": 338,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**B**\n\nChecking: I=T,"
+  },
+  {
+   "i": 74,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 260,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 75,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 292,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 76,
+   "answer": 2,
+   "got": 1,
+   "prompt_tokens": 264,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 77,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 331,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 78,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 545,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 79,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 245,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 80,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 292,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 81,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 260,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 82,
+   "answer": 0,
+   "got": 1,
+   "prompt_tokens": 286,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**B**\n\nThe product is composite unless"
+  },
+  {
+   "i": 83,
+   "answer": 3,
+   "got": 2,
+   "prompt_tokens": 340,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "C\n\nRevenue = $90, variable"
+  },
+  {
+   "i": 84,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 295,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**B**\n\nStable equilibrium requires dU"
+  },
+  {
+   "i": 85,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 295,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 86,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 398,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 87,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 501,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 88,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 695,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 89,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 250,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 90,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 316,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 91,
+   "answer": 0,
+   "got": 2,
+   "prompt_tokens": 306,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 92,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 257,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 93,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 267,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 94,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 366,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "C\n\nP(D|TP) ="
+  },
+  {
+   "i": 95,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 258,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 96,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 243,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 97,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 249,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 98,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 246,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 99,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 296,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 100,
+   "answer": 0,
+   "got": 3,
+   "prompt_tokens": 310,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 101,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 266,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 102,
+   "answer": 2,
+   "got": 3,
+   "prompt_tokens": 364,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 103,
+   "answer": 0,
+   "got": 1,
+   "prompt_tokens": 280,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 104,
+   "answer": 0,
+   "got": 2,
+   "prompt_tokens": 302,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 105,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 400,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 106,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 308,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\nThe presentation (adolescent"
+  },
+  {
+   "i": 107,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 257,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 108,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 253,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 109,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 309,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 110,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 267,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 111,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 246,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 112,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 244,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 113,
+   "answer": 3,
+   "got": 0,
+   "prompt_tokens": 250,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 114,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 270,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 115,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 245,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 116,
+   "answer": 3,
+   "got": 0,
+   "prompt_tokens": 267,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 117,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 308,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 118,
+   "answer": 3,
+   "got": 2,
+   "prompt_tokens": 246,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 119,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 266,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 120,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 290,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 121,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 266,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 122,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 273,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 123,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 294,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 124,
+   "answer": 0,
+   "got": 2,
+   "prompt_tokens": 327,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**C**\n\nUsing f = qB"
+  },
+  {
+   "i": 125,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 244,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 126,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 248,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 127,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 391,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 128,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 275,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 129,
+   "answer": 2,
+   "got": 3,
+   "prompt_tokens": 309,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 130,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 304,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 131,
+   "answer": 2,
+   "got": 1,
+   "prompt_tokens": 269,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 132,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 251,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 133,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 271,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 134,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 269,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 135,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 727,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 136,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 255,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 137,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 255,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 138,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 257,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 139,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 269,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 140,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 306,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 141,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 342,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\nOver a complete cycle,"
+  },
+  {
+   "i": 142,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 294,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 143,
+   "answer": 3,
+   "got": 2,
+   "prompt_tokens": 310,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 144,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 520,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 145,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 581,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 146,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 263,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 147,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 249,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 148,
+   "answer": 2,
+   "got": 3,
+   "prompt_tokens": 307,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 149,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 279,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 150,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 269,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 151,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 284,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 152,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 252,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 153,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 242,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 154,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 251,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 155,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 242,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 156,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 258,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 157,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 320,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 158,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 282,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 159,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 264,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 160,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 251,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 161,
+   "answer": 3,
+   "got": 0,
+   "prompt_tokens": 278,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 162,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 488,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 163,
+   "answer": 2,
+   "got": 1,
+   "prompt_tokens": 442,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 164,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 273,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 165,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 246,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 166,
+   "answer": 0,
+   "got": 2,
+   "prompt_tokens": 462,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 167,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 294,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 168,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 280,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 169,
+   "answer": 1,
+   "got": 3,
+   "prompt_tokens": 247,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 170,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 254,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 171,
+   "answer": 3,
+   "got": 2,
+   "prompt_tokens": 269,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "C\n\n**Statement 1:** True"
+  },
+  {
+   "i": 172,
+   "answer": 2,
+   "got": 3,
+   "prompt_tokens": 284,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\nAn inferior alveolar nerve block"
+  },
+  {
+   "i": 173,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 256,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 174,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 309,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 175,
+   "answer": 1,
+   "got": 2,
+   "prompt_tokens": 289,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 176,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 247,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 177,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 261,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 178,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 314,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 179,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 323,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\nWorking in alternating 2"
+  },
+  {
+   "i": 180,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 347,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 181,
+   "answer": 3,
+   "got": 2,
+   "prompt_tokens": 308,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 182,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 253,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 183,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 263,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 184,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 292,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 185,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 237,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 186,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 272,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 187,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 337,
+   "finish": "length",
+   "thought": false,
+   "leak": false,
+   "reply": "**D**\n\nChecking option D: L"
+  },
+  {
+   "i": 188,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 265,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 189,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 264,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 190,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 271,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 191,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 327,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 192,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 348,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 193,
+   "answer": 0,
+   "got": 0,
+   "prompt_tokens": 240,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "A"
+  },
+  {
+   "i": 194,
+   "answer": 3,
+   "got": 1,
+   "prompt_tokens": 290,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 195,
+   "answer": 2,
+   "got": 2,
+   "prompt_tokens": 239,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 196,
+   "answer": 1,
+   "got": 2,
+   "prompt_tokens": 309,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "C"
+  },
+  {
+   "i": 197,
+   "answer": 1,
+   "got": 1,
+   "prompt_tokens": 269,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "B"
+  },
+  {
+   "i": 198,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 292,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  },
+  {
+   "i": 199,
+   "answer": 3,
+   "got": 3,
+   "prompt_tokens": 242,
+   "finish": "stop",
+   "thought": false,
+   "leak": false,
+   "reply": "D"
+  }
+ ]
+}

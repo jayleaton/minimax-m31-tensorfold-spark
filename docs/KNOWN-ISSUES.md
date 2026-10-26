@@ -1,9 +1,12 @@
 # What is not known or not solved
 
-What is open after the first measured run ([results/window-all-2](../results/window-all-2/README.md)): prose gains about
-nothing from the draft; prefill is ~8 % slower with the switches on (612 / 484 against 667 / 524 tok/s at 2K / 32K, a fix in
-progress); the KV tier does not start (its I/O setup fails), so 4 x 1M is not in the profile; decode after a long prompt,
-MMLU, tool-eval-bench and memory after the load are not measured. Some notes below predate that run and say so.
+What is open after the latest measured run ([results/window-all-3](../results/window-all-3/README.md)):
+`tool_choice: "none"` lets tool-call markup reach the reply's content (`bench/structured.py` tools 14/15); the KV tier
+starts but panics at the first prompt (`tier_io.zig:153`), so 4 x 1M is not in the profile; `TF_MM3_PLAN_INLINE=1` crashes
+at start (an integer overflow); prose gains nothing from the draft; plain decode is ~5 % below window-all-2's; at four
+streams drafts decode slower than plain decode; tool-eval-bench is not run. The run hit both Sparks' thermal limits and
+stopped early, so the S11-off and S8-off checks are missing. Window-all-2's prefill regression is fixed. Some notes below
+predate these runs and say so.
 
 ## The engine
 

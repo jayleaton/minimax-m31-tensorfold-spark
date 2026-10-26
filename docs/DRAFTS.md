@@ -39,7 +39,7 @@ the engine prints `dspark acceptance total: <the same fields>` either way.
 | file | `config/smoke.env` (from `config/smoke.env.example`, unchanged) | `config/drafts.env` (from `config/drafts.env.example`) |
 | serve flags | `--no-drafts` on both ranks | `--drafter /model/dspark` on both ranks |
 | `TF_MM3_DSPARK_STATS` | not set | `1` (both ranks get it; rank 0 logs) |
-| `TF_MM3_DRAFT_DEPTH` | not set | `3` first (the most drafts a round verifies; then `7` as a second arm if the window has time) |
+| `TF_MM3_DSPARK_CHANCES`, `TF_MM3_CALIB` | not set | `1`, `auto`: each round's depth by the draft's confidences against the verify costs timed at boot (window-all-3's rule; `TF_MM3_DRAFT_DEPTH` unset, the block caps a round) |
 | `MEM_GATE_GIB` | 113 | 115: the draft is spent before any KV, 2.19 GiB a rank (2.03 GiB with one stream's 21 MB K/V ring, plus 8 ring snapshots of 21 MB, `native.draftCost`) |
 | everything else | the smoke profile | the same, value for value (tests/test_repo.py `DraftsProfileTests`, `DraftsScriptTests`) |
 
@@ -47,8 +47,9 @@ the engine prints `dspark acceptance total: <the same fields>` either way.
 drafts-on gate: KV room 8.26 GiB at 117.1 GiB available (188,416 tokens, 1,472 pages), 2.52 GiB more than the
 131,072-token context needs. At 113 GiB available it does not fit (94,848 tokens); `start.sh`'s gate refuses such a load
 before anything starts. The narrower window both halves use then is in the profile: `NARROW_RUN: CONTEXT=65536
-MEM_GATE_GIB=112` (section 5). `TF_MM3_CALIB`, the engine's boot calibration of verify widths, is left at the engine's
-default; its `dspark calibration: ...` line is recorded when the engine prints one.
+MEM_GATE_GIB=112` (section 5). `TF_MM3_CALIB=auto` times the verify widths at boot (~28 s, or reads a matching cached
+table); record its `dspark calibration: ...` line. A fixed cap (`TF_MM3_DRAFT_DEPTH=3`, window-all-2's rule) is the
+second arm when the window has time.
 
 Both files must name the same `WORKER`, `ENGINE_COMMIT`, `ENGINE_PATCHES` and `MODEL_DIR`: one image for both halves (a
 different series would rebuild it between them), an engine that includes mm3/dspark. Never set `KV_SPLIT_DEDUP`,
@@ -59,7 +60,7 @@ different series would rebuild it between them), an engine that includes mm3/dsp
 ```bash
 cp config/drafts.env.example config/drafts.env   # WORKER, ENGINE_COMMIT (and MODEL_DIR) exactly as in config/smoke.env
 diff <(grep -vE '^[[:space:]]*(#|$)' config/smoke.env) <(grep -vE '^[[:space:]]*(#|$)' config/drafts.env)
-#   only DRAFTS, DRAFTER, TF_MM3_DSPARK_STATS, TF_MM3_DRAFT_DEPTH and MEM_GATE_GIB may show
+#   only DRAFTS, DRAFTER, TF_MM3_DSPARK_STATS, TF_MM3_DSPARK_CHANCES, TF_MM3_CALIB and MEM_GATE_GIB may show
 CONFIG=config/drafts.env scripts/serve.sh preflight static     # the pack's dspark/ folder on both nodes, by size
 DRY_RUN=1 python3 bench/drafts.py run --label drafts-on        # the requests it will send; nothing is sent
 tests/run.sh                                                   # on the head's CPU

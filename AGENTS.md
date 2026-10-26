@@ -6,7 +6,7 @@ a 131,072-token context, one request at a time, FP8 KV. Follow the steps in orde
 Ask the user before anything that changes system state outside this repo (installing packages, editing network config,
 `sudo`, sudoers, deleting files, starting a server on a pair someone else may be using).
 
-> **Measured on one pair of Sparks** ([results/window-all-2](results/window-all-2/README.md)). The engine is built from
+> **Measured on one pair of Sparks** ([results/window-all-3](results/window-all-3/README.md)). The engine is built from
 > `ENGINE_PATCHES` (`engine/patches`: TensorFold v1.1.2 plus the `minimax_m3_vl` series). A changed profile is qualified
 > as [docs/OPERATIONS.md section 7](docs/OPERATIONS.md#7-qualifying-the-profile) describes; [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)
 > lists what is open.
@@ -200,7 +200,7 @@ proxy with auth in front, and ask the user first.
 
 ## 7. Do not change these knobs
 
-The profile in `config/prod.env.example` is the one measured in window-all-2 (results/window-all-2).
+The profile in `config/prod.env.example` is the one measured in window-all-3 (results/window-all-3).
 Leave these unless the user asks for an experiment, and then follow docs/OPERATIONS.md section 7:
 
 - `CONTEXT=131072`, `PARALLEL=1`, `KV=fp8`, `MAX_TOKENS=32768`
@@ -213,8 +213,8 @@ Leave these unless the user asks for an experiment, and then follow docs/OPERATI
 - `PAIR_WATCH=1`, `CANARY=strict`, `PREFLIGHT=strict`, `HOST=127.0.0.1`
 - the device's heat limits and GPU setting (`/etc/spark/thermal.env`, docs/OPERATIONS.md section 4): they are not in
   `config/prod.env` and never set by this recipe
-- `DRAFTS=1`, `DRAFTER=dspark`, `TF_MM3_DRAFT_DEPTH=3` (replies equal plain decode's; code, tool calls and math +38-49 %;
-  `DRAFTS=0` turns it off; [docs/DFLASH2.md](docs/DFLASH2.md) for the DFlash2 alternative)
+- `DRAFTS=1`, `DRAFTER=dspark`, `TF_MM3_DSPARK_CHANCES=1`, `TF_MM3_CALIB=auto`, `TF_MM3_DRAFT_DEPTH` unset (replies
+  equal plain decode's; code, tool calls and math +56-74 % over all switches off; `DRAFTS=0` turns it off; [docs/DFLASH2.md](docs/DFLASH2.md) for the DFlash2 alternative)
 - `TF_MM3_GRAPHS_TP=1`, `TF_MM3_ROCE_SUM=1`, `TF_MM3_SHARE_INPLACE=1`, `TF_ROCE_FAST=1`, `ENGINE_API_TOOLS=1` (as measured)
 
 ## 8. Operate

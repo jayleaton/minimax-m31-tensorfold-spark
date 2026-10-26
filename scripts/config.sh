@@ -10,7 +10,7 @@
 # The loading of local.sh and .env is the GLM-5.3-Flash recipe's (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);
 # the config file and its placeholder refusal are the GLM-5.3 and DeepSeek-V4.1 recipes' (jayleaton).
 # STATUS: the minimax_m3_vl family comes from ENGINE_PATCHES (engine/patches in the profile); the profile is measured in
-# results/window-all-2. Defaults below that are not verified pins stay empty (the engine's own default applies); the production values
+# results/window-all-3. Defaults below that are not verified pins stay empty (the engine's own default applies); the production values
 # are in config/prod.env.example, each with where it comes from (calculator, sibling recipe, or NOT MEASURED).
 _cfg_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # _cfg_read <file>: KEY=value lines into the environment for every key still unset (quotes stripped, # comments dropped)
@@ -179,6 +179,12 @@ TF_MM3_DSPARK_STATS="${TF_MM3_DSPARK_STATS:-}"
 # TF_MM3_DRAFT_DEPTH (an engine with mm3/dspark): the most drafts a round verifies, 1..7 (empty: the draft's block of 7);
 # the depth rule may still pick fewer or none. Like every TF_MM3_* it reaches both ranks. It changes no reply.
 TF_MM3_DRAFT_DEPTH="${TF_MM3_DRAFT_DEPTH:-}"
+# TF_MM3_DSPARK_CHANCES=1 (an engine with mm3/dspark, DRAFTER=dspark): each round's depth is sized by the draft's own
+# confidences against the verify costs, at most TF_MM3_DRAFT_DEPTH (or the block); TF_MM3_CALIB gives those costs: auto (a
+# matching cached table, else timed at boot, ~28 s), measure (timed every boot) or off/empty (the engine's static table).
+# The profile measured in window-all-3 sets both (config/prod.env.example). Both reach both ranks; neither changes a reply.
+TF_MM3_DSPARK_CHANCES="${TF_MM3_DSPARK_CHANCES:-}"
+TF_MM3_CALIB="${TF_MM3_CALIB:-}"
 # RoCE for the ranks' small gathers (the family's cuda/roce.zig, as GLM's): 1 leaves it on (the engine's default: RoCE when
 # its setup succeeds, NCCL otherwise), 0 passes TF_ROCE=0 (every gather on NCCL). Both ranks get the same value (the ranks'
 # fingerprint does not carry it yet: docs/rank-contract.md). ROCE_MAX_KB caps a RoCE gather (TF_ROCE_MAX_KB; empty: the
@@ -409,6 +415,8 @@ if [[ "$WEIGHTS" == dir ]]; then
 fi
 [[ "$ENGINE_API_TOOLS" =~ ^[01]$ ]] || die "ENGINE_API_TOOLS is 0 or 1, not $ENGINE_API_TOOLS"
 [[ -z "$TF_MM3_DRAFT_DEPTH" || "$TF_MM3_DRAFT_DEPTH" =~ ^[1-7]$ ]] || die "TF_MM3_DRAFT_DEPTH is 1..7 or empty, not $TF_MM3_DRAFT_DEPTH"
+[[ -z "$TF_MM3_DSPARK_CHANCES" || "$TF_MM3_DSPARK_CHANCES" =~ ^[01]$ ]] || die "TF_MM3_DSPARK_CHANCES is 1 (depth by confidence), 0 or empty, not $TF_MM3_DSPARK_CHANCES"
+[[ -z "$TF_MM3_CALIB" || "$TF_MM3_CALIB" =~ ^(auto|measure|off)$ ]] || die "TF_MM3_CALIB is auto, measure, off or empty, not $TF_MM3_CALIB"
 [[ -z "$TF_MM3_DSPARK_STATS" || "$TF_MM3_DSPARK_STATS" =~ ^[01]$ ]] || die "TF_MM3_DSPARK_STATS is 1 (a line a finished stream), 0 or empty, not $TF_MM3_DSPARK_STATS"
 [[ "$VISION" =~ ^[01]$ && "$VISION_URLS" =~ ^[01]$ ]] || die "VISION and VISION_URLS are 0 or 1, not $VISION / $VISION_URLS"
 [[ "$VISION_MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$VISION_IMAGE_TOKENS" =~ ^[1-9][0-9]*$ ]] ||

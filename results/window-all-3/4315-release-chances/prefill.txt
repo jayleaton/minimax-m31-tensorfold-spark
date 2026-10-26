@@ -1,0 +1,4 @@
+[bench] prefill 2048: prompt 2053 (cached 0), 686.5 tok/s server, 685.9 tok/s by TTFT 2.993 s
+[bench] prefill 32768: prompt 32764 (cached 0), 530.6 tok/s server, 530.6 tok/s by TTFT 61.753 s
+[bench] -> out/bench-graphs-on-20261026-112246.json
+[results] run/results.md (copy out/results-20261026-112353.md) from ['out/smoke-20261026-111027.json', 'out/bench-graphs-off-20261025-135403.json', 'out/bench-graphs-on-20261026-112246.json']

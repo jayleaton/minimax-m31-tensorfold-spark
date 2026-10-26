@@ -1,0 +1,33 @@
+{
+ "tokens": 70000,
+ "rows": [
+  {
+   "ask": "fresh",
+   "status": 200,
+   "error": null,
+   "prompt_tokens": 70006,
+   "cached_tokens": 0,
+   "ttft_s": 167.23,
+   "sha": "c995dcdf00e7fc39"
+  },
+  {
+   "ask": "repeat",
+   "status": 200,
+   "error": null,
+   "prompt_tokens": 70006,
+   "cached_tokens": 69888,
+   "ttft_s": 0.76,
+   "sha": "c995dcdf00e7fc39"
+  },
+  {
+   "ask": "followup",
+   "status": 200,
+   "error": null,
+   "prompt_tokens": 70004,
+   "cached_tokens": 69888,
+   "ttft_s": 0.79,
+   "sha": "a05f630f2cba26ba"
+  }
+ ],
+ "repeat_equal": true
+}

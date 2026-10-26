@@ -1,6 +1,6 @@
 # Operations
 
-> The profile is measured on one pair ([results/window-all-2](../results/window-all-2/README.md); open items:
+> The profile is measured on one pair ([results/window-all-3](../results/window-all-3/README.md); open items:
 > [KNOWN-ISSUES](KNOWN-ISSUES.md)). This page is how the pair is run;
 > [AGENTS.md](../AGENTS.md) is the step-by-step bring-up.
 
