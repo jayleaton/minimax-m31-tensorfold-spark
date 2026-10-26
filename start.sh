@@ -36,8 +36,9 @@
 #   engine   ENGINE_PATCHES, ENGINE_COMMIT, TF_REPO, TF_TAG, TF_REF, ZIG_VERSION, BASE_IMAGE, SM, IMAGE, CONTAINER_NAME,
 #            REQUIRED_FAMILY, ALLOW_UNSUPPORTED
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1, FOREGROUND=1, CANARY (strict|warn|off)
-#   memory   MEM_GATE_GIB, MEM_GATE_TIMEOUT, MEM_GATE_DROP_CACHES, DROP_CACHES, MEMGUARD_GIB, MEMGUARD_HOLD_S, MEMGUARD_HARD_GIB
+#   memory   MEM_GATE_GIB, MEM_GATE_TIMEOUT, MEM_GATE_SLACK_GIB, MEM_GATE_DROP_CACHES, DROP_CACHES, MEMGUARD_GIB, MEMGUARD_HOLD_S, MEMGUARD_HARD_GIB
 #   KV tier  KV_TIER_DIR, WORKER_KV_TIER_DIR, KV_TIER_KEEP_GIB (with TF_MM3_KV_TIER, TF_MM3_KV_TIER_GIB, TF_MM3_KV_HORIZON, ...)
+#   prepared PREPARED, HEAD_PREPARED, WORKER_PREPARED, PREPARED_FREE_GIB (each rank's prepared weights at /prepared)
 #   pair     PAIR_WATCH, PAIR_WATCH_S, GUARD_CONFIG
 #   ranks    every TENSORFOLD_*, TF_MM3_*, TF_ROCE_* and TF_CUDA_* variable you export goes to both ranks, and so does every
 #            other exported NCCL_* variable (values of A-Z a-z 0-9 _ . , : = / - only)
@@ -61,6 +62,8 @@ for v in CONTEXT PARALLEL MAX_TOKENS; do [[ -z "${!v}" || "${!v}" =~ ^[1-9][0-9]
 [[ "$ROCE" =~ ^[01]$ ]] || die "ROCE is 1 (RoCE gathers when their setup succeeds) or 0 (NCCL only), not $ROCE"
 [[ -z "$ROCE_MAX_KB" || "$ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "ROCE_MAX_KB is a whole number of KiB or empty, not $ROCE_MAX_KB"
 [[ "$MEM_GATE_GIB" =~ ^[0-9]+$ && "$MEM_GATE_TIMEOUT" =~ ^[0-9]+$ ]] || die "MEM_GATE_GIB (GiB, 0 turns it off) and MEM_GATE_TIMEOUT (s) are whole numbers, not $MEM_GATE_GIB / $MEM_GATE_TIMEOUT"
+[[ "$MEM_GATE_SLACK_GIB" =~ ^[0-9]+$ ]] || die "MEM_GATE_SLACK_GIB is a whole number of GiB under MEM_GATE_GIB, not $MEM_GATE_SLACK_GIB"
+(( MEM_GATE_GIB == 0 || MEM_GATE_SLACK_GIB < MEM_GATE_GIB )) || die "MEM_GATE_SLACK_GIB is a whole number of GiB under MEM_GATE_GIB, not $MEM_GATE_SLACK_GIB"
 for v in MEM_GATE_DROP_CACHES DROP_CACHES PAIR_WATCH; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$PAIR_WATCH_S" =~ ^[1-9][0-9]*$ ]] || die "PAIR_WATCH_S is a whole number of seconds, not $PAIR_WATCH_S"
 [[ "$CANARY" =~ ^(strict|warn|off)$ ]] || die "CANARY is strict, warn or off, not $CANARY"
@@ -128,6 +131,8 @@ printf '%s  %s · 2 x DGX Spark · TensorFold %s · %s · port %s%s\n\n' "$D" "$
   "$([[ -n "$CONTEXT" ]] && echo "$CONTEXT-token window" || echo "engine's default window")" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
+# mark <phase>: the phase timing scripts/serve.sh start reads (MM31_BOOT_MARKS, a file it names; unset: nothing)
+mark() { [[ -z "${MM31_BOOT_MARKS:-}" ]] || echo "$1 $EPOCHREALTIME" >> "$MM31_BOOT_MARKS"; }
 
 command -v docker >/dev/null || die "docker is not installed"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
@@ -257,16 +262,31 @@ if (( ! DRY )); then
   # nothing else on the GPUs: the pair needs both Sparks' memory (another stack's process holds its share until it exits)
   others=$( { nvidia-smi --query-compute-apps=pid,name --format=csv,noheader; worker 1 nvidia-smi --query-compute-apps=pid,name --format=csv,noheader; } 2>/dev/null | grep -c '[0-9]' || true)
   (( others == 0 )) || die "a CUDA process is running on a Spark (nvidia-smi --query-compute-apps on both): stop the other stack first"
-  # memory: a rank that takes all of a Spark's memory freezes the machine. Drop the page cache, then wait for MemFree on both
+  # memory: a rank that takes all of a Spark's memory freezes the machine. Drop the page cache, then the gate on both
+  mark gate
   drop_caches 3
   if ! mem_gate; then
     shm=$(du -sm /dev/shm 2>/dev/null | cut -f1)
-    die "MemFree ${HERE_GB:-?} / ${WORKER_GB:-?} GiB (here / $(worker_host 1)) still under MEM_GATE_GIB $MEM_GATE_GIB after ${MEM_GATE_TIMEOUT}s: stop other workloads (containers, a desktop session, a copy in progress)${shm:+; /dev/shm holds $shm MiB here}. The value is scripts/quant_budget.py --serve for this CONTEXT x PARALLEL; a smaller CONTEXT needs less"
+    die "the memory gate is still shut after ${MEM_GATE_TIMEOUT}s (MEM_GATE_GIB $MEM_GATE_GIB, MemFree floor $(( MEM_GATE_GIB - MEM_GATE_SLACK_GIB ))): $MEM_GATE_WHY. Stop other workloads (containers, a desktop session, a copy in progress)${shm:+; /dev/shm holds $shm MiB here}. The value is scripts/quant_budget.py --serve for this CONTEXT x PARALLEL; a smaller CONTEXT needs less"
   fi
+  mark gate_done
   if ! kv_tier_gate; then
     die "the KV tier needs TF_MM3_KV_TIER_GIB $TF_MM3_KV_TIER_GIB + KV_TIER_KEEP_GIB $KV_TIER_KEEP_GIB GiB on each Spark's disk; $(kv_tier_here) has ${TIER_HERE_GIB:-?} and $(worker_kv_tier_dir) on $(worker_host 1) ${TIER_WORKER_GIB:-?} (free plus the tier's own files)"
   fi
   [[ -z "$KV_TIER_DIR" ]] || log "KV tier: $TIER_HERE_GIB / $TIER_WORKER_GIB GiB for its $TF_MM3_KV_TIER_GIB GiB (here / $(worker_host 1))"
+  # the prepared weights (PREPARED=1): each node's folder made; a rank with no file yet needs PREPARED_FREE_GIB to write one
+  if [[ "$PREPARED" == 1 ]]; then
+    for node in head worker; do
+      p=$(prepared_node "$node" mkdir)
+      case "$p" in
+        file\ *) read -r _ pf ps _ <<<"$p"; log "Prepared weights on the $node: $pf ($(( ps / 1073741824 )) GiB): this boot reads it if its key matches" ;;
+        none\ *) (( ${p#none } >= PREPARED_FREE_GIB )) ||
+                   die "PREPARED=1: no prepared file on the $node yet and only ${p#none } GiB free in $(prepared_dir "$node") (it writes ~94 GiB; PREPARED_FREE_GIB $PREPARED_FREE_GIB): free space, move HEAD_PREPARED / WORKER_PREPARED, or PREPARED=0"
+                 log "Prepared weights on the $node: none yet in $(prepared_dir "$node") (${p#none } GiB free): this boot writes one (~94 GiB, slower than a plain load)" ;;
+        *) die "PREPARED=1: cannot read or create $(prepared_dir "$node" 2>/dev/null || echo the folder) on the $node" ;;
+      esac
+    done
+  fi
   memguard_start
 fi
 
@@ -319,13 +339,18 @@ draft1=""; draft0=()   # the DFlash2 draft's folder of each node at /dflash2, re
 if dflash2_wanted; then
   draft1="-v $(printf '%q' "$(worker_dflash2_dir)"):$DFLASH2_IN_CONTAINER:ro"; draft0=(-v "$(dflash2_dir_here):$DFLASH2_IN_CONTAINER:ro")
 fi
-remote="docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $wmount $tier1 $draft1 $(envs "${ENV1[@]}") $(rank_nccl_env 1) $IMAGE $cmd1"
+prep1=""; prep0=()   # the prepared weights' folder of each node at /prepared, read-write (PREPARED=1: the engine writes it)
+if [[ "$PREPARED" == 1 ]]; then
+  prep1="-v $(printf '%q' "$(worker_prepared_dir)"):$PREPARED_IN_CONTAINER"; prep0=(-v "$(prepared_here):$PREPARED_IN_CONTAINER")
+fi
+mark launch
+remote="docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $wmount $tier1 $draft1 $prep1 $(envs "${ENV1[@]}") $(rank_nccl_env 1) $IMAGE $cmd1"
 if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
 else
   log "Rank 1 on $(worker_host 1): ${SERVE1[*]}"
   worker 1 "$remote" >/dev/null || die "could not start rank 1 on $(worker_host 1)"
 fi
-here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$(head_model_mount)" "${tier0[@]}" "${draft0[@]}")
+here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$(head_model_mount)" "${tier0[@]}" "${draft0[@]}" "${prep0[@]}")
 if [[ "$API_KEY" == 1 ]]; then here+=(-v "$API_KEY_FILE:$API_KEY_IN_CONTAINER:ro"); fi
 for x in "${ENV0[@]}"; do here+=(-e "$x"); done
 rank_nccl_args 0
@@ -367,33 +392,42 @@ until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
 done
 kill $LOGS_PID 2>/dev/null || true
 sleep 0.3
+mark answered
 log "Server answered after $((SECONDS - start))s: $(curl -s --max-time 5 "${AUTH[@]}" "$URL/v1/models")"
 drop_caches 3                                       # the load's page cache, before the smoke test and the canary
 
 # ---------------------------------------------------------------- 5. smoke test
 # Greedy and short; no reply text, or one character repeated (a collapsed model), fails the start.
 step 5 "Smoke test: one chat completion through both ranks"
+mark smoke
 if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 64, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
            python3 -I -c 'import json,sys; r = json.load(sys.stdin); m = r["choices"][0]["message"]; c = m.get("content") or m.get("reasoning_content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+  mark smoke_done
   log "OK: $smoke"
 else
   fail "the smoke test request failed (no reply text, or one character repeated: the weights load but the model does not answer); the ranks are still running"
 fi
 # The canary (scripts/canary.py): a greedy chat, a reply with separated reasoning, a tool call the server parses into tool_calls
 # with no raw markup, a JSON reply. CANARY=strict stops both ranks on a failure and keeps their last logs (DeepSeek's rule).
+# STATE_DIR/canary-last records the verdict for this rank 0 container's start time (scripts/serve.sh ready reads it).
+canary_record() { echo "started=$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER_NAME" 2>/dev/null || echo unknown) result=$1 at=$(date -u +%FT%TZ)" > "$STATE_DIR/canary-last"; }
 if [[ "$CANARY" != off ]]; then
   cargs=(--base "$URL" --model "$SERVED_NAME"); [[ "$API_KEY" != 1 ]] || cargs+=(--api-key-file "$API_KEY_FILE")
-  if timeout 900 python3 -I scripts/canary.py "${cargs[@]}"; then :
+  if timeout 900 python3 -I scripts/canary.py "${cargs[@]}"; then canary_record pass
   elif [[ "$CANARY" == strict ]]; then
+    canary_record fail
     docker logs --tail 200 "$CONTAINER_NAME" > "$STATE_DIR/canary-fail-r0.log" 2>&1 || true
     worker 1 docker logs --tail 200 "$CONTAINER_NAME" > "$STATE_DIR/canary-fail-r1.log" 2>&1 || true
     ./stop.sh >/dev/null 2>&1 || true
     die "the canary failed (CANARY=strict): both ranks stopped; their last logs are in $STATE_DIR/canary-fail-r{0,1}.log"
   else
+    canary_record fail
     warn "the canary failed (CANARY=warn): still serving"
   fi
   drop_caches 3                                     # the canary's page cache out again
+else
+  canary_record off
 fi
 # Headroom: how far MemAvailable sits above memguard's floor once the weights and caches are loaded. Nothing in the engine holds
 # it above that floor while it runs, and memguard kills the rank if it reaches the floor.
@@ -409,6 +443,9 @@ if awk -v g="$MEMGUARD_GIB" 'BEGIN {exit !(g > 0)}'; then
 fi
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
+# the pair serves: after a reboot scripts/boot-start.sh starts it again (stop.sh removes this, except at a system shutdown)
+echo "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown) $(date +%s)" > "$STATE_DIR/serving"
+mark live
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)

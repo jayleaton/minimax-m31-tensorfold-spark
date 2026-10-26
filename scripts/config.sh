@@ -272,17 +272,33 @@ WORKER_KV_TIER_DIR="${WORKER_KV_TIER_DIR:-}"
 KV_TIER_KEEP_GIB="${KV_TIER_KEEP_GIB:-300}"
 KV_TIER_IN_CONTAINER=/kvtier
 
+# ---------------------------------------------------------------- prepared per-rank weights
+# PREPARED=1 (an engine that reads TF_MM3_PREPARED; one without it ignores both variables): each rank keeps its share of the
+# weights, as the engine lays them out on the GPU, in one file of its node's folder, HEAD_PREPARED here and WORKER_PREPARED on
+# the worker (default: each node's ~/.cache/tensorfold-minimax-m3/prepared; a leading ~/ is each node's own home), mounted at
+# /prepared. A boot that finds no file for its key writes mm3-r<rank>of<world>-<key16>.tfprep (~94 GiB a rank,
+# TF_MM3_PREPARED_WRITE=1); later boots read it. The key covers the pack revision, the engine build and the layout settings:
+# a change makes a new key and leaves the old file stale (scripts/serve.sh prepared clean). Both ranks get the same two
+# variables (rank_env), so the switch is on for both or for neither; each node's folder holds only its own rank's file.
+# preflight wants PREPARED_FREE_GIB free on a node whose folder has no file yet.
+PREPARED="${PREPARED:-0}"
+HEAD_PREPARED="${HEAD_PREPARED:-$CACHE_DIR/prepared}"
+WORKER_PREPARED="${WORKER_PREPARED:-}"; [[ -n "$WORKER_PREPARED" ]] || WORKER_PREPARED=\~/.cache/tensorfold-minimax-m3/prepared
+PREPARED_FREE_GIB="${PREPARED_FREE_GIB:-100}"
+PREPARED_IN_CONTAINER=/prepared
+
 # ---------------------------------------------------------------- memory
 # A Spark's GPU shares its memory with the host: a rank that takes it all does not fail cleanly, the machine freezes and has to
 # be power-cycled. Both Sparks have the same MemTotal (127.6 GB) since the worker's BIOS and firmware match the head's
 # (2026-10-24), so either rank can bind: every floor below is one value checked on BOTH ranks (the DeepSeek recipe, PR #79).
 # The levels, highest first (docs/OPERATIONS.md, Memory):
-#  - MEM_GATE_GIB: before a load, MemFree (not MemAvailable: on GB10 the page cache is the GPU's memory too) must reach this
-#    on both Sparks within MEM_GATE_TIMEOUT s, or the start stops. With MEM_GATE_DROP_CACHES=1 the gate drops the page cache
-#    (`sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches'`; the scoped sudoers line is in AGENTS.md) while it waits, and
-#    DROP_CACHES=1 drops it (echo 3) before the load, after the server answers and after the canary. The value is
-#    scripts/quant_budget.py --serve for the configured CONTEXT x PARALLEL and KV (weights a rank + the engine's reserve,
-#    runtime and workspaces + that KV), not a measurement. 0 turns the gate off.
+#  - MEM_GATE_GIB: before a load, after the page cache is dropped (echo 3), MemAvailable (MemFree plus what the kernel can
+#    still reclaim) must reach this on both Sparks, and MemFree itself at least MEM_GATE_GIB - MEM_GATE_SLACK_GIB (on GB10
+#    the page cache is the GPU's memory too, so the slack bounds what may still be cache), within MEM_GATE_TIMEOUT s, or the
+#    start stops. With MEM_GATE_DROP_CACHES=1 the gate drops the page cache (`sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'`;
+#    the scoped sudoers line is in AGENTS.md) while it waits, and DROP_CACHES=1 drops it (echo 3) before the load, after the
+#    server answers and after the canary. The value is scripts/quant_budget.py --serve for the configured CONTEXT x PARALLEL
+#    and KV (weights a rank + the engine's reserve, runtime and workspaces + that KV), not a measurement. 0 turns the gate off.
 #  - TENSORFOLD_MEMORY_RESERVE_GIB (config/prod.env, both ranks): what the engine leaves free when it sizes its KV pool. The
 #    engine's own default is a tenth of MemTotal (12.2 GiB here), which would leave this pack about 6 GiB of KV a rank.
 #  - the guard's hard STOP (scripts/guard, 4 GiB of MemAvailable on either node), when the guard runs.
@@ -295,6 +311,7 @@ KV_TIER_IN_CONTAINER=/kvtier
 #    both nodes and warns when it does not.
 MEM_GATE_GIB="${MEM_GATE_GIB:-0}"
 MEM_GATE_TIMEOUT="${MEM_GATE_TIMEOUT:-600}"
+MEM_GATE_SLACK_GIB="${MEM_GATE_SLACK_GIB:-4}"
 MEM_GATE_DROP_CACHES="${MEM_GATE_DROP_CACHES:-1}"
 DROP_CACHES="${DROP_CACHES:-1}"
 MEMGUARD_GIB="${MEMGUARD_GIB:-3}"
@@ -369,6 +386,20 @@ if [[ -n "$KV_TIER_DIR" ]]; then
 elif [[ -n "${TF_MM3_KV_TIER:-}" ]]; then
   die "TF_MM3_KV_TIER is set without KV_TIER_DIR: nothing would be mounted at $TF_MM3_KV_TIER"
 fi
+# the prepared weights: PREPARED=1 mounts each node's folder at /prepared and gives both ranks the same two variables
+[[ "$PREPARED" =~ ^[01]$ ]] || die "PREPARED is 0 or 1, not $PREPARED"
+[[ "$PREPARED_FREE_GIB" =~ ^[0-9]+$ ]] || die "PREPARED_FREE_GIB is a whole number of GiB, not $PREPARED_FREE_GIB"
+for _n in HEAD_PREPARED WORKER_PREPARED; do
+  [[ "${!_n}" == /* || "${!_n}" == \~/* ]] || die "$_n is an absolute path or one under ~/, not ${!_n}"
+done
+if [[ "$PREPARED" == 1 ]]; then
+  [[ -z "${TF_MM3_PREPARED:-}" || "$TF_MM3_PREPARED" == "$PREPARED_IN_CONTAINER" ]] ||
+    die "PREPARED=1 mounts the folder at $PREPARED_IN_CONTAINER: leave TF_MM3_PREPARED unset (it is $TF_MM3_PREPARED)"
+  export TF_MM3_PREPARED=$PREPARED_IN_CONTAINER TF_MM3_PREPARED_WRITE="${TF_MM3_PREPARED_WRITE:-1}"
+  [[ "$TF_MM3_PREPARED_WRITE" =~ ^[01]$ ]] || die "TF_MM3_PREPARED_WRITE is 1 (write a missing file) or 0 (read only), not $TF_MM3_PREPARED_WRITE"
+elif [[ -n "${TF_MM3_PREPARED:-}${TF_MM3_PREPARED_WRITE:-}" ]]; then
+  die "TF_MM3_PREPARED / TF_MM3_PREPARED_WRITE are set without PREPARED=1: nothing would be mounted at $PREPARED_IN_CONTAINER (set PREPARED=1 instead)"
+fi
 if [[ "$WEIGHTS" == dir ]]; then
   for _n in MODEL_DIR WORKER_MODEL_DIR; do
     [[ -z "${!_n}" || "${!_n}" == /* || "${!_n}" == "~/"* ]] || die "$_n is an absolute path or one under ~/, not ${!_n}"
@@ -404,6 +435,8 @@ snapshot_rev() { local rev=$MODEL_REVISION; [[ -n "$rev" ]] || rev=$(cat "$(mode
 model_dir_here() { local d=$MODEL_DIR; [[ "$d" != "~/"* ]] || d="$HOME/${d#"~/"}"; echo "$d"; }
 # kv_tier_here: the KV tier's folder on this Spark (a leading ~/ is this node's home)
 kv_tier_here() { local d=$KV_TIER_DIR; [[ "$d" != "~/"* ]] || d="$HOME/${d#"~/"}"; echo "$d"; }
+# prepared_here: the prepared weights' folder on this Spark (HEAD_PREPARED; a leading ~/ is this node's home)
+prepared_here() { local d=$HEAD_PREPARED; [[ "$d" != \~/* ]] || d="$HOME/${d#\~/}"; echo "$d"; }
 # dflash2_dir_here: the DFlash2 draft's folder on this Spark (a leading ~/ is this node's home)
 dflash2_dir_here() { local d=$DFLASH2_DIR; [[ "$d" != "~/"* ]] || d="$HOME/${d#"~/"}"; echo "$d"; }
 # dflash2_wanted: this start loads the DFlash2 draft (DRAFTS=dflash2, or DRAFTS=1 with DRAFTER=dflash2)

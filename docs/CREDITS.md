@@ -26,9 +26,8 @@ If something is missing or credited wrongly, please open an issue.
 This recipe is built on Mia's work ([MiaAI-Lab](https://github.com/MiaAI-Lab) on GitHub,
 [Mia-AiLab](https://huggingface.co/Mia-AiLab) on Hugging Face):
 
-- The **MiniMax-M3.1-Flash TensorFold recipe**,
-  [MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold)
-  (Apache-2.0), imported at `fd1d379` as this repository's base: `start.sh`, `stop.sh`, node and link discovery, the memory
+- Mia / MiaAI-Lab's **MiniMax-M3.1-Flash TensorFold recipe and `minimax_m3_vl` family patch** (private repo;
+  Apache-2.0), imported at `fd1d379` as this repository's base: `start.sh`, `stop.sh`, node and link discovery, the memory
   guard, the image build, and the engine notes in `docs/` (rank contract, FP8 KV, dspark plan, loader speed, engine port
   plan, GLM engine reuse, speed surveys, build notes). What changed since: [PORT](PORT.md), [CHANGELOG](CHANGELOG.md).
 - The **`minimax_m3_vl` TensorFold family patch** (`patches/0001-minimax-m3-family.patch`, per task in `patches/tasks/`;

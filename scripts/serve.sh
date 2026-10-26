@@ -15,7 +15,21 @@
 #   scripts/serve.sh start       preflight (PREFLIGHT=strict|warn|off), then ./start.sh: page cache dropped, MemFree gate on
 #                                both Sparks, rank 1 then rank 0, memory guard and pair watch, wait for /v1/models, smoke test,
 #                                canary, caches dropped again
-#   scripts/serve.sh restart | stop | status | logs [0|1] | health | canary | args | xid [SINCE] | watch [--once]
+#   scripts/serve.sh up          the same as start
+#   scripts/serve.sh restart | stop | status | logs [0|1] | canary | args | xid [SINCE] | watch [--once]
+#   scripts/serve.sh health [--json]   liveness: both ranks running, /health 200, /v1/models lists SERVED_NAME (exit 0 / 1)
+#   scripts/serve.sh ready [--json]    readiness, for supervisors and load balancers: health, and the last start's canary passed
+#                                for this rank 0 container, both nodes' device thermal state normal, no thermal-stop or
+#                                fail-fast record (exit 0 only then)
+#   scripts/serve.sh boot-times [N]    the last N starts' phase timing (STATE_DIR/boot-times.jsonl; start prints its own)
+#   scripts/serve.sh prepared [list | clean [all]]   the prepared per-rank weights' files on both nodes (PREPARED=1): size,
+#                                age, newest or stale; clean removes the stale ones (all but each rank's newest), clean all
+#                                every one (the server stopped)
+#   scripts/serve.sh upgrade     the safe path to a new IMAGE or pack revision (config/prod.env): stop, build / prepare,
+#                                preflight, start with the canary required; on a failure it rolls back to the last good image
+#                                by itself and says so (STATE_DIR/last-good.env, recorded after every start whose canary passed)
+#   scripts/serve.sh rollback [--clear]   restart on the last good image and revision and pin them (STATE_DIR/rollback.env)
+#                                until --clear
 #   scripts/serve.sh roce-reset      delete the RoCE failure marker (TF_ROCE_MARK) on both nodes after the link is fixed: the
 #                                next start tries RoCE again (while it exists both ranks start on NCCL)
 #   scripts/serve.sh thermal-clear   clear a thermal hard stop (memguard's record on either node) once both nodes read at or
@@ -34,10 +48,16 @@ fi
 export CONFIG
 source ./scripts/config.sh
 source ./scripts/nodes.sh
+source ./scripts/ops.sh
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 [[ "${1:-}" =~ ^(|help|-h|--help)$ ]] || check_workers
 mkdir -p "$STATE_DIR" "$LOG_DIR"
+# a rollback pin (scripts/serve.sh rollback, or a failed upgrade): what starts runs on the last good image and revision
+if [[ -f "$ROLLBACK_PIN" && -z "${MM31_PINNED:-}" && "${1:-}" =~ ^(start|up|restart|args|preflight)$ ]]; then
+  warn "rollback pin $ROLLBACK_PIN: running on $(ops_kv "$ROLLBACK_PIN" IMAGE) @ $(ops_kv "$ROLLBACK_PIN" MODEL_REVISION | cut -c1-8), not config/prod.env's $IMAGE (scripts/serve.sh rollback --clear drops it)"
+  exec env MM31_PINNED=1 IMAGE="$(ops_kv "$ROLLBACK_PIN" IMAGE)" MODEL_REVISION="$(ops_kv "$ROLLBACK_PIN" MODEL_REVISION)" PREPARE=0 "$PWD/scripts/serve.sh" "$@"
+fi
 PREFLIGHT="${PREFLIGHT:-strict}"
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
@@ -161,27 +181,35 @@ preflight() {
       on_node "$node" "sudo -n true" >/dev/null 2>&1 || pf "warning: no passwordless sudo -n on the $node: the page cache cannot be dropped (AGENTS.md, scoped sudoers line)"
     fi
   done
+  # the prepared weights (PREPARED=1): which files each node holds for its rank, and room to write one where none is
+  if [[ "$PREPARED" == 1 ]]; then
+    local pn=()
+    for node in head worker; do
+      out=$(prepared_node "$node")
+      case "$out" in
+        file\ *) read -r _ h w _ <<<"$out"; pn+=(file); log "preflight: prepared weights on the $node: $h ($(( w / 1073741824 )) GiB; read when its key matches this build and pack)" ;;
+        none\ *) pn+=(none)
+                 if (( ${out#none } >= PREPARED_FREE_GIB )); then log "preflight: prepared weights on the $node: none yet ($(prepared_dir "$node"), ${out#none } GiB free): the next start writes one (~94 GiB)"
+                 else pf "no prepared file on the $node and only ${out#none } GiB free in $(prepared_dir "$node") (PREPARED_FREE_GIB $PREPARED_FREE_GIB: a rank writes ~94 GiB)"; bad=1; fi ;;
+        *) pn+=(unreadable); pf "the prepared folder on the $node ($(prepared_dir "$node" 2>/dev/null)) cannot be read"; bad=1 ;;
+      esac
+    done
+    [[ "${pn[0]}" == "${pn[1]:-}" || "${pn[*]}" == *unreadable* ]] ||
+      pf "warning: one node has a prepared file and the other none: the next start reads on one rank and writes on the other (as slow as the writing rank)"
+  fi
   [[ "$static" == static ]] && return $bad
   # what fails while something else serves
   for p in "$PORT" "$MASTER_PORT" "$((MASTER_PORT + 1))"; do listening "$p" && { pf "something listens on :$p already"; bad=1; }; done
   if gpu_busy; then pf "a CUDA process is running on a Spark (nvidia-smi): stop the other stack first"; bad=1; fi
-  h=$(memfree head); w=$(memfree worker)
-  if (( MEM_GATE_GIB > 0 )) && (( ${h:-0} < MEM_GATE_GIB || ${w:-0} < MEM_GATE_GIB )); then
-    pf "warning: MemFree ${h:-?} / ${w:-?} GiB (here / worker) under MEM_GATE_GIB $MEM_GATE_GIB: start drops the page cache and waits up to ${MEM_GATE_TIMEOUT}s"
+  if (( MEM_GATE_GIB > 0 )); then
+    for node in head worker; do
+      read -r h w < <(meminfo_kb "$node") || true
+      out=$(mem_gate_check "${h:-}" "${w:-}") ||
+        pf "warning: the memory gate would wait on the $node now ($out): start drops the page cache and waits up to ${MEM_GATE_TIMEOUT}s"
+      h=""; w=""
+    done
   fi
   return $bad
-}
-
-# health: one verdict for scripts and people: both containers up, /health 200, /v1/models lists SERVED_NAME. 0 healthy
-health() {
-  local r0 r1 code body
-  r0=$(running 0); r1=$(running 1)
-  [[ "$r0" == true ]] || { log "health: rank 0 $r0"; return 1; }
-  [[ "$r1" == true ]] || { log "health: rank 1 $r1"; return 1; }
-  body=$(curl -s -m 10 "${AUTH[@]}" -w '\n%{http_code}' "$BASE/health" || true); code=${body##*$'\n'}; body=${body%$'\n'*}
-  [[ "$code" == 200 ]] || { log "health: /health $code ${body:0:300}"; return 1; }
-  curl -s -m 10 "${AUTH[@]}" "$BASE/v1/models" | grep -q "\"$SERVED_NAME\"" || { log "health: /v1/models does not list $SERVED_NAME"; return 1; }
-  log "health: ok (both ranks up, /health 200, $SERVED_NAME listed)"
 }
 
 cmd_xid() { # NVIDIA Xid events on both Sparks since $1 (journalctl syntax; default the last hour); non-zero if one was seen
@@ -204,15 +232,24 @@ prepare)
   if server_running; then die "the server is running: scripts/serve.sh stop first (the setup reads ${MODEL_GIB} GiB)"; fi
   shift; exec ./scripts/prepare.sh "$@" ;;
 preflight) preflight "${2:-}" && log "preflight ok${2:+ ($2)}" ;;
-start|restart)
-  mode=$1; shift
+start|up|restart)
+  mode=$1; shift; [[ "$mode" != up ]] || mode=start
+  # the phase marks (start.sh's mark) for the timing line and STATE_DIR/boot-times.jsonl; none with FOREGROUND=1 (no end)
+  marks=""
+  if [[ "${FOREGROUND:-0}" != 1 && "${DRY_RUN:-0}" != 1 ]]; then marks=$(mktemp "$STATE_DIR/boot-marks.XXXXXX"); trap 'rm -f "$marks"' EXIT; echo "begin $EPOCHREALTIME" > "$marks"; fi
   case "$PREFLIGHT" in
     off) ;;
     # a restart preflights statically: the running pair holds the ports and the GPUs until ./start.sh stops it
-    strict) preflight "$( [[ "$mode" == restart ]] && server_running && echo static)" || die "preflight failed (above); not starting (PREFLIGHT=warn starts anyway)" ;;
+    strict) preflight "$( [[ "$mode" == restart ]] && server_running && echo static)" || { rm -f "$marks"; die "preflight failed (above); not starting (PREFLIGHT=warn starts anyway)"; } ;;
     *) preflight "$( [[ "$mode" == restart ]] && server_running && echo static)" || warn "preflight: problems above (PREFLIGHT=warn: starting anyway)" ;;
   esac
-  if [[ "$mode" == restart ]]; then exec ./start.sh restart "$@"; else exec ./start.sh "$@"; fi ;;
+  [[ -n "$marks" ]] || { if [[ "$mode" == restart ]]; then exec ./start.sh restart "$@"; else exec ./start.sh "$@"; fi; }
+  rc=0
+  if [[ "$mode" == restart ]]; then MM31_BOOT_MARKS=$marks ./start.sh restart "$@" || rc=$?; else MM31_BOOT_MARKS=$marks ./start.sh "$@" || rc=$?; fi
+  ops_boot_record "$marks" "$mode" "$rc"
+  rm -f "$marks"
+  (( rc != 0 )) || ops_last_good_record
+  exit "$rc" ;;
 stop) exec ./stop.sh ;;
 status)
   echo "rank 0 (here): $(docker ps -a --filter "name=^${CONTAINER_NAME}\$" --format '{{.Status}}' 2>/dev/null || echo '?')"
@@ -221,6 +258,9 @@ status)
   [[ -f "$STATE_DIR/memguard.pid" ]] && echo "memory guard here: on" || echo "memory guard here: off"
   [[ ! -f "$STATE_DIR/failfast" ]] || echo "fail-fast: $(cut -d' ' -f2- "$STATE_DIR/failfast") (at $(date -d "@$(cut -d' ' -f1 "$STATE_DIR/failfast")" '+%F %T'))"
   [[ ! -f "$STATE_DIR/stopped" ]] || echo "stopped on purpose (the watchdog stands down until the next start)"
+  [[ ! -f "$ROLLBACK_PIN" ]] || echo "ROLLBACK PIN: starts run on $(ops_kv "$ROLLBACK_PIN" IMAGE) @ $(ops_kv "$ROLLBACK_PIN" MODEL_REVISION | cut -c1-8) (scripts/serve.sh rollback --clear)"
+  [[ ! -f "$LAST_GOOD" ]] || echo "last good: $(ops_kv "$LAST_GOOD" IMAGE) (content $(ops_kv "$LAST_GOOD" IMAGE_IDENT | cut -c1-12)) @ $(ops_kv "$LAST_GOOD" MODEL_REVISION | cut -c1-8), $(ops_kv "$LAST_GOOD" UTC)"
+  [[ "$PREPARED" != 1 ]] || echo "prepared weights: $(prepared_node head | cut -d' ' -f1-2) here, $(prepared_node worker | cut -d' ' -f1-2) on the worker (scripts/serve.sh prepared)"
   rm_=$(roce_marks | paste -sd, -); [[ -z "$rm_" ]] || echo "RoCE failure marker on the $rm_: serving on NCCL (scripts/serve.sh roce-reset)"
   ts=$(thermal_stops); [[ -z "$ts" ]] || echo "THERMAL HARD STOP recorded: ${ts//$'\n'/; } (scripts/serve.sh thermal-clear)"
   echo "device thermal state: $(device_state head) here, $(device_state worker) on the worker; hottest reading (GPU, ACPI): $(hottest_now head || echo ?) / $(hottest_now worker || echo ?) C (the device's limits: pause ${GUARD_PAUSE_C:-?}, resume ${GUARD_RESUME_C:-?}, stop ${GUARD_KILL_C:-?} C for ${GUARD_KILL_HOLD_S:-?} s)"
@@ -228,7 +268,13 @@ status)
   curl -s -m 10 "${AUTH[@]}" "$BASE/v1/models" || true; echo
   curl -s -m 10 "${AUTH[@]}" "$BASE/health" || true; echo ;;
 logs) if [[ "${2:-0}" == 1 ]]; then worker 1 docker logs --tail "${TAIL:-80}" "$CONTAINER_NAME"; else docker logs --tail "${TAIL:-80}" "$CONTAINER_NAME"; fi ;;
-health) health ;;
+health|ready) ops_verdict "$1" "${2:-}" ;;
+boot-times) ops_boot_times "${2:-10}" ;;
+prepared) ops_prepared "${2:-list}" "${3:-}" ;;
+upgrade) ops_upgrade ;;
+rollback)
+  if [[ "${2:-}" == --clear ]]; then rm -f "$ROLLBACK_PIN"; log "rollback pin dropped: start / restart use config/prod.env's $IMAGE again"
+  else ops_rollback "${2:-by hand}"; fi ;;
 canary)
   cargs=(--base "$BASE" --model "$SERVED_NAME"); [[ "$API_KEY" != 1 ]] || cargs+=(--api-key-file "$API_KEY_FILE")
   exec python3 -I scripts/canary.py "${cargs[@]}" ;;

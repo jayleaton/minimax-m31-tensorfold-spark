@@ -1,6 +1,7 @@
 # Credits of the base recipe (MiaAI-Lab)
 
-This is MiaAI-Lab's `CREDITS.md` from the base recipe, kept as imported with the lines added since. This repository's own credits,
+This is MiaAI-Lab's `CREDITS.md` from the base recipe, kept as imported with the lines added since (a link to a
+repository of hers that is private is written as its name). This repository's own credits,
 which include everyone named here, are [CREDITS.md](CREDITS.md).
 
 This repository is a recipe: scripts, a Dockerfile and a list of pins that put other people's work together on two DGX
@@ -94,7 +95,7 @@ Their numbers and anything not run are recorded in `patches/README.md`.
   `stop.sh`, the start banner, the loading progress line and the image's build pattern come from Mia's AI Lab's
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold) and
   from Mia's AI Lab's native-Zig
-  [DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-TensorFold),
+  DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-TensorFold (private repo),
   with code those contributors authored in the GLM recipe:
   - **webzone**: both PCIe links of a cabled QSFP port as rails (the DGX Spark "twins") in `scripts/nodes.sh`
     ([`d5afeb0`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/d5afeb0));

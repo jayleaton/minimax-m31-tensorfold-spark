@@ -8,8 +8,8 @@ any model weights.
 
 This project builds on other work that keeps its own license:
 
-MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold: the base of this recipe; see the section at the end of this
-file, which reproduces its NOTICE.
+MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold (a private repository): the base of this recipe; see the
+section at the end of this file, which reproduces its NOTICE.
 
 DeepSeek-V4.1 TensorFold recipe
   https://github.com/jayleaton/deepseek-v41-tensorfold-spark, Copyright 2026 Jay Leaton, Apache License 2.0.
@@ -68,7 +68,7 @@ Not included; each user obtains these under their own terms:
   from.
 
 ====================================================================================================
-MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold (the base of this recipe)
+MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold (the base of this recipe; a private repository)
   Copyright 2026 MiaAI-Lab. Apache License, Version 2.0. Imported at commit fd1d379: start.sh, stop.sh, scripts/
   (banner.sh, check-drafted.sh, config.sh, local.sh.example, memguard.sh, nodes.sh, prepare.sh, publish-image.sh),
   zig/Dockerfile, patches/ (unchanged), docs/ (dspark-plan, engine-port-plan, engine-reuse-glm-zig, fp8-kv,

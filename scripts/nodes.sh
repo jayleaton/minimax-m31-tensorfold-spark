@@ -105,6 +105,54 @@ kv_tier_gate() {
   TIER_WORKER_GIB=$(worker 1 "$(kv_tier_room_cmd "$w")") || TIER_WORKER_GIB=0
   (( ${TIER_HERE_GIB:-0} >= need && ${TIER_WORKER_GIB:-0} >= need ))
 }
+# The prepared weights (PREPARED=1, config.sh). worker_prepared_dir: the folder on worker 1 (WORKER_PREPARED; ~/ is its home);
+# prepared_dir <head|worker>: that node's folder. The engine names a rank's file mm3-r<rank>of<world>-<key16>.tfprep.
+PREPARED_RE='^mm3-r([0-9]+)of([0-9]+)-([0-9A-Za-z]{16})\.tfprep$'
+worker_prepared_dir() {
+  local d=$WORKER_PREPARED h
+  [[ "$d" == \~/* ]] || { echo "$d"; return 0; }
+  [[ -z "${WORKER_DOWN[1]:-}" ]] || { echo "<WORKER:$d>"; return 0; }
+  h=$(worker 1 "printf %s \"\$HOME\"") && [[ "$h" == /* ]] || return 1
+  echo "$h/${d#\~/}"
+}
+prepared_dir() { if [[ "$1" == head ]]; then prepared_here; else worker_prepared_dir; fi; }
+# prepared_scan_cmd <dir> [mkdir]: a shell command printing "F <name> <bytes> <mtime>" for each prepared file there and
+# "D <bytes free>" for its disk (the nearest folder that exists; mkdir: create the folder first). Read-only without mkdir.
+prepared_scan_cmd() {
+  local q; q=$(printf '%q' "$1")
+  printf '%s' "$([[ "${2:-}" != mkdir ]] || echo "mkdir -p $q && ")"
+  printf '%s' "d=$q; while [ ! -d \"\$d\" ]; do d=\$(dirname \"\$d\"); done; [ \"\$d\" != $q ] || "
+  printf '%s\n' "find $q -maxdepth 1 -type f -name 'mm3-r*of*-*.tfprep' -printf 'F %f %s %T@\\n'; echo \"D \$(df -B1 --output=avail \"\$d\" | tail -1)\""
+}
+# prepared_scan <head|worker> [mkdir]: prepared_scan_cmd run on that node
+prepared_scan() {
+  local d; d=$(prepared_dir "$1") || return 1
+  if [[ "$1" == head ]]; then bash -c "$(prepared_scan_cmd "$d" "${2:-}")"; else worker 1 "$(prepared_scan_cmd "$d" "${2:-}")"; fi
+}
+# prepared_stale [all]: stdin prepared_scan lines; prints the file names to remove: every one but the newest of each
+# rank-of-world (all: every one). Pure.
+prepared_stale() {
+  local kind name size mt
+  while read -r kind name size mt; do
+    [[ "$kind" == F && "$name" =~ $PREPARED_RE ]] || continue
+    printf '%s %s %s\n' "r${BASH_REMATCH[1]}of${BASH_REMATCH[2]}" "${mt%.*}" "$name"
+  done | LC_ALL=C sort -k1,1 -k2,2nr -k3,3r | awk -v all="${1:-}" '{ if (all == "all" || seen[$1]++) print $3 }'
+}
+# prepared_node <head|worker> [mkdir]: that node's own rank (head 0, worker 1): "file <name> <bytes> <mtime>" (its newest
+# file), "none <GiB free>", or "unreadable"
+prepared_node() {
+  local r out kind name size mt free="" best="" bt=0
+  [[ "$1" == head ]] && r=0 || r=1
+  out=$(prepared_scan "$@" 2>/dev/null) || { echo unreadable; return 0; }
+  while read -r kind name size mt; do
+    if [[ "$kind" == D ]]; then free=$name; continue; fi
+    [[ "$kind" == F && "$name" =~ $PREPARED_RE && "${BASH_REMATCH[1]}" == "$r" && "${BASH_REMATCH[2]}" == "$TP" ]] || continue
+    (( ${mt%.*} >= bt )) && { best="$name $size ${mt%.*}"; bt=${mt%.*}; }
+  done <<<"$out"
+  if [[ -n "$best" ]]; then echo "file $best"
+  elif [[ "$free" =~ ^[0-9]+$ ]]; then echo "none $(( free / 1073741824 ))"
+  else echo unreadable; fi
+}
 model_dir_manifest() {
   local d q
   if [[ "$1" == head ]]; then d=$(model_dir_here); else d=$(worker_model_dir) || return 1; fi
@@ -417,19 +465,47 @@ drop_caches() {
   if worker 1 "$cmd" 2>/dev/null; then log "Dropped the page cache on $(worker_host 1) (MemFree now $(memfree worker) GiB)"
   else warn "drop_caches refused on $(worker_host 1) (no scoped sudo -n: AGENTS.md)"; fi
 }
-# mem_gate: MemFree >= MEM_GATE_GIB on both Sparks, waiting up to MEM_GATE_TIMEOUT s (dropping the page cache every 10 s with
-# MEM_GATE_DROP_CACHES=1). Sets HERE_GB / WORKER_GB. 1 when the time ran out (the caller refuses the start).
+# meminfo_kb <head|worker>: "<MemFree kB> <MemAvailable kB>" (empty when the worker cannot be read)
+meminfo_kb() {
+  local q="awk '/^MemFree:/ {f = \$2} /^MemAvailable:/ {a = \$2} END {if (f != \"\" && a != \"\") print f, a}' /proc/meminfo"
+  if [[ "$1" == head ]]; then bash -c "$q"; else worker 1 "$q" 2>/dev/null || true; fi
+}
+# mem_gate_check <MemFree kB> <MemAvailable kB>: the gate's rule for one node, pure (no I/O). 0 when the profile's memory is
+# there: MemAvailable (MemFree plus what the kernel can still reclaim, read after a drop) >= MEM_GATE_GIB, and MemFree >=
+# MEM_GATE_GIB - MEM_GATE_SLACK_GIB (on GB10 the page cache is the GPU's memory too: the slack bounds how much of the
+# profile may still sit in reclaimable cache when the load starts). Otherwise 1, and why on stdout.
+mem_gate_check() {
+  local free=$1 avail=$2 gib=1048576 floor why=()
+  floor=$(( MEM_GATE_GIB > MEM_GATE_SLACK_GIB ? MEM_GATE_GIB - MEM_GATE_SLACK_GIB : 0 ))
+  [[ "$free" =~ ^[0-9]+$ && "$avail" =~ ^[0-9]+$ ]] || { echo "meminfo unreadable"; return 1; }
+  (( avail >= MEM_GATE_GIB * gib )) ||
+    why+=("MemAvailable $(awk -v k="$avail" 'BEGIN {printf "%.1f", k / 1048576}') GiB < MEM_GATE_GIB $MEM_GATE_GIB")
+  (( free >= floor * gib )) ||
+    why+=("MemFree $(awk -v k="$free" 'BEGIN {printf "%.1f", k / 1048576}') GiB < $floor (MEM_GATE_GIB - MEM_GATE_SLACK_GIB $MEM_GATE_SLACK_GIB)")
+  (( ${#why[@]} == 0 )) && return 0
+  floor=$(printf '%s; ' "${why[@]}"); echo "${floor%; }"; return 1
+}
+# mem_gate: mem_gate_check on both Sparks, waiting up to MEM_GATE_TIMEOUT s (dropping the page cache, echo 3, every 10 s with
+# MEM_GATE_DROP_CACHES=1) and saying which node waits and why. Sets HERE_GB / WORKER_GB (MemFree, whole GiB) and
+# MEM_GATE_WHY (the last reason, for the caller's refusal). 1 when the time ran out (the caller refuses the start).
 mem_gate() {
-  local t0=$SECONDS
+  local t0=$SECONDS hf ha wf wa hwhy wwhy
+  MEM_GATE_WHY=""
   (( MEM_GATE_GIB > 0 )) || return 0
   while :; do
-    HERE_GB=$(memfree head); WORKER_GB=$(memfree worker)
-    if (( ${HERE_GB:-0} >= MEM_GATE_GIB && ${WORKER_GB:-0} >= MEM_GATE_GIB )); then
-      log "MemFree $HERE_GB / $WORKER_GB GiB (here / $(worker_host 1)) >= MEM_GATE_GIB $MEM_GATE_GIB"; return 0
+    hf=""; ha=""; wf=""; wa=""
+    read -r hf ha < <(meminfo_kb head) || true; read -r wf wa < <(meminfo_kb worker) || true
+    HERE_GB=""; [[ ! "$hf" =~ ^[0-9]+$ ]] || HERE_GB=$(( hf / 1048576 ))
+    WORKER_GB=""; [[ ! "$wf" =~ ^[0-9]+$ ]] || WORKER_GB=$(( wf / 1048576 ))
+    hwhy=$(mem_gate_check "$hf" "$ha") && hwhy=""; wwhy=$(mem_gate_check "$wf" "$wa") && wwhy=""
+    if [[ -z "$hwhy" && -z "$wwhy" ]]; then
+      log "Memory gate passed: MemAvailable $(awk -v a="$ha" -v b="$wa" 'BEGIN {printf "%.1f / %.1f", a / 1048576, b / 1048576}') GiB >= MEM_GATE_GIB $MEM_GATE_GIB, MemFree $HERE_GB / $WORKER_GB GiB >= $(( MEM_GATE_GIB - MEM_GATE_SLACK_GIB )) (here / $(worker_host 1))"
+      return 0
     fi
+    MEM_GATE_WHY="${hwhy:+here: $hwhy}${hwhy:+${wwhy:+; }}${wwhy:+$(worker_host 1): $wwhy}"
     (( SECONDS - t0 < MEM_GATE_TIMEOUT )) || return 1
-    log "Waiting for memory: MemFree ${HERE_GB:-?} / ${WORKER_GB:-?} GiB (here / $(worker_host 1)), want $MEM_GATE_GIB"
-    [[ "$MEM_GATE_DROP_CACHES" != 1 ]] || drop_caches 1 1 >/dev/null 2>&1
+    log "Waiting for memory ($(( SECONDS - t0 ))s of ${MEM_GATE_TIMEOUT}s): $MEM_GATE_WHY"
+    [[ "$MEM_GATE_DROP_CACHES" != 1 ]] || drop_caches 3 1 >/dev/null 2>&1
     sleep 10
   done
 }

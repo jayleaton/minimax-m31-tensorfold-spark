@@ -25,7 +25,7 @@ Run on the head; run the `ssh <worker>` lines to check the worker too.
 | Docker + NVIDIA runtime | `docker info --format '{{.Runtimes}}'` (both) | contains `nvidia`; runs without `sudo` |
 | Passwordless ssh | `ssh -o BatchMode=yes <worker> docker ps` | no password prompt; the worker user can run docker |
 | Same memory on both | `grep MemTotal /proc/meminfo` (both) | equal within 0.5 GiB (127.6 GB on ours since both run the same BIOS and firmware). Every floor here is one value for both ranks |
-| Free memory | `grep -E 'MemFree\|MemAvailable' /proc/meminfo` (both) | MemFree >= 113 GiB once the page cache is dropped (`MEM_GATE_GIB`). Close desktop sessions, browsers, other containers |
+| Free memory | `grep -E 'MemFree\|MemAvailable' /proc/meminfo` (both) | once the page cache is dropped, MemAvailable >= 112 GiB (`MEM_GATE_GIB`) and MemFree >= 108 (`MEM_GATE_GIB - MEM_GATE_SLACK_GIB`); `preflight` says which node would wait and why. Close desktop sessions, browsers, other containers |
 | Passwordless sudo (cache drops) | `sudo -n true` (both) | exit 0 with the scoped sudoers line below; without it the gate cannot drop the page cache |
 | earlyoom | `systemctl is-active earlyoom; ps -o args= -C earlyoom` (both) | if active, `-m 2` or lower (SIGTERM under 2% of MemTotal, 2.43 GiB): `MEMGUARD_HARD_GIB` (2.75) must stay above it. `preflight` checks |
 | Disk | `df -h ~/.cache/huggingface` (both) | ~220 GB free on the head and on the worker (`WEIGHTS=local`: a copy on each) |
@@ -127,24 +127,30 @@ scripts/serve.sh start
 the family; the checkpoint (config, index, LICENSE) here and on the worker; the link (route over a CX7 port with a RoCE v2
 GID, the pins, every RDMA port ACTIVE, a full-MTU ping); the driver (and 590.x), `vm.min_free_kbytes` and MemTotal alike;
 earlyoom's level under `MEMGUARD_HARD_GIB`; `sudo -n` for the cache drops; and (not with `static`) nothing on `PORT`,
-`MASTER_PORT` or `MASTER_PORT + 1`, no CUDA process, MemFree against `MEM_GATE_GIB`.
+`MASTER_PORT` or `MASTER_PORT + 1`, no CUDA process, the memory gate's verdict now; with `PREPARED=1`, each node's
+prepared file (or room for one).
 
 What `start` does, in order: the family gate and `tensorfold-native info` on the checkpoint; the link and the pins; the
 serve flags against the build's capabilities; any old server stopped; the ports; no CUDA process; the page cache dropped
-and MemFree >= `MEM_GATE_GIB` on both Sparks (waiting up to `MEM_GATE_TIMEOUT`); the memory guard on both; rank 1 on the
+and the memory gate on both Sparks (MemAvailable >= `MEM_GATE_GIB` and MemFree >= `MEM_GATE_GIB - MEM_GATE_SLACK_GIB`,
+waiting up to `MEM_GATE_TIMEOUT` and saying which node waits and why); the memory guard on both; rank 1 on the
 worker, then rank 0 here; the pair watch; a line every 15 s while it loads; `/v1/models`; the caches dropped; a smoke test;
 the canary (`scripts/canary.py`: chat, separated reasoning, a parsed tool call, JSON); the caches dropped again; then
 `MiniMax-M3.1-Flash-EXL3 is now LIVE! on port 8000`.
 
 Timings: NOT MEASURED for this pack. The first start reads ~93 GiB a rank; MiaAI-Lab's first TP2 load of her 157 GiB
 pack took 1874 s before her loader fix (`patches/tasks/0015`, 5.5-6.1 GB/s on NVMe afterwards, docs/loader-speed.md).
-`WAIT_TIMEOUT` is 2400 s. Follow a long start with `scripts/serve.sh logs 0` and `logs 1`; do not interrupt it.
+`WAIT_TIMEOUT` is 2400 s. Follow a long start with `scripts/serve.sh logs 0` and `logs 1`; do not interrupt it. At the end
+`start` prints one line of each phase's seconds (checks, gate wait, load, smoke, canary, total) and keeps it in
+`STATE_DIR/boot-times.jsonl`; `scripts/serve.sh boot-times` prints the last starts.
 
 ## 5. Verify
 
 ```bash
 scripts/serve.sh status      # both containers "Up", pair watch on, MemAvailable, /v1/models and /health JSON
-scripts/serve.sh health      # one verdict: both ranks up, /health 200, the model listed
+scripts/serve.sh health      # liveness: both ranks up, /health 200, the model listed (health --json: one JSON object)
+scripts/serve.sh ready       # readiness: health, and this start's canary passed, both nodes' thermal state normal, no
+                             # thermal-stop or fail-fast record. Exit 0 only then; ready --json for a supervisor or balancer
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "MiniMax-M3.1-Flash-EXL3", "max_tokens": 512,
   "messages": [{"role": "user", "content": "Write a Python function that reverses a linked list."}]}'
@@ -163,7 +169,7 @@ require them (docs/PORT.md, Engine features).
 Then the harnesses (bench/README.md): `bash bench/tooleval/run.sh`, `python3 bench/toolcall.py`, `python3 bench/quality.py`,
 `python3 bench/vision.py smoke` and `bench`.
 
-Client settings: base URL `http://127.0.0.1:8000/v1`, model `MiniMax-M3.1-Flash-EXL3`, context window 131,072, max output
+Client settings (docs/CLIENTS.md has every option and client example): base URL `http://127.0.0.1:8000/v1`, model `MiniMax-M3.1-Flash-EXL3`, context window 131,072, max output
 32,768. The API has no auth and listens on 127.0.0.1 only: do not set `HOST=0.0.0.0` without `API_KEY=1` or a reverse
 proxy with auth in front, and ask the user first.
 
@@ -178,7 +184,9 @@ proxy with auth in front, and ask the user first.
 | `... copy in ... differs from this Spark's` | an interrupted copy | `scripts/serve.sh prepare` again (rsync resumes) |
 | `the link to the worker runs over X, not LINK_NETDEV=Y` | renamed netdev, other port | step 2; fix the pin or the cabling (ask the user) |
 | `a CUDA process is running on a Spark` | another stack holds a GPU | stop it (ask the user) |
-| `MemFree ... still under MEM_GATE_GIB 113` | other workloads, page cache without `sudo -n` | stop them; the scoped sudoers line; a smaller `CONTEXT` needs less (`scripts/quant_budget.py --serve`) |
+| `the memory gate is still shut after 600s (MEM_GATE_GIB 112, ...)` | other workloads, page cache without `sudo -n` | the line names the node and the short value; stop them; the scoped sudoers line; a smaller `CONTEXT` needs less (`scripts/quant_budget.py --serve`) |
+| `scripts/serve.sh ready` says `canary: no canary record for this rank 0 container` | the ranks were started by hand, or `CANARY=off` | `scripts/serve.sh restart` (the canary runs) |
+| `upgrade ... failed at ...; ROLLED BACK to ...` | the new image or revision did not build, pass preflight, load or pass the canary | the pair serves the last good (pinned); read the step's output; fix `config/prod.env`, `scripts/serve.sh upgrade` again, or put the last good pins back and `scripts/serve.sh rollback --clear` |
 | `rank 1 exited` / `rank 0 exited` early, NCCL timeout in its log | link down, wrong address, firewall on `MASTER_PORT`/`+1` | `scripts/serve.sh preflight`; step 2 |
 | a rank's container gone, `memguard.log` says `killed container` | MemAvailable under `MEMGUARD_HARD_GIB`, or under `MEMGUARD_GIB` for 4 s | do not lower the floors: lower `CONTEXT`, keep `DRAFTER` empty, find the other memory user |
 | `scripts/serve.sh status` shows `fail-fast: rank N exited ...` | one rank died; the pair watch stopped the other | read both saved logs (`~/.cache/tensorfold-minimax-m3/logs`); the watchdog heals it with `WATCH_HEAL=1` |
@@ -212,10 +220,19 @@ Leave these unless the user asks for an experiment, and then follow docs/OPERATI
 ## 8. Operate
 
 ```bash
-scripts/serve.sh status | health | logs 0 | logs 1 | stop | restart
+scripts/serve.sh status | health | ready | logs 0 | logs 1 | stop | restart
 scripts/serve.sh canary      # the post-load probes on demand
 scripts/serve.sh xid 2h      # NVIDIA Xid events on both nodes
+scripts/serve.sh boot-times  # the last starts' phase timing
+scripts/serve.sh prepared    # PREPARED=1: each node's prepared weights files; prepared clean removes the stale ones
+scripts/serve.sh upgrade     # after changing ENGINE_* / IMAGE / MODEL_REVISION: build, check, start; rolls back by itself
+scripts/serve.sh rollback    # restart on the last good image and revision (pinned until rollback --clear)
 ```
+
+Ask the user before `upgrade` or `rollback`: both stop the pair. Unattended running (docs/OPERATIONS.md section 5a):
+`scripts/systemd/mm31-boot-start.service` starts the pair after a reboot only if it was serving before (it starts
+`mm31-serve.service`, whose stop stops the pair at shutdown). `mm31-logrotate.timer` rotates the logs hourly and notes each
+node's thermal state and limits in `thermal.log`. Install them as user units, after asking the user.
 
 Watchdog (optional, restarts a dead pair): `scripts/systemd/tf-watchdog.{service,timer}` as user units, with
 `WATCH_HEAL=1` in `config/prod.env` (docs/OPERATIONS.md section 5). `scripts/serve.sh stop` makes it stand down until the

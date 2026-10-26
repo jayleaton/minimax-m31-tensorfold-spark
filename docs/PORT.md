@@ -1,6 +1,6 @@
 # The port: what came from where
 
-The base is [MiaAI-Lab's MiniMax-M3.1-Flash recipe](https://github.com/MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+The base is Mia / MiaAI-Lab's MiniMax-M3.1-Flash TensorFold recipe and `minimax_m3_vl` family patch (private repo)
 at `fd1d379` (Apache-2.0; her LICENSE, NOTICE and CREDITS kept). On top of it: what the GLM-5.3 recipe (origin/main
 `dd5df45`) and the DeepSeek-V4.1 recipe (origin/main `60b6688`) learned about operating and serving two Sparks, and this
 repository's own skeleton (the calculator, the guard and the watchdog). Verdicts: **ported** (the same behaviour),
@@ -19,10 +19,11 @@ repository's own skeleton (the calculator, the guard and the watchdog). Verdicts
 | `serve.sh preflight [static]` | GLM, DS | adapted | ssh, docker, image on both and identical and current, family gate, checkpoint and LICENSE on both, the link, driver / `vm.min_free_kbytes` / MemTotal parity, earlyoom level, `sudo -n`, ports, GPUs idle, MemFree |
 | `serve.sh xid` | GLM | ported | Xid lines from both kernels' logs |
 | `serve.sh gpucheck` / `gpuwatch.py` (GB10 power-state check) | GLM | not applicable | GLM's tool depends on host tuning details this repository keeps out (public wording rule); not requested |
-| Health check | GLM, DS | adapted | `serve.sh health` (both ranks up, `/health` 200, model listed) and `status` (pair watch, memguard, fail-fast and stop records, MemAvailable) |
+| Health check | GLM, DS | adapted | `serve.sh health` (both ranks up, `/health` 200, model listed) and `status` (pair watch, memguard, fail-fast and stop records, MemAvailable, the last good, a rollback pin) |
+| `serve.sh ready` (readiness for supervisors and load balancers, `--json`) | DS (canary gating), new | adapted | `scripts/ops.sh`: health plus this rank 0 container's canary passed (`STATE_DIR/canary-last`, written by start.sh with the container's start time), both nodes' device thermal state `normal`, no thermal-stop or fail-fast record; `health --json` / `ready --json` print one object |
 | Canary after a start (`CANARY=strict` stops on failure, logs kept) | DS, GLM | adapted | `scripts/canary.py` for MiniMax's reasoning field and tool parser (raw `]<]minimax[>[` markup is a failure); MiaAI-Lab's smoke test stays before it |
-| Memory gate (MemFree on both, timeout, page-cache drops) | GLM, DS | ported | `mem_gate` / `drop_caches` in nodes.sh; replaces MiaAI-Lab's `MIN_AVAIL_GIB` (MemAvailable, a guess of 100) with the MemFree rule and a calculator value (113) |
-| Drop caches before the load, after ready, after the canary | DS | ported | `DROP_CACHES=1`; `echo 1` while the gate waits (GLM) |
+| Memory gate (MemFree on both, timeout, page-cache drops) | GLM, DS | adapted | `mem_gate` / `mem_gate_check` / `drop_caches` in nodes.sh, the calculator's value for the profile (`MEM_GATE_GIB`, 112). The rule asks for what the profile needs: MemAvailable after a drop >= `MEM_GATE_GIB` and MemFree >= `MEM_GATE_GIB - MEM_GATE_SLACK_GIB` (4), not MemFree alone, which waited 4-6 minutes on the first TP2 starts for memory the node already had reclaimable; it logs which node waits and why |
+| Drop caches before the load, after ready, after the canary | DS | ported | `DROP_CACHES=1`; `echo 3` every 10 s while the gate waits |
 | Scoped sudoers line for the drops | GLM | ported | AGENTS.md section 1 |
 | Slot check after the load (`check_slots`, one retry) | GLM, DS | not applicable | the family's slot line is unknown until a first start (KNOWN-ISSUES); add it then |
 | Memory floors on both ranks, one value (PR #79) | DS | ported | every level in config.sh and OPERATIONS section 3 is checked on both ranks; preflight warns on a MemTotal mismatch |
@@ -30,7 +31,12 @@ repository's own skeleton (the calculator, the guard and the watchdog). Verdicts
 | earlyoom notes | DS | adapted | memguard's hard floor (2.75 GiB) above earlyoom's 2.43; preflight reads each node's earlyoom `-m`; the `--avoid tensorfold-` behaviour documented |
 | Fail-fast for the pair (exit 70, both ranks end in ~1 s) | DS | adapted | `scripts/pairwatch.sh` from outside the engine: stops the survivor within 5 s, writes `STATE_DIR/failfast`; the engine's own coherent stop (exit 70, `mm3/robust`) is recorded as such and healed once, not in a loop |
 | Watchdog restart (timer, `WATCH_*`, lease, stop marker, lock) | DS (PR #48), GLM | adapted | the skeleton's `scripts/watch.sh` on MiaAI-Lab's contract: one container name, `serve.sh restart` heals, stop marker scoped to the boot, the start lock, the fail-fast record heals at once, the probe carries the API key |
-| Start after a reboot (`boot-start.sh`) | DS | adapted | the watchdog heals a pair that is gone after a reboot (a stop marker from an earlier boot does not count) |
+| Start after a reboot (`boot-start.sh`) | DS | adapted | `scripts/boot-start.sh` and `mm31-boot-start.service`: starts only if the pair was serving before the reboot (start.sh's `STATE_DIR/serving`, removed by a deliberate stop, kept by a stop during a system shutdown), after docker, the worker and the link's RoCE ports are up; `BOOT_LEASE`, `BOOT_DRY_RUN=1`; the watchdog stays the fallback |
+| User units for the pair (`mm31-serve.service`) | DS (systemd units) | adapted | oneshot, `RemainAfterExit=yes`: `serve.sh start` / `serve.sh stop`, a start budget of 4500 s; not enabled for every boot (the boot start starts it); the `tf-watchdog` and `tf-guard` units kept as they were |
+| Prepared per-rank weights (`HEAD_PREPARED` / `WORKER_PREPARED` at `/prepared`) | DS | adapted | `PREPARED=1` mounts each node's folder and passes `TF_MM3_PREPARED=/prepared` and `TF_MM3_PREPARED_WRITE=1` to both ranks (an engine without the feature ignores them); preflight and start report each node's file or want 100 GiB free; `serve.sh prepared list / clean [all]` (docs/OPERATIONS.md section 3b) |
+| Boot timing (per-phase seconds of a start) | DS | adapted | start.sh marks its phases; `serve.sh start` prints checks, gate wait, load, smoke (first reply), canary, total, and appends a JSON line (image, content id, revision, each rank's prepared read / wrote / none) to `STATE_DIR/boot-times.jsonl`; `serve.sh boot-times [N]` |
+| Log rotation with a thermal note | DS (`--log-opt` caps), new | adapted | `scripts/logrotate.sh` and `mm31-logrotate.{service,timer}`: memguard, pair watch, heal, boot-start and thermal logs here and the worker's memguard log, by size, `LOG_KEEP` gzipped generations, copytruncate; one line a node with its device state, hottest reading and the limits its own `/etc/spark/thermal.env` states (never a value of its own) |
+| `serve.sh upgrade` / `rollback` (last good image, automatic way back) | DS (image content key), new | adapted | the last good image tagged `<repo>:last-good` on both nodes and recorded in `STATE_DIR/last-good.env` after every start whose canary passed; `upgrade` stops, builds / prepares, preflights, starts with the canary required, and on a failure pins and restarts on the last good by itself; `rollback [--clear]` (docs/OPERATIONS.md section 8) |
 | tokens-a-round alert (`tpr_check`) | GLM | not applicable | drafting is off by default and the family's `/metrics` names are unverified |
 | Container log cap (`--log-opt`) | DS | ported | `LOG_MAX_SIZE` / `LOG_MAX_FILE`; MiaAI-Lab's saved logs at stop kept |
 | NCCL cuMem off | DS | ported | already in MiaAI-Lab's nodes.sh |
@@ -147,3 +153,12 @@ unchanged.
 13. Images (`VISION=1 CONTEXT=23680 MEM_GATE_GIB=110`, docs/OPERATIONS.md section 3a): `bench/vision.py smoke` passes on the real model (descriptions,
     the Anthropic route, an image with a tool call, clean 4xx refusals, the server alive afterwards); `bench/vision.py
     bench` gives the image tokens MiniMax's geometry predicts; rank 0's memory with the tower against the estimate.
+14. The memory gate's rule: a start passes at once when MemAvailable after the drop covers `MEM_GATE_GIB` and MemFree is
+    within `MEM_GATE_SLACK_GIB`; the engine's KV pool (its pool line) is the calculator's at that MemFree, not smaller.
+15. Prepared weights (`PREPARED=1`, an engine that reads `TF_MM3_PREPARED`: `mm3/boot` `3a8093c6f`): the first boot writes one file a rank and logs
+    `prepared: wrote`, the next reads it (`prepared: read`); whether that is faster than the checkpoint at TP2 (`serve.sh boot-times`; on one GPU it was not: 21.0 s against 14.9 s); a new image makes a new
+    key; `prepared clean` keeps each rank's newest.
+16. `serve.sh ready` / `ready --json` against a live pair; `mm31-serve.service` start and stop; a reboot of the head with
+    `mm31-boot-start.service` enabled starts the pair once (and not after a deliberate stop).
+17. `serve.sh upgrade` to a deliberately broken image rolls back to the last good by itself and serves; `rollback --clear`.
+18. `scripts/logrotate.sh` under the timer while memguard and the pair watch write.

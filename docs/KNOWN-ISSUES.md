@@ -85,10 +85,23 @@ MMLU, tool-eval-bench and memory after the load are not measured. Some notes bel
 - **earlyoom is not under the recipe's control.** On our nodes it runs `-m 2,1` (SIGTERM at 2.43 GiB) with
   `--avoid ^(...|tensorfold-|...)`, which lowers a rank's score but does not exempt it. The recipe's floors (memguard 3 /
   2.75 GiB, the guard's 4 GiB) sit above it; `preflight` warns when a node's earlyoom level reaches `MEMGUARD_HARD_GIB`.
+- **The memory gate's slack is a choice.** The gate passes on MemAvailable after a drop at `MEM_GATE_GIB` with MemFree
+  at most `MEM_GATE_SLACK_GIB` (4) under it. On GB10 the page cache is GPU memory too: whether the engine's KV pool at a
+  MemFree 4 GiB short of the gate is still the calculator's (or the load reclaims that cache first) is to be read from the
+  pool line of the first starts that pass this way. A smaller slack waits longer; 0 is the old MemFree-only rule.
 - **NFS weights** (`WEIGHTS=nfs`, MiaAI-Lab's default): rank 1's load speed over NFS and the worker's page-cache cost are
   not measured; the production profile copies the checkpoint to the worker instead.
 
 ## Operations
+
+- **Prepared weights are not faster yet.** On one GPU a prepared read (21.0 s) lost to the checkpoint (14.9 s) for the
+  same 73 GiB, and the one-time write took 102 s (OPERATIONS 3b). The TP2 case, where the checkpoint path over-reads,
+  is not measured; `PREPARED` stays off by default.
+- **No prompt-cache hit observed.** Every logged request on the TP2 profiles shows `cached=0`, including two identical
+  prompts in a row (window-all run 206). Whether the family's kept prompt states get any memory on these profiles
+  (`PROMPT_CACHE_GIB` is unset, and the engine's default is what 70 % of RAM leaves past the loaded server) or whether
+  resumes are off for TP2 is not established. docs/CLIENTS.md's stable-prefix guidance is written for when it works;
+  measure with the server log's `cached=` before promising revisit speedups.
 
 - **MiaAI-Lab's speed survey sets GPU limits; do not apply it.** `docs/speed-borrow-deepseek.md` (her engine notes,
   kept as imported) suggests one ceiling for both Sparks with `nvidia-smi`; the operator's setting on both nodes is
@@ -108,5 +121,22 @@ MMLU, tool-eval-bench and memory after the load are not measured. Some notes bel
   run, production keeps `DRAFTS=0`. The DFlash2 draft's depth prior in the engine is GLM-5.3's survival, a placeholder
   until the TP2 window measures this pack's ([DFLASH2](DFLASH2.md) section 5); its 0.5 GiB runtime term is an estimate.
   RadixArk's DFlash2 draft is not supported (the engine refuses its causal block; its card declares no license).
+- **Prepared weights are the engine's, and new.** `PREPARED=1` passes `TF_MM3_PREPARED=/prepared` and
+  `TF_MM3_PREPARED_WRITE=1` to an engine that reads them (another work stream's); the recipe's side (folders, free space,
+  list / clean, the per-rank `read|wrote|none|refused` lines in the boot record) is checked on the CPU only. The file
+  size (~94 GiB a rank), the time a write adds to the first boot and the time a read saves are NOT MEASURED; so is what
+  the engine does with a partial file left by a killed write (a `refused` line is expected).
+- **The boot start and the user units need a reboot to verify.** `mm31-serve.service`'s ExecStop runs `serve.sh stop`
+  while the user manager stops; whether docker (a system service) and the link to the worker are still up then is not
+  under a user unit's ordering, so the stop at shutdown may only save logs and leave the ranks to docker's own stop. The
+  serving marker survives either way, so the boot start still starts the pair. `systemctl is-system-running` reading
+  `stopping` at that moment (which keeps the marker) is checked on the CPU only.
+- **Upgrade and rollback are checked on the CPU only.** The refusals, the last good record and tag, the pin and its
+  re-run are tested with fakes; a real failed upgrade rolling back by itself is to be run once on the pair (docs/PORT.md,
+  item 17). The pair is down from the stop until the new start, or the rollback, is LIVE.
+- **`ready` needs the canary.** A pair started with `CANARY=off`, or whose rank 0 was started by hand, is never `ready`
+  (no canary record for that container's start time); `health` still reports it alive.
+- **Log rotation copies, then truncates.** A line written between the copy and the truncation is lost (the copytruncate
+  caveat); the window is one `cp` of a file of at most `LOG_ROTATE_MIB` MiB.
 - **Imported scripts keep their shellcheck notes.** MiaAI-Lab's scripts carry style and warning findings (intended word
   splitting); `tests/run.sh` fails on shellcheck errors only, and the recipe's own changes add no new finding.

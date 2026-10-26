@@ -20,6 +20,10 @@ source ./scripts/nodes.sh
 if [[ "${DRY_RUN:-0}" != 1 ]]; then
   pairwatch_stop
   mkdir -p "$STATE_DIR" && echo "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown) $(date +%s)" > "$STATE_DIR/stopped"
+  # the serving marker (start.sh) goes too, so scripts/boot-start.sh leaves the pair down after a reboot; kept when the
+  # system is shutting down (mm31-serve.service's ExecStop), so the pair comes back after the reboot
+  if [[ "$(systemctl is-system-running 2>/dev/null)" == stopping ]]; then log "The system is shutting down: the pair starts again after the reboot (scripts/boot-start.sh)"
+  else rm -f "$STATE_DIR/serving"; fi
 fi
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i)
 here=0; docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && here=1

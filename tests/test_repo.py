@@ -45,7 +45,7 @@ SHELL_SCRIPTS = sorted([ROOT / "start.sh", ROOT / "stop.sh", *(ROOT / "scripts")
 PATCHES_TREE_SHA256 = "1f10a178f6fffaea5a795c4e4280e351361b94470a5525a86ce7edaac5c7bf98"
 # Values the scripts compute, not settings; and the device's limits, read from /etc/spark/thermal.env, never from the recipe
 COMPUTED = {"HEAD_ADDR", "HEAD_HCA", "HERE_GB", "HF_HOME", "IP", "SERVE_PROFILE", "WORKER_ADDR", "WORKER_GB",
-            "TIER_HERE_GIB", "TIER_WORKER_GIB",
+            "TIER_HERE_GIB", "TIER_WORKER_GIB", "MM31_BOOT_MARKS", "MM31_PINNED",
             "GUARD_PAUSE_C", "GUARD_RESUME_C", "GUARD_KILL_C", "GUARD_KILL_HOLD_S"}
 # The operator's device files, copied verbatim (the spark-health copies and both nodes' installed files)
 DEVICE_SHA256 = {'20-from-thermal-env.conf': '764c86c6349aceade73a26122e801ce39f91e92951a686774ebeb120fbfeb1ff', 'dgx-gpu-clock-cap.service': 'fa82eb44f907af02f938cfd51c5c27f1d99cc349ea1e0c851585f515fdbede12', 'spark-thermal-guard': '48311306ebdea7861b23051a9e84ae052bf2ee70463ae95f2592ad08172667a2', 'spark-thermal-guard.service': '5267b101ced2d73511a649db81980e8fde00ea3846f0db359103554050f659c9', 'thermal.env': '2a172210e67f529b7da7b612f9d19d599280b3616ba35d2771a25a7ab426bae1'}
@@ -842,6 +842,30 @@ class CoherentStopTests(ScriptFixture, unittest.TestCase):
 
 
 class CheckPublicTests(unittest.TestCase):
+    def test_ai_tool_credit_passes_only_as_miaai_labs_verbatim_lines(self):
+        # Mia's own credit text is kept verbatim in her two files; the same words anywhere else fail
+        name = "Claude" + " Code"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "docs").mkdir()
+            for f in ("check-public.sh", "check_secrets.py", "redact.py", "check-secrets-allow.txt"):
+                shutil.copy(ROOT / "scripts" / f, root / "scripts")
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            run = lambda: subprocess.run(["bash", "scripts/check-public.sh"], cwd=root, capture_output=True, text=True)
+            (root / "docs" / "CREDITS-MIAAI-LAB.md").write_text(f"Every patch was written by Mia's AI Lab with {name}.\n")
+            self.assertEqual(run().returncode, 0, "her verbatim credit line passes")
+            for path, line in (("docs/CLIENTS.md", f"Written by Mia's AI Lab with {name}."),
+                               ("docs/CREDITS-MIAAI-LAB.md", f"We used {name} for this."),
+                               ("README.md", f"Built with {name}.")):
+                with self.subTest(path=path):
+                    (root / "docs" / "CREDITS-MIAAI-LAB.md").write_text(f"Every patch was written by Mia's AI Lab with {name}.\n")
+                    target = root / path
+                    target.write_text((target.read_text() if target.exists() and path.endswith("MIAAI-LAB.md") else "") + line + "\n")
+                    self.assertEqual(run().returncode, 1, path)
+                    if path != "docs/CREDITS-MIAAI-LAB.md":
+                        target.unlink()
+
     def test_repo_is_clean(self):
         result = subprocess.run(["bash", str(ROOT / "scripts" / "check-public.sh")], capture_output=True, text=True,
                                 cwd=ROOT, timeout=300)

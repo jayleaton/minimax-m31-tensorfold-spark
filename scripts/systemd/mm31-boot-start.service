@@ -1,0 +1,20 @@
+# Start the pair once at boot on the head, only when it was serving before the reboot (scripts/boot-start.sh: waits for
+# docker, the worker and the link's RoCE ports, honours an optional BOOT_LEASE file, then starts mm31-serve.service when it
+# is installed, else scripts/serve.sh restart). The watchdog timer (tf-watchdog.timer) stays the fallback. Install as a
+# user unit with linger on (docs/OPERATIONS.md section 5a); WorkingDirectory is this checkout. Ported from the DeepSeek-V4.1
+# recipe's dsv41-boot-start.service.
+[Unit]
+Description=MiniMax-M3.1-Flash TensorFold start at boot (only if it was serving; the watchdog is the fallback)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/minimax-m31-tensorfold-spark
+Environment=CONFIG=config/prod.env
+# Environment=BOOT_DRY_RUN=1
+ExecStart=/usr/bin/env bash scripts/boot-start.sh
+# BOOT_WAIT (300 s) for docker, the worker and the link, then a whole start (mm31-serve.service's TimeoutStartSec)
+TimeoutStartSec=5000
+KillMode=process
+
+[Install]
+WantedBy=default.target

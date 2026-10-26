@@ -17,18 +17,34 @@ Terms: **head** = the Spark that runs the scripts, rank 0, the API, the pair wat
 | `build [--rebuild]` / `prebuild` | the image (zig/Dockerfile: TensorFold v1.1.2 + `ENGINE_PATCHES`), copied to the worker, compared by content, family gate. The kernels compile into the binary at build time, so nothing compiles beside loaded weights; refuses while the server runs |
 | `prepare [--dflash2]` | build, then the checkpoint here (license, `SHA256SUMS` once per revision) and rank 1's copy (`WEIGHTS`); with `DRAFTS=dflash2` also the DFlash2 draft on both Sparks, sha256-pinned. `--dflash2`: only that draft ([DFLASH2](DFLASH2.md)) |
 | `preflight [static]` | read-only checks of both nodes (AGENTS.md section 4); `static` skips ports, GPUs and MemFree |
-| `start` / `restart` | preflight (`PREFLIGHT`), then `./start.sh [restart]` (below) |
+| `start` / `up` / `restart` | preflight (`PREFLIGHT`), then `./start.sh [restart]` (below); at the end one line of each phase's seconds, kept in `STATE_DIR/boot-times.jsonl` (section 6) |
 | `stop` | `./stop.sh`: the pair watch stops, the stop marker is written, each rank's log is saved (gzipped, `LOG_KEEP`), both containers removed |
-| `status` / `health` / `logs 0\|1` / `canary` / `xid [SINCE]` / `args` | inspection; `args` prints both ranks' `docker run` without starting anything |
+| `status` / `logs 0\|1` / `canary` / `xid [SINCE]` / `args` | inspection; `args` prints both ranks' `docker run` without starting anything |
+| `health [--json]` / `ready [--json]` | liveness and readiness (below), for people or as one JSON object |
+| `boot-times [N]` | the last N starts' phase timing (section 6) |
+| `prepared [list \| clean [all]]` | the prepared per-rank weights' files on both nodes (section 3b) |
+| `upgrade` / `rollback [--clear]` | a new image or pack revision with an automatic way back, and the way back by hand (section 8) |
 | `watch [--once]` | the watchdog (section 5) |
+
+**Health and readiness.** `scripts/serve.sh health` is liveness: both ranks running, `/health` 200, `/v1/models` lists
+`SERVED_NAME`. `scripts/serve.sh ready` is readiness, for a supervisor or a load balancer: everything `health` checks, and
+the last start's canary passed for the rank 0 container that runs now (start.sh writes `STATE_DIR/canary-last` with the
+container's start time), both nodes' device thermal state is `normal`, and no thermal-stop or fail-fast record exists.
+Both exit 0 only when every check passes; `--json` prints one object, `{"check": "ready", "ok": true, "utc": ...,
+"checks": {"rank0": {"ok": true, "detail": "running"}, ...}}` (checks `rank0`, `rank1`, `health`, `models`, and for
+`ready` also `canary`, `thermal_head`, `thermal_worker`, `thermal_stop`, `failfast`). A pair started with `CANARY=off` is
+never ready; a container started by hand (not by start.sh) neither.
 
 What a start does, in order: one start at a time (`STATE_DIR/start.lock`; the watchdog stands down while it is held); the
 guard's lifecycle decision when `GUARD_CONFIG` is set; setup (`scripts/prepare.sh`) when the prepared marker differs; the
 family gate and `tensorfold-native info`; the link and `LINK_NETDEV` / `LINK_HCAS`; the serve flags against the build's
 capabilities; any old server stopped; `PORT`, `MASTER_PORT`, `MASTER_PORT + 1` free; no CUDA process on either Spark; page
-cache dropped and the MemFree gate on both; memguard on both; rank 1, then rank 0; the stop marker cleared; the pair watch;
-`/v1/models` within `WAIT_TIMEOUT`; caches dropped; smoke test; canary (`CANARY=strict` stops both ranks on a failure and
-saves their last logs in `STATE_DIR/canary-fail-r{0,1}.log`); caches dropped again.
+cache dropped and the memory gate on both (section 3); the prepared folders with `PREPARED=1` (section 3b); memguard on
+both; rank 1, then rank 0; the stop marker cleared; the pair watch; `/v1/models` within `WAIT_TIMEOUT`; caches dropped;
+smoke test; canary (`CANARY=strict` stops both ranks on a failure and saves their last logs in
+`STATE_DIR/canary-fail-r{0,1}.log`; the verdict goes to `STATE_DIR/canary-last`); caches dropped again; the serving
+marker (`STATE_DIR/serving`, section 5a). After a start whose canary passed, `serve.sh` records the image and revision as
+the last good (section 8).
 
 ## 2. Configuration
 
@@ -70,12 +86,14 @@ The rank contract is the family's (docs/rank-contract.md), not the DeepSeek engi
 
 ## 3. Memory
 
-Both Sparks have the same MemTotal (127.6 GB) since the worker's BIOS and firmware match the head's, so either rank can
-bind: every level below is one value, checked on **both** ranks (the DeepSeek recipe's rule, PR #79). Highest first:
+Both Sparks have the same MemTotal (127.6 GB) since the worker's BIOS update to 5.36_1.8.0 (2026-10-24) brought it to the
+head's BIOS and firmware (it gained ~2 GiB), so either rank can bind: every level below is one value, checked on **both**
+ranks (the DeepSeek recipe's rule, PR #79); `preflight` warns when the two MemTotal differ by more than 0.5 GiB. Highest
+first:
 
 | Level | Value | What happens |
 | --- | --- | --- |
-| `MEM_GATE_GIB` | 113 GiB MemFree | before a load, on both, after a page-cache drop; the start stops after `MEM_GATE_TIMEOUT` (600 s). MemFree, not MemAvailable: on GB10 the page cache is the GPU's memory too |
+| `MEM_GATE_GIB` | 115 GiB MemAvailable, MemFree >= 111 | before a load, on both, after a page-cache drop (below); the start stops after `MEM_GATE_TIMEOUT` (600 s) |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | 8 GiB | what the engine leaves free when it sizes the KV pool. Unset, the engine takes a tenth of MemTotal (12.2 GiB) and this pack gets ~6 GiB of KV a rank |
 | `TF_MM3_FLOOR_GIB` | 5 GiB MemAvailable, either rank | the engine (mm3/robust): a new prompt waits while other streams run |
 | `TF_MM3_FLOOR_HARD_GIB` | 4 GiB, either rank | the engine (mm3/robust): no prompt chunk starts on either rank; `TF_MM3_FLOOR_TRANSIENT_GIB` (0.5) is what one chunk may take beyond its scratch. All three are in the ranks' fingerprint: unequal values refuse the start |
@@ -91,7 +109,26 @@ available, that leaves 10.44 GiB (238,336 fp8 tokens, 1,862 pages) for the pool 
 tokens, 1,453 pages) with `VISION=1`: the engine takes rank 0's vision tower, its scratch and the image rows (2.30 GiB)
 out of the pool, and both ranks size their pool to rank 0's (section 3a). `MEM_GATE_GIB` is 113 either way. Change `CONTEXT`, `PARALLEL`, `KV`, `DRAFTER` or the reserve and run it again: `MEM_GATE_GIB` follows
 (tests/test_repo.py checks the two agree). The page cache is dropped (`echo 3`) before the load, after the server
-answers and after the canary; while the gate waits it drops `echo 1` every 10 s (scoped sudo, AGENTS.md).
+answers and after the canary; while the gate waits it drops it again (`echo 3`) every 10 s (scoped sudo, AGENTS.md).
+
+### The memory gate
+
+The gate asks for what the profile needs, not for MemFree a node does not reach. After the drop, on **both** nodes:
+
+- **MemAvailable >= `MEM_GATE_GIB`**: MemFree plus what the kernel can still reclaim, which after `echo 3` is the page
+  cache a drop could not free at once. `MEM_GATE_GIB` stays `scripts/quant_budget.py --serve` for the profile (112 for
+  production, 113 for the all-resident smoke profile, 115 / 116 with a draft).
+- **MemFree >= `MEM_GATE_GIB - MEM_GATE_SLACK_GIB`** (default 4 GiB of slack: 108 for production). On GB10 the page cache
+  is the GPU's memory too, so the slack bounds how much of the profile may still sit in reclaimable cache when the load
+  starts.
+
+The earlier rule (MemFree alone at `MEM_GATE_GIB`) waited minutes for memory the node did not have free yet: on the first
+TP2 starts MemFree after the drop sat at 110-113 GiB and rose about 1 GiB a minute, so two starts at a 115 / 116 GiB gate
+spent 4-6 minutes in it (312 s and 425 s to LIVE, against 66 s for a start that passed it at once). While it waits the gate
+logs which node waits and why, every 10 s (`Waiting for memory (40s of 600s): <worker>: MemFree 110.2 GiB < 112
+(MEM_GATE_GIB - MEM_GATE_SLACK_GIB 4)`), and a start that runs out of `MEM_GATE_TIMEOUT` stops with the last reason.
+`preflight` reports the same rule's verdict now, as a warning. The rule is `mem_gate_check` in scripts/nodes.sh (tested
+with fake meminfo values in tests/test_ops.py).
 
 ### The KV tier (opt-in, off by default)
 
@@ -179,6 +216,45 @@ dropped (not composited over white) and EXIF orientation is not applied (docs/KN
 route, a blue square over `/v1/messages`, an image with a `record_color` tool call, the refusals above, and the server
 still answering afterwards), then `python3 bench/vision.py bench` (time to the first token and the image's prompt tokens
 at three sizes, and 10 synthetic visual questions with exact answers).
+
+## 3b. Prepared weights (`PREPARED=1`)
+
+The engine side is the branch `mm3/boot` (`3a8093c6f`, on `mm3/window-all` `3fdc50c67`): an engine without it ignores
+`TF_MM3_PREPARED` and loads the checkpoint every time. Its key covers the pack's metadata digest, not the shard bytes:
+after replacing shards in place under the same headers, run `serve.sh prepared clean all`.
+
+**Measured (one Spark, one GPU, a 24-layer thin model, world 1, 73 GiB, 2026-10-25):** the checkpoint loaded in 14.9 s;
+the writing boot took 102.4 s (the file written at 0.81 GB/s); the reading boot 21.0 s (the file read in 15.1 s, 5.2 GB/s).
+The 32 greedy tokens were byte-identical across the three. So on one rank a prepared file is **slower** than the
+checkpoint: the checkpoint path already streams at the drive's speed there. The case it was built for is TP2, where each
+rank cuts its columns out of every routed tensor and the checkpoint path over-reads ~1.64x (docs/loader-speed.md); that is
+not measured. Keep `PREPARED=0` unless a TP2 measurement (`serve.sh boot-times`, read against plain) shows a gain.
+
+An engine that reads `TF_MM3_PREPARED` can keep each rank's share of the weights, laid out as that rank holds them on the
+GPU, in one file, and read it instead of the pack on later boots. Off by default (`PREPARED=0`); an engine without the
+feature ignores the variables.
+
+- **Switch and folders.** `PREPARED=1` in `config/prod.env` mounts a folder of each node at `/prepared` in its rank:
+  `HEAD_PREPARED` here (default `~/.cache/tensorfold-minimax-m3/prepared`, under `CACHE_DIR`) and `WORKER_PREPARED` on the
+  worker (the same path in the worker's home by default; absolute or `~/`). Both ranks get `TF_MM3_PREPARED=/prepared` and
+  `TF_MM3_PREPARED_WRITE=1` (0: read a file that is there, never write one).
+- **Files.** A boot that finds no file for its key writes `mm3-r<rank>of<world>-<key16>.tfprep`, ~94 GiB a rank (the
+  head's folder holds `mm3-r0of2-*`, the worker's `mm3-r1of2-*`); later boots read it. Each rank logs one line,
+  `[tensorfold] prepared: read|wrote|none|refused ...`, which the boot timing record keeps per rank (section 6).
+- **Invalidation.** The key covers the pack revision, the engine build and the layout settings. A new revision, a new
+  image or a changed layout setting makes a new key: the next boot writes a new file and the old one is stale, not wrong
+  (it is still the right file for the old build, which a rollback reads again, section 8).
+- **Both ranks.** The switch must be the same on both ranks, on or off; `rank_env` gives both the same variables, so it
+  is. The files themselves are each rank's own. A boot where one node has its file and the other none reads on one rank
+  and writes on the other, and is as slow as the writing rank (`preflight` warns).
+- **Disk.** ~94 GiB a rank a key. `preflight` and start want `PREPARED_FREE_GIB` (100) free on a node whose folder has no
+  file yet, and report which files exist on each node. `scripts/serve.sh prepared` lists them (size, age, newest or stale);
+  `prepared clean` removes the stale ones (every file but the newest of each rank), `prepared clean all` every one (with
+  the server stopped). Only file names the engine writes are removed. After a rolled-back upgrade the newest file can be
+  the failed build's: clean once the upgrade has settled, or the last good build's file goes and its next boot writes it
+  again.
+
+The time a read saves and the cost of a write are NOT MEASURED (docs/KNOWN-ISSUES.md).
 
 ## 4. Temperature: the device's limits
 
@@ -288,13 +364,56 @@ without it.
   and `status` report it; after the link is fixed (AGENTS.md section 2), `scripts/serve.sh roce-reset` deletes it on both
   nodes and the next start tries RoCE.
 
+## 5a. Unattended: systemd user units
+
+All user units on the head (`~/.config/systemd/user/`), `WorkingDirectory` set to this checkout, then
+`systemctl --user daemon-reload`. `loginctl enable-linger <user>` lets them run without a login session.
+
+| Unit | What it does | Enable |
+| --- | --- | --- |
+| `mm31-serve.service` | oneshot, `RemainAfterExit=yes`: start runs `scripts/serve.sh start`, stop runs `scripts/serve.sh stop` (`TimeoutStartSec=4500`: gate, load and canary) | **not** for every boot: `mm31-boot-start.service` starts it |
+| `mm31-boot-start.service` | once at boot, `scripts/boot-start.sh`: starts the pair only if it was serving before the reboot | `systemctl --user enable mm31-boot-start.service` |
+| `tf-watchdog.timer` | the watchdog (section 5), the fallback | `systemctl --user enable --now tf-watchdog.timer` |
+| `mm31-logrotate.timer` | hourly `scripts/logrotate.sh` (section 6) | `systemctl --user enable --now mm31-logrotate.timer` |
+
+**Was it serving?** start.sh writes `STATE_DIR/serving` when the pair is LIVE. A deliberate stop (`scripts/serve.sh stop`,
+`./stop.sh`, `systemctl --user stop mm31-serve`) removes it; a stop while the system is shutting down
+(`systemctl is-system-running` says `stopping`: `mm31-serve.service`'s ExecStop at a reboot) keeps it. A power loss
+leaves it too. So after a reboot `scripts/boot-start.sh` starts the pair when the marker is from an earlier boot, and
+does nothing when it is missing (stopped on purpose, or never started), when it is from this boot, when rank 0 already
+runs, or while `BOOT_LEASE` (a file you touch) is younger than `BOOT_LEASE_MIN` minutes. Before the start it waits, at most
+`BOOT_WAIT` s (300), for docker here, the worker over ssh with docker up, and the link: the route to the worker over a CX7
+port with a RoCE v2 GID (the `LINK_NETDEV` / `LINK_HCAS` pins apply) and every RoCE device of it `ACTIVE` on both nodes.
+Then `systemctl --user start mm31-serve.service` when that unit is installed (`BOOT_UNIT`; its ExecStop then stops the
+pair cleanly at the next shutdown), else `scripts/serve.sh restart`. `BOOT_DRY_RUN=1 scripts/boot-start.sh` decides and
+waits but starts nothing; its log is `STATE_DIR/boot-start.log` (`BOOT_STDOUT=1`: the terminal). A start it gives up on
+is left to the watchdog (`WATCH_HEAL=1`).
+
 ## 6. Logs and state
 
 - `scripts/serve.sh logs 0|1`; each rank's whole log is saved (gzipped) at every stop and before a stopped container is
   removed: `~/.cache/tensorfold-minimax-m3/logs/<date>-<time>-rank<N>.log.gz` on its own node (the newest `LOG_KEEP`).
-- `LOG_DIR` here also holds `memguard.log` and `pairwatch.log`; the worker keeps its own `memguard.log`.
-- `STATE_DIR` (`~/.local/state/tensorfold-minimax-m3`): `start.lock`, `prepared`, `stopped`, `failfast`, the API key file
-  (mode 600) and its header file, canary-failure logs, `watch/` (counters, heal log, heal evidence).
+- `LOG_DIR` here also holds `memguard.log`, `pairwatch.log` and `thermal.log`; the worker keeps its own `memguard.log`.
+- **Rotation.** `scripts/logrotate.sh` (hourly by `mm31-logrotate.timer`) rotates `memguard.log`, `pairwatch.log`,
+  `thermal.log`, `STATE_DIR/watch/heal.log` and `STATE_DIR/boot-start.log` here, and the worker's `memguard.log`, once one
+  is over `LOG_ROTATE_MIB` (16) MiB: copied to `<file>.1.gz` and truncated in place (copytruncate: the writers append with
+  `>>` and go on writing; only a line written between the copy and the truncation can be lost), older generations shift
+  up, `LOG_KEEP` (10) are kept. `--dry-run` says what it would rotate.
+- **The thermal note.** Every run first appends one line a node to `LOG_DIR/thermal.log`: the device thermal state, the
+  hottest GPU / ACPI reading, and the limits as that node's own `/etc/spark/thermal.env` (`SPARK_THERMAL_ENV`) states them,
+  with the file's sha256. A limit it cannot read is written as `limits unreadable (no whole GUARD_KILL_C)`, never as a
+  number; the script holds no temperature and no GPU value.
+- **Boot timing.** Every `scripts/serve.sh start` / `up` / `restart` that reaches the memory gate prints, at the end, one
+  line (`boot times (start): checks 10.2 s, gate wait 0.4 s, load 24.6 s, smoke 1.0 s (first reply 0.6 s), canary 30.1 s,
+  total 66.3 s; prepared r0 read, r1 read`) and appends one JSON line to `STATE_DIR/boot-times.jsonl`: `utc`, `mode`,
+  `ok`, `failed_at` (the phase a failed start stopped in), `image`, `image_id` (its content id, 12 hex), `model_revision`,
+  `prepared` (`r0` / `r1`: `read`, `wrote`, `none`, `refused` from each rank's log, `-` without a line) and `seconds`
+  (`checks`: preflight to the gate plus the checks after it, `gate`: the drop and the memory gate, `load`: the launch to
+  `/v1/models`, `smoke` and `first_reply`, `canary`, `total`). `scripts/serve.sh boot-times [N]` prints the last N. A
+  `FOREGROUND=1` start records none.
+- `STATE_DIR` (`~/.local/state/tensorfold-minimax-m3`): `start.lock`, `prepared`, `stopped`, `serving` (section 5a),
+  `failfast`, `canary-last`, `boot-times.jsonl`, `last-good.env` and `rollback.env` (section 8), the API key file (mode
+  600) and its header file, canary-failure logs, `boot-start.log`, `watch/` (counters, heal log, heal evidence).
 
 ## 7. Qualifying the profile
 
@@ -318,3 +437,35 @@ records each number in [RESULTS](RESULTS.md); stop at the first failure and add 
    (the watchdog stands down).
 6. Only then raise `PARALLEL` (after concurrent replies equal solo ones) or `CONTEXT`, each with
    `scripts/quant_budget.py --serve` first, and soak for several hours with the watchdog on.
+
+## 8. Upgrade and rollback
+
+**The last good.** After every start whose canary passed (for the rank 0 container that runs now), `serve.sh` tags the
+running image `<repo>:last-good` on both nodes (so a rebuild under the same tag cannot take it away) and writes
+`STATE_DIR/last-good.env`: `IMAGE`, `LAST_GOOD_IMAGE`, `IMAGE_IDENT` (the content id, the same on both nodes),
+`MODEL_REVISION`, `ENGINE_PATCHES`, `ENGINE_COMMIT`, `PATCHES_HASH`, `UTC` (KEY=value lines, read, never run).
+`scripts/serve.sh status` shows it.
+
+**`scripts/serve.sh upgrade`** is the safe path to a new engine image or pack revision. Change `config/prod.env` first
+(`ENGINE_PATCHES` / `ENGINE_COMMIT` for a new engine, `IMAGE` for a new tag, `MODEL_REVISION` for a new pack revision),
+then run it. It refuses unless the last good image is on both nodes with its recorded content; then it stops the pair
+(no build beside loaded weights: the pair is down from here until the new start is LIVE), runs `scripts/prepare.sh` (the
+image built or pulled and shipped, the family gate, the checkpoint of that revision on both nodes), `preflight`, and a
+start with `CANARY=strict`. A start whose canary passes is the new last good: `upgrade ok`. A failure at any step restores
+the last good by itself and says so: it writes `STATE_DIR/rollback.env` (the pin) and restarts on `<repo>:last-good` and
+the last good revision, then exits non-zero with `ROLLED BACK to ...`.
+
+**`scripts/serve.sh rollback`** does the same by hand: pin, then restart on the last good. While the pin exists, every
+`start`, `up`, `restart`, `args` and `preflight` (the watchdog's heals too) runs on the pinned image and revision, with
+`PREPARE=0` (no rebuild of the config's image), and says so; `status` shows it. Put the last good pins back in
+`config/prod.env` (or fix the new ones and run `upgrade` again, which drops the pin), then
+`scripts/serve.sh rollback --clear`.
+
+Also:
+
+- **Prepared files** (section 3b): the old build's file keeps its key, so it stays valid for the old build and a rollback
+  reads it again; the new build's boot writes its own.
+- **The device limits** are not the recipe's: rolling them back is section 4's rollback lines
+  (`scripts/install-device-limits.sh` installed them).
+- **The recipe itself**: `git checkout <previous tag>` of this repository, then `scripts/serve.sh restart`.
+- The `last-good` tag keeps one more image on each node; `docker image prune` leaves it (it is tagged).

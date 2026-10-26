@@ -4,6 +4,20 @@ Every change to this recipe, newest first. Nothing here has been run on two Spar
 
 ## Unreleased
 
+- **Operations at parity with the DeepSeek-V4.1 recipe.** `PREPARED=1`: each node's `HEAD_PREPARED` / `WORKER_PREPARED`
+  folder at `/prepared` and `TF_MM3_PREPARED` / `TF_MM3_PREPARED_WRITE=1` on both ranks (an engine without the feature
+  ignores them); preflight and start report each node's file or want `PREPARED_FREE_GIB` free; `serve.sh prepared list /
+  clean [all]`. `serve.sh start` (and its alias `up`) prints each phase's seconds and appends a JSON line to
+  `STATE_DIR/boot-times.jsonl` (image, content id, revision, each rank's prepared outcome); `serve.sh boot-times`. The
+  memory gate asks for what the profile needs: MemAvailable after a drop >= `MEM_GATE_GIB` and MemFree >= `MEM_GATE_GIB -
+  MEM_GATE_SLACK_GIB` (4), logging which node waits and why (it waited 4-6 minutes on the first TP2 starts). `serve.sh
+  ready [--json]` (and `health --json`) for supervisors and load balancers. `scripts/boot-start.sh`,
+  `mm31-boot-start.service` and `mm31-serve.service`: after a reboot the pair starts only if it was serving.
+  `scripts/logrotate.sh` and `mm31-logrotate.timer`: size-based copytruncate rotation and an hourly line a node of its
+  device thermal state and the limits its own `/etc/spark/thermal.env` states. `serve.sh upgrade` / `rollback`: the last
+  good image tagged and recorded after every start whose canary passed, and restored by itself when an upgrade fails.
+  Checked on the CPU only (tests/test_ops.py).
+
 - **The measured profile (window-all-2).** `config/prod.env.example` is the profile measured on the pair
   (results/window-all-2): 131,072 x 1, FP8 KV, CUDA graphs at TP2, the dspark draft at depth 3, the RoCE switches
   (`TF_MM3_ROCE_SUM`, `TF_MM3_SHARE_INPLACE`, `TF_ROCE_FAST`), `ENGINE_API_TOOLS=1`, `MEM_GATE_GIB=115`, the KV tier and

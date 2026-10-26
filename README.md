@@ -6,7 +6,8 @@ Support me here: https://buymeacoffee.com/jayleaton
 
 A recipe for serving MiniMax-M3.1-Flash on two NVIDIA DGX Sparks behind an OpenAI-compatible API: our EXL3 pack, the
 TensorFold Zig engine with the `minimax_m3_vl` family, one rank on each Spark, and the exact serving profile we measured.
-It is built on [Mia / MiaAI-Lab's MiniMax-M3.1-Flash TensorFold recipe and family patch](#credits).
+It is built on [Mia / MiaAI-Lab's MiniMax-M3.1-Flash TensorFold recipe and `minimax_m3_vl` family patch](#credits)
+(private repo).
 
 | | |
 | --- | --- |
@@ -92,6 +93,7 @@ scripts/serve.sh build             # the engine image on both Sparks
 scripts/serve.sh prepare           # the pack here and on the worker, checked against SHA256SUMS
 scripts/serve.sh preflight         # both nodes, the link, memory
 scripts/serve.sh start             # -> MiniMax-M3.1-Flash-EXL3 on http://127.0.0.1:8000/v1
+scripts/serve.sh status | health | ready | logs 0 | logs 1 | restart | stop
 ```
 
 - `scripts/serve.sh build` builds the engine from upstream TensorFold v1.1.2 plus [`engine/patches`](engine/SOURCE-EXPORT.md);
@@ -156,6 +158,7 @@ The full table of symptoms and fixes is [AGENTS.md section 6](AGENTS.md#6-common
 | [OPERATIONS](docs/OPERATIONS.md) | commands, settings, memory, images, heat limits, guard, watchdog, qualifying a profile |
 | [PACKS](docs/PACKS.md) / [RESULTS](docs/RESULTS.md) | the pack and its per-rank budget; every measurement and how it was taken |
 | [DRAFTS](docs/DRAFTS.md) / [DFLASH2](docs/DFLASH2.md) | the dspark and DFlash2 drafts: profiles, memory, how they are measured |
+| [CLIENTS](docs/CLIENTS.md) | connecting a client: endpoints, reply fields, request options, efficient use, examples |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |
 | [PORT](docs/PORT.md) / [CHANGELOG](docs/CHANGELOG.md) | what came from MiaAI-Lab's recipe and our GLM / DeepSeek recipes; every change |
 | [bench/](bench/README.md) | tool calling, structured output, quality, stress, soak, images, drafts |
@@ -172,9 +175,9 @@ scripts/check-public.sh --history    # before publishing anything
 
 Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart (ashhart) and its contributors, and on
 [MiniMax](https://huggingface.co/MiniMaxAI)'s model, dspark draft and papers. The base of this recipe, its
-`minimax_m3_vl` engine family patch and its engine notes are Mia / MiaAI-Lab's
-([MiaAI-Lab on GitHub](https://github.com/MiaAI-Lab), [Mia-AiLab on Hugging Face](https://huggingface.co/Mia-AiLab):
-[MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/MiniMax-M3.1-Flash-EXL3-2x-DGX-Sparks-TensorFold),
+`minimax_m3_vl` engine family patch and its engine notes are Mia / MiaAI-Lab's: her MiniMax-M3.1-Flash TensorFold
+recipe and `minimax_m3_vl` family patch (private repo; imported here at `fd1d379`, the patch shipped unchanged)
+([MiaAI-Lab on GitHub](https://github.com/MiaAI-Lab), [Mia-AiLab on Hugging Face](https://huggingface.co/Mia-AiLab),
 with her [EAQ v1 3.06 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw) and
 [3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw) packs). The DFlash2 draft is
 [incoai](https://huggingface.co/incoai/MiniMax-M3.1-Flash-DFlash2)'s, and both drafts follow

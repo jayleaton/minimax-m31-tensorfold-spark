@@ -1,0 +1,13 @@
+# One run of scripts/logrotate.sh on the head: the recipe's logs here and the worker's memguard.log rotated by size
+# (LOG_ROTATE_MIB, LOG_KEEP gzipped generations, copytruncate), and one line a node in LOG_DIR/thermal.log with its device
+# thermal state, hottest reading and the limits its /etc/spark/thermal.env states. Run by mm31-logrotate.timer; install as
+# a user unit (docs/OPERATIONS.md section 6); WorkingDirectory is this checkout.
+[Unit]
+Description=MiniMax-M3.1-Flash TensorFold log rotation and thermal note
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/minimax-m31-tensorfold-spark
+Environment=CONFIG=config/prod.env
+ExecStart=/usr/bin/env bash scripts/logrotate.sh
+TimeoutStartSec=300

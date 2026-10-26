@@ -1,0 +1,22 @@
+# The pair as a user unit on the head: start runs scripts/serve.sh start (preflight, both ranks, the memory gate, the canary)
+# and the unit stays active; stop runs scripts/serve.sh stop (both ranks' logs saved, both containers removed). At a system
+# shutdown the stop keeps STATE_DIR/serving, so mm31-boot-start.service starts the pair again after the reboot; a stop by
+# hand (systemctl --user stop, scripts/serve.sh stop) removes it. Install as a user unit (docs/OPERATIONS.md section 5a);
+# WorkingDirectory is this checkout. Do not enable this unit for every boot: enable mm31-boot-start.service, which starts it
+# only when the pair was serving before the reboot.
+[Unit]
+Description=MiniMax-M3.1-Flash TensorFold pair (both ranks)
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/minimax-m31-tensorfold-spark
+Environment=CONFIG=config/prod.env
+ExecStart=/usr/bin/env bash scripts/serve.sh start
+ExecStop=/usr/bin/env bash scripts/serve.sh stop
+# preflight, setup when needed, the memory gate (MEM_GATE_TIMEOUT 600 s), the load (WAIT_TIMEOUT 2400 s), the canary (900 s)
+TimeoutStartSec=4500
+TimeoutStopSec=300
+# memguard and the pair watch run detached (their own session); stop.sh stops them
+KillMode=process
