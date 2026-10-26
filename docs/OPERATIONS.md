@@ -50,7 +50,7 @@ the last good (section 8).
 
 `config/prod.env` (from `config/prod.env.example`, which documents every setting) through `scripts/config.sh`. Order of
 precedence: the environment, `scripts/local.sh`, `./.env`, `config/prod.env`, the defaults. A placeholder left in the
-config stops every script. Every `TENSORFOLD_*`, `TF_MM3_*`, `TF_ROCE_*` and `TF_CUDA_*` line reaches both ranks; a
+config stops every script. Every `TENSORFOLD_*`, `TF_MM3_*`, `TF_ROCE_*`, `TF_CUDA_*`, `TF_SERVE_*` and `TF_EXL3_*` line reaches both ranks; a
 credential-named one is refused (it would show in `docker inspect`).
 
 `config/smoke.env.example` is the first TP2 load's profile: the production values on the `mm3/integrate` engine
@@ -93,7 +93,7 @@ first:
 
 | Level | Value | What happens |
 | --- | --- | --- |
-| `MEM_GATE_GIB` | 115 GiB MemAvailable, MemFree >= 111 | before a load, on both, after a page-cache drop (below); the start stops after `MEM_GATE_TIMEOUT` (600 s) |
+| `MEM_GATE_GIB` | 114 GiB MemAvailable, MemFree >= 110 | before a load, on both, after a page-cache drop (below); the start stops after `MEM_GATE_TIMEOUT` (600 s) |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | 8 GiB | what the engine leaves free when it sizes the KV pool. Unset, the engine takes a tenth of MemTotal (12.2 GiB) and this pack gets ~6 GiB of KV a rank |
 | `TF_MM3_FLOOR_GIB` | 5 GiB MemAvailable, either rank | the engine (mm3/robust): a new prompt waits while other streams run |
 | `TF_MM3_FLOOR_HARD_GIB` | 4 GiB, either rank | the engine (mm3/robust): no prompt chunk starts on either rank; `TF_MM3_FLOOR_TRANSIENT_GIB` (0.5) is what one chunk may take beyond its scratch. All three are in the ranks' fingerprint: unequal values refuse the start |

@@ -203,9 +203,9 @@ proxy with auth in front, and ask the user first.
 The profile in `config/prod.env.example` is the one measured in window-all-3 (results/window-all-3).
 Leave these unless the user asks for an experiment, and then follow docs/OPERATIONS.md section 7:
 
-- `CONTEXT=131072`, `PARALLEL=1`, `KV=fp8`, `MAX_TOKENS=32768`
+- `CONTEXT=114688`, `PARALLEL=1`, `KV=fp8`, `MAX_TOKENS=32768`
 - the KV tier stays off (`KV_TIER_DIR` empty) unless the user asks for it (docs/OPERATIONS.md section 3)
-- `TENSORFOLD_MEMORY_RESERVE_GIB=8` and `MEM_GATE_GIB=115` (they move together: `scripts/quant_budget.py --serve --drafter dspark`)
+- `TENSORFOLD_MEMORY_RESERVE_GIB=8` and `MEM_GATE_GIB=114` (they move together: `scripts/quant_budget.py --serve --drafter dspark`)
 - `VISION=0`, `VISION_MAX_IMAGES=4`, `VISION_IMAGE_TOKENS=2304`, `VISION_URLS=0` (`VISION=1` takes the images out of the
   KV room: config/prod.env.example, Image input)
 - the floors: `TF_MM3_FLOOR_GIB=5`, `TF_MM3_FLOOR_HARD_GIB=4`, `TF_MM3_FLOOR_TRANSIENT_GIB=0.5` (equal on both ranks),

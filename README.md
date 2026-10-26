@@ -14,8 +14,8 @@ It is built on [Mia / MiaAI-Lab's MiniMax-M3.1-Flash TensorFold recipe and `mini
 | Model | [`MiniMaxAI/MiniMax-M3.1-Flash`](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) (revision `54e4e69d`) |
 | Pack | **EXL3 3.55 bpw, 199.9 GB**: [`jayleaton/MiniMax-M3.1-Flash-EXL3-3.55bpw-mm31`](https://huggingface.co/jayleaton/MiniMax-M3.1-Flash-EXL3-3.55bpw-mm31) (revision `5bff3d73`; routed experts 3.55 bpw, attention 6 / 8, head 8, the base model's `dspark/` draft copied unchanged) |
 | Hardware | 2x DGX Spark (GB10, 128 GB each), tensor parallel 2 over the 200 Gb/s CX7 link |
-| Engine | [TensorFold](https://github.com/ashhart/TensorFold) v1.1.2 Zig engine plus the `minimax_m3_vl` family, vendored as [`engine/patches`](engine/SOURCE-EXPORT.md) (MiaAI-Lab's family patch and ours; exported from engine commit `0547afe802fa`) |
-| Serving | 131,072 tokens x 1 slot, FP8 KV, KV tier off, tool calling, structured output (xgrammar), drafts on, MiniMax's dspark draft, image input off by default (`VISION=1` measured) |
+| Engine | [TensorFold](https://github.com/ashhart/TensorFold) v1.1.2 Zig engine plus the `minimax_m3_vl` family, vendored as [`engine/patches`](engine/SOURCE-EXPORT.md) (MiaAI-Lab's family patch and ours; exported from engine commit `6c6f7b28936f`) |
+| Serving | 114,688 tokens x 1 slot, FP8 KV, KV tier off (262,144 exact works, opt-in), tool calling, structured output (xgrammar), drafts on, MiniMax's dspark draft, image input off by default (`VISION=1` measured) |
 
 The served model ID is `MiniMax-M3.1-Flash-EXL3`.
 
@@ -24,12 +24,51 @@ The served model ID is `MiniMax-M3.1-Flash-EXL3`.
 
 ## Results
 
-Measured on our pair in one combined run (window-all-3, 2026-10-26), at the profile in
-[`config/prod.env.example`](config/prod.env.example): 131,072 x 1, FP8 KV, CUDA graphs on, the dspark draft with each
-round's depth sized by its own confidences (`TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto`, `TF_MM3_DRAFT_DEPTH` unset) and
+**Latest, window-all-4 (2026-10-26):** decode speed is unchanged (~31 tok/s median, the same as window-all-3). The gains
+are prefill (32K: 565 tok/s in the profile, 582 with every prompt switch at its default, against 485 for window-all-3's
+recipe in the same window), the prefix cache (a 70K prompt's first token 140 s fresh, 0.67 s repeated), four streams
+(65.3 tok/s combined without drafts) and the KV tier, which now works on two Sparks (an exact 262,144-token context,
+19 tok/s, replies identical). Every draft job ran at a 114,688-token context, which is now the profile's
+(`config/prod.env.example`). The table just below compares the two runs; the speed table after it is window-all-3's.
+
+Window-all-3 was measured in one combined run (2026-10-26) at its profile: 131,072 x 1, FP8 KV, CUDA graphs on, the
+dspark draft with each round's depth sized by its own confidences (`TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto`, `TF_MM3_DRAFT_DEPTH` unset) and
 the RoCE switches on, thinking off. Raw files, method and every switch: [results/window-all-3](results/window-all-3/README.md)
 (the earlier run: [results/window-all-2](results/window-all-2/README.md)). Both Sparks were running at their thermal
 limits during this run ([heat](#limits)).
+
+**window-all-3 → window-all-4** (window-all-4: 2026-10-26, 09:49-11:35 UTC, engine `mm3/window-all-4` @ `6c6f7b289`,
+job 5072: window-all-3's recipe at `CONTEXT=114688` with `TF_MM3_GLUE_ACT=1`, `TF_MM3_GLUE_ADD=1` and
+`TF_SERVE_INCREMENTAL=1`; four streams: jobs 508 / 511 at 40,960; raw files:
+[results/window-all-4](results/window-all-4/README.md)):
+
+| | window-all-3 | **window-all-4** | change |
+| --- | ---: | ---: | ---: |
+| code T0 | 30.8 | **30.4** | -1 % |
+| tool calls T0 | 33.5 | **33.4** | 0 % |
+| math T0 | 32.7 | **32.3** | -1 % |
+| prose T0 | 20.1 | **20.2** | 0 % |
+| code T1 | 30.7 | **29.3** | -5 % |
+| tool calls T1 | 32.2 | **32.0** | -1 % |
+| math T1 | 30.3 | **33.2** | +10 % |
+| prose T1 | 20.2 | **19.9** | -1 % |
+| **median T0 / T1** | **31.75 / 30.5** | **31.34 / 30.64** | **-1 % / +1 %** |
+| Decode after a 32K prompt (tok/s) | 20.8 | **not re-measured** | - |
+| Prefill 2K / 32K (tok/s) | 687 / 531 | **694 / 565** | +1 % / +6 % |
+| Time to first token, 32K prompt (s) | 66.7 | **not re-measured** | - |
+| Time to first token, 70K prompt repeated (s) | 0.76 | **0.67 (fresh 140.0)** | -12 % (fresh -16 %) |
+| 4 streams at once, code / chat T0 aggregate (tok/s) | 52.0 / 41.9 | **52.7 / 37.6 (plain 65.3 / 63.2)** | +1 % / -10 % |
+| Smoke / tool chains / tool calls | 12/12 / 12/12 / 42/42 | **12/12 / 12/12 / 42/42** | same |
+| `bench/structured.py` tools (`tool_choice: "none"`) | 14/15 | **not re-measured** | - |
+| MMLU-200, 0-shot | 0.780 | **not re-measured** | - |
+
+Decode is unchanged (median 31.34 / 30.64 tok/s); the gains are in prompts and memory: prefill at 32K 565 tok/s
+in the profile (582 with every prompt switch at its default, job 507; 485 for window-all-3's recipe in the same window, job
+5015), a fresh 70K prompt's first token in 140.0 s (167.2), and **the KV tier now works on two Sparks**: an exact
+262,144-token context starts, passes smoke 12/12 and decodes 18.96 tok/s with drafts off (it panicked at the first prompt
+in window-all-3). Four streams with drafts: one code stream 53.6 tok/s (35.3), four 52.7 in all; without drafts 65.3 on
+code and 63.2 on chat. `TF_MM3_PLAN_INLINE` now starts (no clear gain: off); int8 index keys are neutral (off). Every
+job's reply hashes equal the baseline's.
 
 **Speed**, one stream, decode tok/s at the server, 256 tokens a reply; T0 greedy, T1 sampled (1.0, top_p 0.95):
 
@@ -96,8 +135,12 @@ server). Method: [PACKS](docs/PACKS.md),
 - **Prose gains nothing from the draft** (20.1 against 20.8 plain at T0); the gain is in code, tool calls and math.
 - **Plain decode is ~5 % below window-all-2's** (20.1 against 21.2 at T0): the prefill fix that removed window-all-2's
   prefill regression gives back the one-row router batching.
-- **Off, they fail**: the KV tier (it starts, then panics at the first prompt), so the context is 131,072 tokens, all
-  resident, and 4 x 1M is not in the profile; `TF_MM3_PLAN_INLINE=1` (crashes at start).
+- **Context is 114,688 tokens** since window-all-4 (the head's memory budget is ~1.5 GiB tighter on this engine; a
+  131,072 start was refused once). The KV tier works at an exact 262,144 (window-all-4, drafts off, smoke 12/12) but is
+  opt-in and not in the profile; 4 x 1M approximate is not measured. `TF_MM3_PLAN_INLINE=1` starts now but gains nothing
+  clear (off).
+- **window-all-4 did not re-measure** decode after a 32K prompt, MMLU-200 or `bench/structured.py` (so the engine's
+  `tool_choice: "none"` fix is not yet confirmed through the server); those rows are window-all-3's.
 - **Depth by confidence is measured at one stream only**; four streams were measured at depth 3.
 - Not measured: tool-eval-bench, `TF_MM3_INDEX_KEYS=int8` on long prompts, the side image's serve-latency switches.
 - One pair of Sparks, one run per job.

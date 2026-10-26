@@ -40,8 +40,8 @@
 #   KV tier  KV_TIER_DIR, WORKER_KV_TIER_DIR, KV_TIER_KEEP_GIB (with TF_MM3_KV_TIER, TF_MM3_KV_TIER_GIB, TF_MM3_KV_HORIZON, ...)
 #   prepared PREPARED, HEAD_PREPARED, WORKER_PREPARED, PREPARED_FREE_GIB (each rank's prepared weights at /prepared)
 #   pair     PAIR_WATCH, PAIR_WATCH_S, GUARD_CONFIG
-#   ranks    every TENSORFOLD_*, TF_MM3_*, TF_ROCE_* and TF_CUDA_* variable you export goes to both ranks, and so does every
-#            other exported NCCL_* variable (values of A-Z a-z 0-9 _ . , : = / - only)
+#   ranks    every TENSORFOLD_*, TF_MM3_*, TF_ROCE_*, TF_CUDA_*, TF_SERVE_* and TF_EXL3_* variable you export goes to
+#            both ranks, and so does every other exported NCCL_* variable (values of A-Z a-z 0-9 _ . , : = / - only)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh

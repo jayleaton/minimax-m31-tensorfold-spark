@@ -211,8 +211,8 @@ VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-2304}"         # --vision-image-toke
 # a request, private and loopback addresses refused). 0: data: URLs only, and an https part is refused.
 export VISION_URLS="${VISION_URLS:-0}"
 # More environment for BOTH ranks, as NAME=value words (a family patch's switches), e.g. EXTRA_ENV="TF_FOO=1 TF_BAR=2".
-# Every exported TENSORFOLD_*, TF_MM3_*, TF_ROCE_* and TF_CUDA_* variable goes to both ranks too (config/prod.env's lines
-# are exported), e.g. TENSORFOLD_MEMORY_RESERVE_GIB.
+# Every exported TENSORFOLD_*, TF_MM3_*, TF_ROCE_*, TF_CUDA_*, TF_SERVE_* and TF_EXL3_* variable goes to both ranks too
+# (config/prod.env's lines are exported), e.g. TENSORFOLD_MEMORY_RESERVE_GIB.
 EXTRA_ENV="${EXTRA_ENV:-}"
 
 # ---------------------------------------------------------------- files

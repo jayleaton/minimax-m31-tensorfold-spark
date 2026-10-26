@@ -32,15 +32,17 @@ SMOKE_DIFFERS = {"WORKER", "WEIGHTS", "MODEL_DIR", "ENGINE_PATCHES", "ENGINE_COM
                  "TF_MM3_KV_HORIZON", "TF_MM3_KV_CANDIDATES", "KV_TIER_KEEP_GIB",
                  # production is the measured profile: the dspark draft and the RoCE switches on, the smoke load plain
                  "DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB", "TF_MM3_ROCE_SUM",
-                 "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST"}
+                 "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST",
+                 # window-all-4's profile: the decode glue, TF_SERVE_INCREMENTAL by EXTRA_ENV
+                 "TF_MM3_GLUE_ACT", "TF_MM3_GLUE_ADD", "EXTRA_ENV"}
 DRAFTS_PROFILE = ROOT / "config" / "drafts.env.example"
 # What the drafts profile may set differently from the smoke profile, its drafts-off control (config/drafts.env.example)
 DRAFTS_DIFFERS = {"DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB", "MEM_GATE_GIB"}
 SLOTS4 = ROOT / "config" / "slots4.env.example"
 # What the four-slot profile may set differently from the drafts profile (config/slots4.env.example says why)
 SLOTS4_DIFFERS = {"PARALLEL", "CONTEXT", "MEM_GATE_GIB", "ENGINE_PATCHES", "ENGINE_COMMIT",
-                  # measured at four streams at depth 3, depth by confidence at one stream only
-                  "TF_MM3_DRAFT_DEPTH", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB"}
+                  # window-all-4's four-stream job: one draft pass across the streams
+                  "TF_MM3_DRAFT_BATCH", "TF_MM3_GLUE_ACT", "TF_MM3_GLUE_ADD", "EXTRA_ENV"}
 # Engine switches no profile of this recipe may set
 FORBIDDEN_ENGINE_ENV = ("KV_SPLIT_DEDUP", "KV_SPLIT_EARLY", "TF_TP_ROCE_CHUNKED_KB")
 SHELL_SCRIPTS = sorted([ROOT / "start.sh", ROOT / "stop.sh", *(ROOT / "scripts").glob("*.sh"),
@@ -417,6 +419,12 @@ class RankContractTests(ScriptFixture, unittest.TestCase):
         self.assertIn("TF_ROCE=0", words)
         self.assertIn("TF_ROCE_MAX_KB=1024", words)
 
+    def test_server_and_exl3_switches_reach_both_ranks(self):
+        for rank in (0, 1):
+            words = self.rank_env(rank, TF_SERVE_PROMPT_ONCE="1", TF_EXL3_EXPERT_LOADS="lanes").stdout.split()
+            self.assertIn("TF_SERVE_PROMPT_ONCE=1", words)
+            self.assertIn("TF_EXL3_EXPERT_LOADS=lanes", words)
+
     def test_a_credential_never_rides_in_the_environment(self):
         result = self.rank_env(0, TENSORFOLD_API_KEY="x" * 24)
         self.assertNotEqual(result.returncode, 0)
@@ -599,7 +607,7 @@ class DraftsScriptTests(ScriptFixture, unittest.TestCase):
 
     def test_four_slots_and_the_draft_reach_both_ranks(self):
         for rank in self.dry(SLOTS4):
-            for part in ("--drafter /model/dspark", "TF_MM3_DRAFT_DEPTH=3", "--parallel 4", "--context 40960"):
+            for part in ("--drafter /model/dspark", "TF_MM3_DSPARK_CHANCES=1", "--parallel 4", "--context 40960"):
                 self.assertIn(part, rank)
             self.assertNotIn("--no-drafts", rank)
 

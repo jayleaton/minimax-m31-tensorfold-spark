@@ -705,7 +705,8 @@ serves_flag() { engine_caps 2>/dev/null | python3 -I -c 'import json,sys; sys.ex
 # TF_ROCE_GID_INDEX from the link scan (TF_ROCE_HCA is not set: roce.zig falls back to NCCL_IB_HCA, which NCCL_ARGS sets from
 # the same scan), TF_ROCE=0 / TF_ROCE_MAX_KB from ROCE / ROCE_MAX_KB, MM31_SERVE_PROFILE (the serve flags both ranks run, as
 # one word, so the guard's identity check sees a CONTEXT or KV change: the engine does not read it), then every exported
-# TENSORFOLD_*, TF_MM3_*, TF_ROCE_* and TF_CUDA_* variable, and EXTRA_ENV. TF_TP_* and TF_COMM_BACKEND are not passed: this
+# TENSORFOLD_*, TF_MM3_*, TF_ROCE_*, TF_CUDA_*, TF_SERVE_* and TF_EXL3_* variable (TF_SERVE_*: the
+# server's switches, TF_EXL3_*: the EXL3 kernels'), and EXTRA_ENV. TF_TP_* and TF_COMM_BACKEND are not passed: this
 # family reads neither. Values are limited to A-Z a-z 0-9 _ . , : = / - because they end up in a command the worker's shell runs.
 rank_env() {
   local r=$1 x name val master=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}
@@ -715,7 +716,7 @@ rank_env() {
   [[ -z "$ROCE_MAX_KB" ]] || printf '%s\n' "TF_ROCE_MAX_KB=$ROCE_MAX_KB"
   [[ -z "${SERVE_PROFILE:-}" ]] || printf '%s\n' "MM31_SERVE_PROFILE=$SERVE_PROFILE"
   while IFS= read -r name; do
-    [[ "$name" =~ ^(TENSORFOLD|TF_MM3|TF_ROCE|TF_CUDA)_[A-Za-z0-9_]+$ ]] || continue
+    [[ "$name" =~ ^(TENSORFOLD|TF_MM3|TF_ROCE|TF_CUDA|TF_SERVE|TF_EXL3)_[A-Za-z0-9_]+$ ]] || continue
     case "$name" in TF_MM3_WORLD|TF_MM3_RANK|TF_ROCE_GID_INDEX|TF_ROCE_MAX_KB) continue ;; esac
     # a credential never rides in a container's environment (docker inspect shows it): the API key goes as a file
     [[ ! "$name" =~ (^|_)(API_?KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?|TOKEN)(_|$) ]] ||
