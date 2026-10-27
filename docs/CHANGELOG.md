@@ -4,6 +4,13 @@ Every change to this recipe, newest first. Nothing here has been run on two Spar
 
 ## Unreleased
 
+- **The measured profile (window-all-5 / 6).** `config/prod.env.example` adds `TF_MM3_ATTN_SPLIT=1` (decode attention
+  split: decode the draft cannot help, prose and after a long prompt, +10-14 %) and `TF_MM3_ATTN_MMA=1` (prompt attention on bf16 tensor cores: prefill 32K 580 → 720
+  tok/s, a 70K prompt's first token 133 → 109 s); single-stream drafted decode is unchanged. `config/slots4.env.example`
+  adds only the split: tensor-core prompt attention costs greedy code ~16 % at four streams (results/window-all-6b). The
+  engine is `engine/patches`, exported from `mm3/s15b-wa5` @ `84c4863e0`: the measured `mm3/window-all-6` @ `0f591bc41`
+  plus contract-test fixes only. Results: results/window-all-5, -6 and -6b.
+
 - **The measured profile (window-all-3).** `config/prod.env.example` is the profile measured on the pair
   (results/window-all-3, 2026-10-26): the dspark draft with each round's depth sized by its own confidences
   (`TF_MM3_DSPARK_CHANCES=1`, `TF_MM3_CALIB=auto`; `TF_MM3_DRAFT_DEPTH` no longer set), otherwise as window-all-2. Median

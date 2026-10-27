@@ -70,20 +70,21 @@ features). A build without them answers HTTP 400 with the reason; treat that as 
 
 ## Speed to expect
 
-Measured on the pair in the window-all-3 run (README "Results", CONTEXT 131,072 x 1, thinking off, 256-token replies):
+Measured on the pair (README "Results"; window-all-3 at CONTEXT 131,072 x 1 unless noted, window-all-5 / 6 at 114,688;
+thinking off, 256-token replies):
 
 | | Plain decode | DSpark drafts, depth by confidence (the baseline recipe) |
 | --- | ---: | ---: |
 | decode, code / tool calls / math (greedy) | ~20 tok/s | 31-34 tok/s |
 | decode, prose (greedy) | ~21 tok/s | ~20 tok/s (prose drafts poorly) |
-| decode after a 32K prompt | | 20.8 tok/s |
-| prefill, 2K / 32K prompt | 695 / 526 tok/s | 687 / 531 tok/s |
-| time to first token, 32K prompt | | 66.7 s |
-| time to first token, the same 70K prompt again (prefix cache) | | 0.76 s (167 s fresh) |
-| four streams at once (`PARALLEL=4`), code | 65.5 tok/s in all (window-all-2) | 52.0 tok/s in all (depth 3) |
+| decode after a 32K prompt | | 22.9 tok/s (window-all-5) |
+| prefill, 2K / 32K prompt | | 786 / 720 tok/s (window-all-6) |
+| time to first token, 32K prompt | | 66.7 s (window-all-3) |
+| time to first token, the same 70K prompt again (prefix cache) | | 0.62 s (109 s fresh, window-all-6) |
+| four streams at once (`PARALLEL=4`), code | 67.6-69.2 tok/s in all (window-all-6b) | 49.6 tok/s in all (window-all-5) |
 
 Drafted replies equal plain ones (verified). A warm server start loads in ~54 s (~28 s of it is timing the draft's verify
-costs). `tool_choice: "none"` can let tool-call markup reach `content`: leave the tools out of a request instead. These are not guarantees: long
+costs). `tool_choice: "none"` no longer lets tool-call markup reach `content` (measured once, window-all-5). These are not guarantees: long
 contexts, concurrency and the device's thermal state (a hot Spark runs at a lower GPU limit) change them. A long prompt
 costs far more than a long reply: keep prompts short and stable (below).
 

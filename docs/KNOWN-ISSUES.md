@@ -1,9 +1,11 @@
 # What is not known or not solved
 
-What is open after the latest measured run ([results/window-all-3](../results/window-all-3/README.md)):
-`tool_choice: "none"` lets tool-call markup reach the reply's content (`bench/structured.py` tools 14/15); the KV tier
-starts but panics at the first prompt (`tier_io.zig:153`), so 4 x 1M is not in the profile; `TF_MM3_PLAN_INLINE=1` crashes
-at start (an integer overflow); prose gains nothing from the draft; plain decode is ~5 % below window-all-2's; at four
+What is open after the latest measured runs ([results/window-all-6](../results/window-all-6/README.md),
+[-6b](../results/window-all-6b/README.md), [-5](../results/window-all-5/README.md)): `TF_MM3_ATTN_MMA=1` costs greedy code
+~16 % at four streams (not understood; off in the four-slot profile); the worker reached its device emergency limit three
+times under sustained load (the guard stopped each job); MMLU-200 has not been re-measured since window-all-3. Fixed
+since window-all-3: `tool_choice: "none"` (`bench/structured.py` tools 15/15, once), the KV tier (exact 262,144 works,
+opt-in), `TF_MM3_PLAN_INLINE=1` (starts; off, no gain). From window-all-3 and still open: prose gains nothing from the draft; plain decode is ~5 % below window-all-2's; at four
 streams drafts decode slower than plain decode; tool-eval-bench is not run. The run hit both Sparks' thermal limits and
 stopped early, so the S11-off and S8-off checks are missing. Window-all-2's prefill regression is fixed. Some notes below
 predate these runs and say so.

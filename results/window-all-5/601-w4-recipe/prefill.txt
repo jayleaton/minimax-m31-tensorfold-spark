@@ -1,0 +1,3 @@
+[bench] prefill 2048: prompt 2053 (cached 0), 695.6 tok/s server, 695.2 tok/s by TTFT 2.953 s
+[bench] prefill 32768: prompt 32764 (cached 0), 471.5 tok/s server, 471.4 tok/s by TTFT 69.498 s
+[bench] -> <path>

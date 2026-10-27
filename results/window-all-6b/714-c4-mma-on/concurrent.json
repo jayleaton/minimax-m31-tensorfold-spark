@@ -1,0 +1,1819 @@
+{
+ "label": "714-c4-mma-on",
+ "tokens": 256,
+ "mixed": false,
+ "cells": [
+  {
+   "prompt": "code",
+   "temperature": 1.0,
+   "streams": 1,
+   "failed": 1,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 1
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 1,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 1,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null
+     ],
+     "errors": [
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": 256,
+        "token_sha256": "3c07380658e2267c58becb795940ffd527810641f543795402c26c867ab82750",
+        "output_sha256": "470abbd1dcc935005c9ed7b6693f783e583c98c3182017c3719227ed045fa8f7",
+        "complete": true,
+        "error": null
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "code",
+   "temperature": 1.0,
+   "streams": 2,
+   "failed": 2,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 2
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 2,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 2,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": 256,
+        "token_sha256": "3c07380658e2267c58becb795940ffd527810641f543795402c26c867ab82750",
+        "output_sha256": "470abbd1dcc935005c9ed7b6693f783e583c98c3182017c3719227ed045fa8f7",
+        "complete": true,
+        "error": null
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": 256,
+        "token_sha256": "a668b9449301f5fde43b46994cf1449941c529658770ba11c0a3c53eceb79cba",
+        "output_sha256": "a81b18bedcdc5c4f439bbf171b037058fb1ac3c72f068098704320f9f77ce423",
+        "complete": true,
+        "error": null
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "code",
+   "temperature": 1.0,
+   "streams": 4,
+   "failed": 4,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 4
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 4,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 4,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError",
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": 256,
+        "token_sha256": "3c07380658e2267c58becb795940ffd527810641f543795402c26c867ab82750",
+        "output_sha256": "470abbd1dcc935005c9ed7b6693f783e583c98c3182017c3719227ed045fa8f7",
+        "complete": true,
+        "error": null
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": 256,
+        "token_sha256": "a668b9449301f5fde43b46994cf1449941c529658770ba11c0a3c53eceb79cba",
+        "output_sha256": "a81b18bedcdc5c4f439bbf171b037058fb1ac3c72f068098704320f9f77ce423",
+        "complete": true,
+        "error": null
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "incomplete_stream"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "chat",
+   "temperature": 1.0,
+   "streams": 1,
+   "failed": 1,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 1
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 1,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 1,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null
+     ],
+     "errors": [
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "chat",
+   "temperature": 1.0,
+   "streams": 2,
+   "failed": 2,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 2
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 2,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 2,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "chat",
+   "temperature": 1.0,
+   "streams": 4,
+   "failed": 4,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 4
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 4,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 4,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError",
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "code",
+   "temperature": 0.0,
+   "streams": 1,
+   "failed": 1,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 1
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 1,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 1,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null
+     ],
+     "errors": [
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "code",
+   "temperature": 0.0,
+   "streams": 2,
+   "failed": 2,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 2
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 2,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 2,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "code",
+   "temperature": 0.0,
+   "streams": 4,
+   "failed": 4,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 4
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 4,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 4,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError",
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "chat",
+   "temperature": 0.0,
+   "streams": 1,
+   "failed": 1,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 1
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 1,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 1,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null
+     ],
+     "errors": [
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "chat",
+   "temperature": 0.0,
+   "streams": 2,
+   "failed": 2,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 2
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 2,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 2,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "prompt": "chat",
+   "temperature": 0.0,
+   "streams": 4,
+   "failed": 4,
+   "unmeasured": 0,
+   "aggregate_tps": 0.0,
+   "per_stream_tps": 0.0,
+   "ttft_s_max": null,
+   "timing_valid": false,
+   "end_to_end_tps": null,
+   "makespan_s": null,
+   "alone": {
+    "equal": 0,
+    "unequal": 0,
+    "failed": 4
+   },
+   "errors": [
+    "URLError"
+   ],
+   "reps": [
+    {
+     "failed": 4,
+     "unmeasured": 0,
+     "aggregate_tps": 0.0,
+     "requested_requests": 4,
+     "timed_requests": 0,
+     "makespan_s": null,
+     "end_to_end_tps": null,
+     "timing_valid": false,
+     "per_stream_tps": [],
+     "ttft_s": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "errors": [
+      "URLError",
+      "URLError",
+      "URLError",
+      "URLError"
+     ],
+     "evidence": [
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      },
+      {
+       "prompt_tokens": null,
+       "cached_tokens": null,
+       "tokens": null,
+       "cache_state": "unverified",
+       "complete": false,
+       "token_sha": null,
+       "token_sha256": null,
+       "output_sha256": null
+      }
+     ],
+     "client_intervals": [
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      },
+      {
+       "start": null,
+       "first": null,
+       "last": null,
+       "end": null,
+       "elapsed_s": null,
+       "chunk_offsets_s": null,
+       "chunk_gaps_ms": null
+      }
+     ],
+     "equal_alone": [
+      null,
+      null,
+      null,
+      null
+     ],
+     "comparisons": [
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      },
+      {
+       "concurrent": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "alone": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": false,
+        "error": "URLError"
+       },
+       "serial": {
+        "tokens": null,
+        "token_sha256": null,
+        "output_sha256": null,
+        "complete": null,
+        "error": null
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

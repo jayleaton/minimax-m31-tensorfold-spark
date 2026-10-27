@@ -1,0 +1,35 @@
+00:57:41 config <path> image e3938c961a34
+00:57:42 waiting for the locks
+01:02:22 locks held on both nodes
+01:03:22 JOB 711-c4-mma-off toggles [MEM_GATE_GIB=116 CONTEXT=40960 PARALLEL=4 MAX_TOKENS=32768 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1] steps [concurrent]
+01:04:28   711-c4-mma-off start rc=0 in 66s; loaded in 24.0s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+  │ info: minimax budget: 40960 tokens a stream, 1542 pages, 8.65 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+01:09:47   711-c4-mma-off concurrent rc=0 {"label": "711-c4-mma-off", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 67.6, "per_stream_tps": 16.9, "ttft_s_max": 0.49, "timing_valid": true, "end_to_end_tps": 65.72425108898379, "mak
+01:09:52   711-c4-mma-off stopped
+01:10:52 JOB 712-c4-mma-on toggles [MEM_GATE_GIB=116 CONTEXT=40960 PARALLEL=4 MAX_TOKENS=32768 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1 TF_MM3_ATTN_MMA=1] steps [concurrent]
+01:11:59   712-c4-mma-on start rc=0 in 67s; loaded in 23.7s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+  │ info: minimax budget: 40960 tokens a stream, 1659 pages, 9.30 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+01:17:21   712-c4-mma-on concurrent rc=0 {"label": "712-c4-mma-on", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 57.1, "per_stream_tps": 14.5, "ttft_s_max": 0.52, "timing_valid": true, "end_to_end_tps": 56.688845631173, "makesp
+01:17:25   712-c4-mma-on stopped
+01:18:26 JOB 713-c4-mma-off toggles [MEM_GATE_GIB=116 CONTEXT=40960 PARALLEL=4 MAX_TOKENS=32768 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1] steps [concurrent]
+01:19:33   713-c4-mma-off start rc=0 in 67s; loaded in 23.3s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+  │ info: minimax budget: 40960 tokens a stream, 1650 pages, 9.25 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+01:24:49   713-c4-mma-off concurrent rc=0 {"label": "713-c4-mma-off", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 69.2, "per_stream_tps": 17.3, "ttft_s_max": 0.46, "timing_valid": true, "end_to_end_tps": 67.3299750122696, "make
+01:24:54   713-c4-mma-off stopped
+01:25:55 JOB 714-c4-mma-on toggles [MEM_GATE_GIB=116 CONTEXT=40960 PARALLEL=4 MAX_TOKENS=32768 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1 TF_MM3_ATTN_MMA=1] steps [concurrent]
+01:27:00   714-c4-mma-on start rc=0 in 65s; loaded in 24.2s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+  │ info: minimax budget: 40960 tokens a stream, 1638 pages, 9.19 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+01:27:37   714-c4-mma-on concurrent rc=0 {"label": "714-c4-mma-on", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 4, "unmeasured": 0, "aggregate_tps": 0.0, "per_stream_tps": 0.0, "ttft_s_max": null, "timing_valid": false, "end_to_end_tps": null, "makespan_s": null,
+01:27:37   714-c4-mma-on SERVER_DOWN after concurrent
+01:27:40   714-c4-mma-on stopped
+01:27:40 END job
+01:27:40 WINDOW_END
+01:27:41 locks released

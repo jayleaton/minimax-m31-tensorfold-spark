@@ -1,0 +1,4 @@
+[revisit] {"ask": "fresh", "status": 200, "error": null, "prompt_tokens": 70006, "cached_tokens": 0, "ttft_s": 133.34, "sha": "02ca7e21f141db67"}
+[revisit] {"ask": "repeat", "status": 200, "error": null, "prompt_tokens": 70006, "cached_tokens": 69888, "ttft_s": 0.63, "sha": "02ca7e21f141db67"}
+[revisit] {"ask": "followup", "status": 200, "error": null, "prompt_tokens": 70004, "cached_tokens": 69888, "ttft_s": 0.66, "sha": "a05f630f2cba26ba"}
+[revisit] repeat_equal True

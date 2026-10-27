@@ -34,7 +34,9 @@ SMOKE_DIFFERS = {"WORKER", "WEIGHTS", "MODEL_DIR", "ENGINE_PATCHES", "ENGINE_COM
                  "DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB", "TF_MM3_ROCE_SUM",
                  "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST",
                  # window-all-4's profile: the decode glue, TF_SERVE_INCREMENTAL by EXTRA_ENV
-                 "TF_MM3_GLUE_ACT", "TF_MM3_GLUE_ADD", "EXTRA_ENV"}
+                 "TF_MM3_GLUE_ACT", "TF_MM3_GLUE_ADD", "EXTRA_ENV",
+                 # window-all-5 / 6: the decode attention split and tensor-core prompt attention
+                 "TF_MM3_ATTN_SPLIT", "TF_MM3_ATTN_MMA"}
 DRAFTS_PROFILE = ROOT / "config" / "drafts.env.example"
 # What the drafts profile may set differently from the smoke profile, its drafts-off control (config/drafts.env.example)
 DRAFTS_DIFFERS = {"DRAFTS", "DRAFTER", "TF_MM3_DSPARK_STATS", "TF_MM3_DSPARK_CHANCES", "TF_MM3_CALIB", "MEM_GATE_GIB"}
@@ -42,7 +44,8 @@ SLOTS4 = ROOT / "config" / "slots4.env.example"
 # What the four-slot profile may set differently from the drafts profile (config/slots4.env.example says why)
 SLOTS4_DIFFERS = {"PARALLEL", "CONTEXT", "MEM_GATE_GIB", "ENGINE_PATCHES", "ENGINE_COMMIT",
                   # window-all-4's four-stream job: one draft pass across the streams
-                  "TF_MM3_DRAFT_BATCH", "TF_MM3_GLUE_ACT", "TF_MM3_GLUE_ADD", "EXTRA_ENV"}
+                  "TF_MM3_DRAFT_BATCH", "TF_MM3_GLUE_ACT", "TF_MM3_GLUE_ADD", "EXTRA_ENV",
+                  "TF_MM3_ATTN_SPLIT"}
 # Engine switches no profile of this recipe may set
 FORBIDDEN_ENGINE_ENV = ("KV_SPLIT_DEDUP", "KV_SPLIT_EARLY", "TF_TP_ROCE_CHUNKED_KB")
 SHELL_SCRIPTS = sorted([ROOT / "start.sh", ROOT / "stop.sh", *(ROOT / "scripts").glob("*.sh"),
@@ -448,7 +451,8 @@ class RankContractTests(ScriptFixture, unittest.TestCase):
                   ("--drafter ", "/dspark", *(f"{k}={e[k]}" for k in ("TF_MM3_DRAFT_DEPTH", "TF_MM3_DSPARK_CHANCES",
                                                                       "TF_MM3_CALIB") if e.get(k)))
                   if e["DRAFTER"] == "dspark" else ())
-        roce = tuple(f"{k}={e[k]}" for k in ("TF_MM3_ROCE_SUM", "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST", "TF_MM3_GRAPHS_TP") if e.get(k))
+        roce = tuple(f"{k}={e[k]}" for k in ("TF_MM3_ROCE_SUM", "TF_MM3_SHARE_INPLACE", "TF_ROCE_FAST", "TF_MM3_GRAPHS_TP",
+                                             "TF_MM3_ATTN_SPLIT", "TF_MM3_ATTN_MMA") if e.get(k))
         for part in ("TF_MM3_RANK=1", f"--context {e['CONTEXT']}", f"--parallel {e['PARALLEL']}", "--kv-cache fp8",
                      *drafts, *roce, "TENSORFOLD_MEMORY_RESERVE_GIB=8", "NCCL_CUMEM_ENABLE=0", *tier):
             self.assertIn(part, rank1)
@@ -607,8 +611,10 @@ class DraftsScriptTests(ScriptFixture, unittest.TestCase):
 
     def test_four_slots_and_the_draft_reach_both_ranks(self):
         for rank in self.dry(SLOTS4):
-            for part in ("--drafter /model/dspark", "TF_MM3_DSPARK_CHANCES=1", "--parallel 4", "--context 40960"):
+            for part in ("--drafter /model/dspark", "TF_MM3_DSPARK_CHANCES=1", "--parallel 4", "--context 40960",
+                         "TF_MM3_ATTN_SPLIT=1"):
                 self.assertIn(part, rank)
+            self.assertNotIn("TF_MM3_ATTN_MMA", rank)
             self.assertNotIn("--no-drafts", rank)
 
     def test_the_draft_and_its_stats_reach_both_ranks(self):

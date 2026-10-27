@@ -1,0 +1,192 @@
+{
+ "engine_api_tools": true,
+ "schemas": {
+  "status": "PASS",
+  "pass": true,
+  "fails": [],
+  "skipped": [],
+  "unsupported": [],
+  "cases": {
+   "person/chat": {
+    "finish": "stop",
+    "tokens": 36,
+    "same": true
+   },
+   "order/chat": {
+    "finish": "stop",
+    "tokens": 42,
+    "same": true
+   },
+   "status/chat": {
+    "finish": "stop",
+    "tokens": 28,
+    "same": true
+   },
+   "city/chat": {
+    "finish": "stop",
+    "tokens": 46,
+    "same": true
+   },
+   "flags/chat": {
+    "finish": "stop",
+    "tokens": 31,
+    "same": true
+   },
+   "list/chat": {
+    "finish": "stop",
+    "tokens": 30,
+    "same": true
+   },
+   "json_object/chat": {
+    "finish": "stop"
+   },
+   "person/think": {
+    "finish": "stop",
+    "tokens": 61,
+    "same": true
+   },
+   "order/think": {
+    "finish": "stop",
+    "tokens": 196,
+    "same": true
+   },
+   "status/think": {
+    "finish": "stop",
+    "tokens": 153,
+    "same": true
+   },
+   "city/think": {
+    "finish": "stop",
+    "tokens": 88,
+    "same": true
+   },
+   "flags/think": {
+    "finish": "stop",
+    "tokens": 160,
+    "same": true
+   },
+   "list/think": {
+    "finish": "stop",
+    "tokens": 81,
+    "same": true
+   },
+   "json_object/think": {
+    "finish": "stop"
+   }
+  }
+ },
+ "tools": {
+  "status": "PASS",
+  "pass": true,
+  "fails": [],
+  "skipped": [],
+  "unsupported": [],
+  "cases": {
+   "required/chat": {
+    "finish": "tool_calls",
+    "calls": [
+     "get_weather",
+     "search_flights"
+    ]
+   },
+   "named/chat": {
+    "finish": "tool_calls",
+    "calls": [
+     "search_flights"
+    ]
+   },
+   "named-single/chat": {
+    "finish": "tool_calls",
+    "calls": [
+     "search_flights"
+    ]
+   },
+   "strict-auto/chat": {
+    "finish": "tool_calls",
+    "calls": [
+     "send_email"
+    ]
+   },
+   "single/chat": {
+    "finish": "tool_calls",
+    "calls": [
+     "get_weather"
+    ]
+   },
+   "parallel/chat": {
+    "finish": "tool_calls",
+    "calls": [
+     "get_weather",
+     "search_flights"
+    ]
+   },
+   "required/think": {
+    "finish": "tool_calls",
+    "calls": [
+     "get_weather",
+     "search_flights"
+    ]
+   },
+   "named/think": {
+    "finish": "tool_calls",
+    "calls": [
+     "search_flights"
+    ]
+   },
+   "named-single/think": {
+    "finish": "tool_calls",
+    "calls": [
+     "search_flights"
+    ]
+   },
+   "strict-auto/think": {
+    "finish": "tool_calls",
+    "calls": [
+     "send_email"
+    ]
+   },
+   "single/think": {
+    "finish": "tool_calls",
+    "calls": [
+     "get_weather"
+    ]
+   },
+   "parallel/think": {
+    "finish": "tool_calls",
+    "calls": [
+     "get_weather",
+     "search_flights"
+    ]
+   },
+   "none/chat": {
+    "finish": "stop",
+    "calls": 0
+   },
+   "stream/chat": {
+    "calls": [
+     "get_weather",
+     "search_flights"
+    ]
+   },
+   "stream-required/chat": {
+    "calls": [
+     "get_weather",
+     "search_flights"
+    ],
+    "bytes_equal": true
+   }
+  }
+ },
+ "thinking": {
+  "status": "FAIL",
+  "pass": false,
+  "fails": [
+   "suite crashed: RemoteDisconnected: Remote end closed connection without response"
+  ],
+  "skipped": [],
+  "unsupported": [],
+  "cases": {}
+ },
+ "pass": false,
+ "seconds": 211.7
+}

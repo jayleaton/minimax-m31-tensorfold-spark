@@ -216,6 +216,8 @@ Leave these unless the user asks for an experiment, and then follow docs/OPERATI
 - `DRAFTS=1`, `DRAFTER=dspark`, `TF_MM3_DSPARK_CHANCES=1`, `TF_MM3_CALIB=auto`, `TF_MM3_DRAFT_DEPTH` unset (replies
   equal plain decode's; code, tool calls and math +56-74 % over all switches off; `DRAFTS=0` turns it off; [docs/DFLASH2.md](docs/DFLASH2.md) for the DFlash2 alternative)
 - `TF_MM3_GRAPHS_TP=1`, `TF_MM3_ROCE_SUM=1`, `TF_MM3_SHARE_INPLACE=1`, `TF_ROCE_FAST=1`, `ENGINE_API_TOOLS=1` (as measured)
+- `TF_MM3_ATTN_SPLIT=1` and `TF_MM3_ATTN_MMA=1` in the one-stream profile; `config/slots4.env.example` (four streams)
+  sets only `TF_MM3_ATTN_SPLIT=1`: `TF_MM3_ATTN_MMA=1` costs greedy code ~16 % at four streams (results/window-all-6b)
 
 ## 8. Operate
 

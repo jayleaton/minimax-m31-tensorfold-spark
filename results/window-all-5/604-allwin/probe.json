@@ -1,0 +1,155 @@
+{
+ "label": "604-allwin",
+ "tokens": 256,
+ "rows": [
+  {
+   "case": "prose",
+   "mode": "greedy",
+   "ok": true,
+   "sha": "b1aa391d8374e506",
+   "finish": "length",
+   "tokens": 256,
+   "calls": 0,
+   "tps_server": 21.23498831608764,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 21.23498831608764
+   },
+   "leak": null,
+   "wall_s": 12.59,
+   "head": "# The Keeper of Sorrow Light\n\n## Part One: The Glass House\n\n...(+1045 chars)",
+   "rep": 0
+  },
+  {
+   "case": "code",
+   "mode": "greedy",
+   "ok": true,
+   "sha": "37c4065992bbe4c9",
+   "finish": "length",
+   "tokens": 256,
+   "calls": 0,
+   "tps_server": 28.829128207688708,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 28.829128207688708
+   },
+   "leak": null,
+   "wall_s": 9.44,
+   "head": "I'll create a complete LRU cache module with documentation a...(+953 chars)",
+   "rep": 0
+  },
+  {
+   "case": "tools",
+   "mode": "greedy",
+   "ok": true,
+   "sha": "a3e85ae0622ddb84",
+   "finish": "tool_calls",
+   "tokens": 81,
+   "calls": 3,
+   "tps_server": 38.76393526828863,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 38.76393526828863
+   },
+   "leak": null,
+   "wall_s": 2.91,
+   "head": "I'll check the weather for all three cities.",
+   "rep": 0
+  },
+  {
+   "case": "math",
+   "mode": "greedy",
+   "ok": true,
+   "sha": "b838498d0a9d0727",
+   "finish": "length",
+   "tokens": 256,
+   "calls": 0,
+   "tps_server": 33.69601456751176,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 33.69601456751176
+   },
+   "leak": null,
+   "wall_s": 8.15,
+   "head": "# Computing 37 \u00d7 43\n\n**Step 1: Break 43 into parts.**\n43 = 4...(+535 chars)",
+   "rep": 0
+  },
+  {
+   "case": "prose",
+   "mode": "sampled",
+   "ok": true,
+   "sha": "45740b747d9e1d08",
+   "finish": "length",
+   "tokens": 256,
+   "calls": 0,
+   "tps_server": 20.91838271098445,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 20.91838271098445
+   },
+   "leak": null,
+   "wall_s": 12.75,
+   "head": "# The Keeper of Sorrow Head\n\n## Part One: The Glass House\n\nT...(+1055 chars)",
+   "rep": 0
+  },
+  {
+   "case": "code",
+   "mode": "sampled",
+   "ok": true,
+   "sha": "2b0669665b5c8c3f",
+   "finish": "length",
+   "tokens": 256,
+   "calls": 0,
+   "tps_server": 22.34208934814753,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 22.34208934814753
+   },
+   "leak": null,
+   "wall_s": 12.01,
+   "head": "I'll create a complete LRU cache module with the requested m...(+936 chars)",
+   "rep": 0
+  },
+  {
+   "case": "tools",
+   "mode": "sampled",
+   "ok": true,
+   "sha": "a3e85ae0622ddb84",
+   "finish": "tool_calls",
+   "tokens": 81,
+   "calls": 3,
+   "tps_server": 37.10867593723186,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 37.10867593723186
+   },
+   "leak": null,
+   "wall_s": 2.99,
+   "head": "I'll check the weather for all three cities.",
+   "rep": 0
+  },
+  {
+   "case": "math",
+   "mode": "sampled",
+   "ok": true,
+   "sha": "a6bcaea7c7b3ba3a",
+   "finish": "length",
+   "tokens": 256,
+   "calls": 0,
+   "tps_server": 30.441586775145566,
+   "accepted": null,
+   "tensorfold": {
+    "tokens_per_second": 30.441586775145566
+   },
+   "leak": null,
+   "wall_s": 8.96,
+   "head": "# Part 1: Computing 37 \u00d7 43\n\nI'll use the **distributive pro...(+635 chars)",
+   "rep": 0
+  }
+ ],
+ "median_tps": {
+  "greedy": 31.26,
+  "sampled": 26.39
+ },
+ "ok": true
+}

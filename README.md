@@ -14,7 +14,7 @@ It is built on [Mia / MiaAI-Lab's MiniMax-M3.1-Flash TensorFold recipe and `mini
 | Model | [`MiniMaxAI/MiniMax-M3.1-Flash`](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) (revision `54e4e69d`) |
 | Pack | **EXL3 3.55 bpw, 199.9 GB**: [`jayleaton/MiniMax-M3.1-Flash-EXL3-3.55bpw-mm31`](https://huggingface.co/jayleaton/MiniMax-M3.1-Flash-EXL3-3.55bpw-mm31) (revision `5bff3d73`; routed experts 3.55 bpw, attention 6 / 8, head 8, the base model's `dspark/` draft copied unchanged) |
 | Hardware | 2x DGX Spark (GB10, 128 GB each), tensor parallel 2 over the 200 Gb/s CX7 link |
-| Engine | [TensorFold](https://github.com/ashhart/TensorFold) v1.1.2 Zig engine plus the `minimax_m3_vl` family, vendored as [`engine/patches`](engine/SOURCE-EXPORT.md) (MiaAI-Lab's family patch and ours; exported from engine commit `6c6f7b28936f`) |
+| Engine | [TensorFold](https://github.com/ashhart/TensorFold) v1.1.2 Zig engine plus the `minimax_m3_vl` family, vendored as [`engine/patches`](engine/SOURCE-EXPORT.md) (MiaAI-Lab's family patch and ours; exported from engine commit `84c4863e08e1`) |
 | Serving | 114,688 tokens x 1 slot, FP8 KV, KV tier off (262,144 exact works, opt-in), tool calling, structured output (xgrammar), drafts on, MiniMax's dspark draft, image input off by default (`VISION=1` measured) |
 
 The served model ID is `MiniMax-M3.1-Flash-EXL3`.
@@ -24,7 +24,42 @@ The served model ID is `MiniMax-M3.1-Flash-EXL3`.
 
 ## Results
 
-**Latest, window-all-4 (2026-10-26):** decode speed is unchanged (~31 tok/s median, the same as window-all-3). The gains
+**Latest, window-all-5 and -6 (2026-10-26 / 27):** two attention switches, now in the profile. Prefill and long prompts
+are faster: 32K 580 → 720 tok/s, 2K 692 → 786, a fresh 70K prompt's first token 133 → 109 s (tensor-core prompt
+attention, `TF_MM3_ATTN_MMA=1`). Decode the draft cannot help (prose, and after a long prompt; drafts on) is 10-14 % faster: long prose 19.3 / 18.2 →
+21.8 / 21.3 tok/s, after a 32K prompt 20.0 → 22.9 (the decode attention split, `TF_MM3_ATTN_SPLIT=1`). **Single-stream
+drafted decode is unchanged (~31 tok/s median).** Tool tests 42/42 and 12/12, smoke 12/12. With four streams the
+tensor-core prompt attention costs greedy code ~16 %, so the four-slot profile leaves it off (below).
+
+| | Before (job) | **window-all-6 profile** (job) | change |
+| --- | ---: | ---: | ---: |
+| Prefill 32K (tok/s) | 578.6 / 580.3 (701 / 703) | **720.5 / 719.7** (702 / 704) | +24 % |
+| Prefill 2K (tok/s) | 689.1 / 692.2 (701 / 703) | **783.1 / 786.0** (702 / 704) | +14 % |
+| 70K prompt first token: fresh / repeat / follow-up (s) | 133.3 / 0.63 / 0.66 (607) | **109.4 / 0.62 / 0.65** (705) | fresh -18 % |
+| Decode, long prose (`bench.py decode`, 512 tokens, 2 reps, drafts on; tok/s) | 19.3 / 18.2 (601 / 602) | **21.8 / 21.3** (603); 21.7 / 22.6 (704) | +10-14 % |
+| Decode after a 32K prompt, 256 tokens, drafts on (tok/s) | 20.0 (611) | **22.9** (612) | +14 % |
+| Drafted decode, probe median greedy / sampled (tok/s) | 31.34 / 30.64 (window-all-4, 5072) | 30.2 / 28.3 (704); 31.7 / 26.8 (702) | no gain |
+| Smoke / tool chains off, adaptive / tool calls off, adaptive | 12/12 / 12/12, 12/12 / 42/42, 42/42 | **12/12 / 12/12, 12/12 / 42/42, 42/42** (704) | same |
+| `bench/structured.py` tools (incl. `tool_choice: "none"`) | 14/15 (window-all-3) | **15/15** (611) | fixed |
+| 4 streams, drafts off, code T0 aggregate: prompt attention off / on (tok/s) | 65.3 (window-all-4, 511) | **67.6 / 69.2 off**, 57.1 on (711 / 713, 712) | on: -16 % |
+| 4 streams, drafts off, chat T0 aggregate: off / on (tok/s) | 63.2 (window-all-4, 511) | 55.0 / 56.7 off, 54.9 on (711 / 713, 712) | on: even |
+
+"Before" is the previous recipe on the same engine: window-all-5's recipe (window-all-4's plus the split) for the
+prompt rows, window-all-4's for the decode rows. Jobs 6xx are [results/window-all-5](results/window-all-5/README.md),
+70x [results/window-all-6](results/window-all-6/README.md), 71x [results/window-all-6b](results/window-all-6b/README.md);
+engine `mm3/window-all-6` @ `0f591bc41`, CONTEXT 114,688 (four streams: 40,960), FP8 KV, thinking off. Both switches
+change summation order (FP64-gated contract and quality checks pass), so some replies hash differently from runs without
+them; every run with the same switches hashes the same. `bench/structured.py` ran on window-all-4's recipe with this
+engine (611), before the thermal stop below cut its thinking suite. Draft graphs, int8 index keys and plan-inline stay
+off (window-all-5: no gain).
+
+**Heat:** the worker (rank 1) reached the device emergency limit (93 °C or more held 30 s) three times in these runs, each under
+sustained load: at 18:23:13 and 18:28:43 UTC on 2026-10-26 in window-all-5's release steps after the 32K decode (jobs
+611 and 612; 612's structured and MMLU lines are not valid), and at 01:27:36 UTC on 2026-10-27 at four-stream code (job
+714, 94 °C; not a result). Each time the guard stopped the job as designed; the next job started only after both nodes
+had cooled and the recorded stop was cleared.
+
+**Window-all-4 (2026-10-26):** decode speed is unchanged (~31 tok/s median, the same as window-all-3). The gains
 are prefill (32K: 565 tok/s in the profile, 582 with every prompt switch at its default, against 485 for window-all-3's
 recipe in the same window), the prefix cache (a 70K prompt's first token 140 s fresh, 0.67 s repeated), four streams
 (65.3 tok/s combined without drafts) and the KV tier, which now works on two Sparks (an exact 262,144-token context,
@@ -129,9 +164,10 @@ server). Method: [PACKS](docs/PACKS.md),
   the guards stopped the containers each time and the run stopped early at 05:47 UTC. The S11-off and S8-off checks
   (jobs 4591 / 4592) were cut by those stops and are missing; several measurements waited for a throttled node to
   cool before they ran.
-- **`tool_choice: "none"` leaks tool-call markup into the reply's content**: the model may still write a tool call, and
-  its markup reaches `content` (`bench/structured.py` tools 14/15). Clients that send `"none"` must not rely on clean content; leave tools out of
-  the request instead.
+- **`tool_choice: "none"`** leaked tool-call markup into the reply's content in window-all-3 (`bench/structured.py`
+  tools 14/15); the engine fix measures 15/15 in window-all-5 (job 611), once, on window-all-4's recipe.
+- **Four streams with `TF_MM3_ATTN_MMA=1`**: greedy code ~16 % slower (window-all-6b), not yet understood;
+  `config/slots4.env.example` leaves it off.
 - **Prose gains nothing from the draft** (20.1 against 20.8 plain at T0); the gain is in code, tool calls and math.
 - **Plain decode is ~5 % below window-all-2's** (20.1 against 21.2 at T0): the prefill fix that removed window-all-2's
   prefill regression gives back the one-row router batching.
@@ -139,10 +175,9 @@ server). Method: [PACKS](docs/PACKS.md),
   131,072 start was refused once). The KV tier works at an exact 262,144 (window-all-4, drafts off, smoke 12/12) but is
   opt-in and not in the profile; 4 x 1M approximate is not measured. `TF_MM3_PLAN_INLINE=1` starts now but gains nothing
   clear (off).
-- **window-all-4 did not re-measure** decode after a 32K prompt, MMLU-200 or `bench/structured.py` (so the engine's
-  `tool_choice: "none"` fix is not yet confirmed through the server); those rows are window-all-3's.
+- **MMLU-200 was last measured in window-all-3** (0.780); window-all-5's run of it was cut by a thermal stop.
 - **Depth by confidence is measured at one stream only**; four streams were measured at depth 3.
-- Not measured: tool-eval-bench, `TF_MM3_INDEX_KEYS=int8` on long prompts, the side image's serve-latency switches.
+- Not measured: tool-eval-bench, the side image's serve-latency switches.
 - One pair of Sparks, one run per job.
 
 ## Quick start

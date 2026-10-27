@@ -1,0 +1,3 @@
+[bench] decode C1 rep 0: aggregate 21.16 tok/s, per stream 21.12 tok/s, TTFT [0.592], 
+[bench] decode C1 rep 1: aggregate 21.21 tok/s, per stream 21.17 tok/s, TTFT [0.577], 
+[bench] -> <path>

@@ -1,0 +1,60 @@
+19:45:19 config <path> image e3938c961a34
+19:45:20 waiting for the locks
+20:22:20 locks held on both nodes
+20:24:21 JOB 701-w5-recipe toggles [MEM_GATE_GIB=115 CONTEXT=114688 DRAFTS=1 DRAFTER=dspark TF_MM3_DSPARK_STATS=1 TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1] steps [smoke probe prefill]
+20:24:52   701-w5-recipe start rc=1 in 31s; 
+20:24:52   701-w5-recipe THERMAL_STOP recorded: worker: 1793039323 94 C; clearing when both nodes are cool
+[serve.sh] thermal hard stop cleared (worker: 1793039323 94 C; now 54 / 57 C): scripts/serve.sh start may run again
+20:26:27   701-w5-recipe start after thermal-clear rc=0
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+  │ info: minimax budget: 114688 tokens a stream, 1256 pages, 7.04 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+20:27:01   701-w5-recipe smoke rc=0 12 PASS 0 FAIL
+20:28:16   701-w5-recipe probe rc=0 [probe] 701-w5-recipe median tok/s {'greedy': 25.5, 'sampled': 27.49} ok=True
+20:29:18   701-w5-recipe prefill rc=0 prefill 2048: prompt 2053 (cached 0), 689.1 tok/s server prefill 32768: prompt 32764 (cached 0), 578.6 tok/s server 
+20:29:23   701-w5-recipe stopped
+20:31:24 JOB 702-ab-attn-mma toggles [MEM_GATE_GIB=115 CONTEXT=114688 DRAFTS=1 DRAFTER=dspark TF_MM3_DSPARK_STATS=1 TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1 TF_MM3_ATTN_MMA=1] steps [prefill smoke probe]
+20:32:58   702-ab-attn-mma start rc=0 in 94s; loaded in 52.3s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+  │ info: minimax budget: 114688 tokens a stream, 1280 pages, 7.18 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+20:33:49   702-ab-attn-mma prefill rc=0 prefill 2048: prompt 2053 (cached 0), 783.1 tok/s server prefill 32768: prompt 32764 (cached 0), 720.5 tok/s server 
+20:34:23   702-ab-attn-mma smoke rc=0 12 PASS 0 FAIL
+20:35:31   702-ab-attn-mma probe rc=0 [probe] 702-ab-attn-mma median tok/s {'greedy': 31.7, 'sampled': 26.83} ok=True
+20:35:36   702-ab-attn-mma stopped
+20:37:36 JOB 703-w5-recipe-again toggles [MEM_GATE_GIB=115 CONTEXT=114688 DRAFTS=1 DRAFTER=dspark TF_MM3_DSPARK_STATS=1 TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1] steps [prefill]
+20:39:10   703-w5-recipe-again start rc=0 in 94s; loaded in 51.7s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+  │ info: minimax budget: 114688 tokens a stream, 1275 pages, 7.15 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+20:40:12   703-w5-recipe-again prefill rc=0 prefill 2048: prompt 2053 (cached 0), 692.2 tok/s server prefill 32768: prompt 32764 (cached 0), 580.3 tok/s server 
+20:40:17   703-w5-recipe-again stopped
+20:42:17 JOB 704-allwin toggles [MEM_GATE_GIB=115 CONTEXT=114688 DRAFTS=1 DRAFTER=dspark TF_MM3_DSPARK_STATS=1 TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1 TF_MM3_ATTN_MMA=1] steps [smoke toolcall toolthink probe decode prefill]
+20:43:51   704-allwin start rc=0 in 94s; loaded in 51.6s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+  │ info: minimax budget: 114688 tokens a stream, 1289 pages, 7.23 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+20:44:25   704-allwin smoke rc=0 12 PASS 0 FAIL
+20:48:47   704-allwin toolcall rc=0 [bench] tooleval own off: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} [bench] tooleval toolcall off: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, 'corruption
+20:53:55   704-allwin toolthink rc=0 [bench] tooleval own adaptive: rc 0, {'scores': [12], 'max_points': 12, 'min_score': 10, 'pass': True, 'malformed': 0, 'leaks': 0} [bench] tooleval toolcall adaptive: rc 0, {'passed': 42, 'total': 42, 'unsupported': 0, '
+20:55:03   704-allwin probe rc=0 [probe] 704-allwin median tok/s {'greedy': 30.17, 'sampled': 28.28} ok=True
+20:55:52   704-allwin decode rc=0 per stream 21.73 per stream 22.6 
+20:56:43   704-allwin prefill rc=0 prefill 2048: prompt 2053 (cached 0), 786.0 tok/s server prefill 32768: prompt 32764 (cached 0), 719.7 tok/s server 
+20:56:48   704-allwin stopped
+20:58:49 JOB 705-revisit-allwin toggles [MEM_GATE_GIB=115 CONTEXT=114688 DRAFTS=1 DRAFTER=dspark TF_MM3_DSPARK_STATS=1 TF_MM3_DSPARK_CHANCES=1 TF_MM3_CALIB=auto TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1 TF_MM3_ATTN_MMA=1] steps [revisit]
+21:00:23   705-revisit-allwin start rc=0 in 94s; loaded in 52.3s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 114688 --parallel 1 --max-tokens 32768 --kv-cache fp8 --drafter /model/dspark
+  │ info: minimax budget: 114688 tokens a stream, 1270 pages, 7.12 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+21:02:20   705-revisit-allwin revisit rc=0 cached: 0, "ttft_s": 109.43, "sha": "cc82e8599c0a4608"} cached: 69888, "ttft_s": 0.62, "sha": "cc82e8599c0a4608"} cached: 69888, "ttft_s": 0.65, "sha": "cd4f8b1056b9eadb"} [revisit] repeat_equal True 
+21:02:25   705-revisit-allwin stopped
+21:04:25 JOB 706-c4-plain toggles [MEM_GATE_GIB=116 CONTEXT=40960 PARALLEL=4 MAX_TOKENS=32768 DRAFTS=0 TF_MM3_ROCE_SUM=1 TF_MM3_SHARE_INPLACE=1 TF_ROCE_FAST=1 EXTRA_ENV=TF_SERVE_INCREMENTAL=1 TF_MM3_GLUE_ACT=1 TF_MM3_GLUE_ADD=1 TF_MM3_ATTN_SPLIT=1 TF_MM3_ATTN_MMA=1] steps [concurrent]
+21:05:31   706-c4-plain start rc=0 in 66s; loaded in 24.0s
+[start.sh] Rank 1 on root@<addr>: tensorfold-native serve /model --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+[start.sh] Rank 0 here: tensorfold-native serve /model --host 127.0.0.1 --port 8000 --name MiniMax-M3.1-Flash-EXL3 --backend cuda --context 40960 --parallel 4 --max-tokens 32768 --kv-cache fp8 --no-drafts
+  │ info: minimax budget: 40960 tokens a stream, 1645 pages, 9.22 GiB of KV room, e4m3 K, e4m3 V, bf16 index keys (the host's plan has the last word)
+21:10:48   706-c4-plain concurrent rc=0 {"label": "706-c4-plain", "prompt": "code", "temperature": 0.0, "streams": 4, "failed": 0, "unmeasured": 0, "aggregate_tps": 57.7, "per_stream_tps": 14.7, "ttft_s_max": 0.52, "timing_valid": true, "end_to_end_tps": 57.271770109709635, "make
+21:10:53   706-c4-plain stopped
+21:10:53 END job
+21:10:53 WINDOW_END
+21:10:54 locks released
