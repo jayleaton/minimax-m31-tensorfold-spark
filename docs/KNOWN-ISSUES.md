@@ -12,9 +12,10 @@ predate these runs and say so.
 
 ## The engine
 
-- **The family is not this repository's.** The `minimax_m3_vl` family (TensorFold v1.1.2 plus a patch series) lives on the
-  engine branch (jayleaton/TensorFold); this recipe builds whatever `ENGINE_PATCHES` names (default `patches/`, MiaAI-Lab's series at fd1d379,
-  unchanged) and refuses to start a build that does not list the family. That series has passed host tests and per-kernel
+- **The family is not upstream yet.** The `minimax_m3_vl` family is a patch series over unmodified upstream
+  [TensorFold](https://github.com/ashhart/TensorFold) v1.1.2 (`TF_REF`); this recipe builds that tag with whatever
+  `ENGINE_PATCHES` names applied (default `patches/`, MiaAI-Lab's series at fd1d379, unchanged) and refuses to start a
+  build that does not list the family. That series has passed host tests and per-kernel
   GPU contract runs only: no forward pass of the whole model, no two-rank run and no generated token is recorded for it
   (patches/README.md). Its model semantics (swigluoai, RoPE layout, sparse block forcing, router order, norm folds) are
   held as switches with the likeliest defaults.
